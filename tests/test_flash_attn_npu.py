@@ -144,6 +144,9 @@ test_cases = [
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True),
     (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False),
+    (torch.bfloat16, 1, 4, 4, 1, 1024, 128, 0, 128, True),
+    (torch.float16, 1, 1, 1, 1, 2048, 128, 1, 128, False),
+
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal", test_cases)
