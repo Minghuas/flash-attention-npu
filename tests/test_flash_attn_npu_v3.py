@@ -150,7 +150,9 @@ test_cases = [
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "BSND"),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND"),
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "TND"),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "TND"),
     (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, True, "BSND"),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, 1, 128, False, "BSND"),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout", test_cases)
