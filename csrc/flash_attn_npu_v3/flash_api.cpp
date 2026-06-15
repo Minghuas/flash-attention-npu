@@ -133,10 +133,6 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     TORCH_CHECK(num_splits == 1 || num_splits == 0, "NPU FlashAttention only supports num_splits=1 or num_splits=0");
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(), "NPU FlashAttention does not support pack_gqa");
 
-    if (is_varlen_kv) {
-        cu_seqlens_k = cu_seqlens_k_.value();
-        TORCH_CHECK(!paged_KV, "If cu_seqlens_k is passed in, then paged table is not supported");
-    }
     if (k_new_.has_value()) {
         k_ = k_new_.value();
     }
@@ -185,8 +181,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 128 : k.size(1);
-    const int num_heads_k = k.size(2);
-
+    const int num_heads_k = k.dim() == 3 ? k.size(1) : k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");

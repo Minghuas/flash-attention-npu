@@ -145,8 +145,10 @@ def ref_flash_attention(
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal)
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "TND"),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND"),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, "TND"),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, "TND"),
+    (torch.bfloat16, 5, 4, 2, 1024, 1024, 128, 0, 128, True, "TND"),
+    (torch.bfloat16, 5, 4, 2, 1024, 1024, 128, 0, 128, True, "BSND"),
+    (torch.float16, 7, 4, 1, 512, 512, 128, 1, 128, False, "TND"),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "BSND"),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "BSND"),
 ]
@@ -221,8 +223,12 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             pre_seq_sum = 0
             for i in range(batch_size):
                 pre_seq_sum += kv_seqlen_list[i]
-                new_kv_seqlen_list.append(pre_seq_sum)
-            new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list)
+                new_kv_seqlen_list.append(pre_seq_sum.clone())
+            new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list, dtype=torch.int32).npu()
+        else:
+            new_kv_seqlen_list = kv_seqlen_list
+    else:
+        new_kv_seqlen_list = kv_seqlen_list
     out_out, softmax_lse, *rest = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -232,7 +238,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         None,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
-        cache_seqlens=kv_seqlen_list,
+        cache_seqlens=new_kv_seqlen_list,
         cache_batch_idx=cache_batch_idx,
         cache_leftpad=leftpad_k,
         page_table=block_tables,
