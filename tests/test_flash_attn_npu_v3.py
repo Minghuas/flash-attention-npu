@@ -25,11 +25,14 @@ def group_matmul(head, kv_head, left, right, high_prec = 1):
 
 def softmax1( 
     qk_result,
+    sub_mask,
     is_first,
     gm,
     interm_dtype = torch.float16
     ):
     sim = qk_result.to(interm_dtype)
+    if sub_mask is not None:
+        sim.masked_fill_(sub_mask.unsqueeze(0), -torch.inf)
     lm = torch.max(sim, dim=-1, keepdims=True)[0]
     if is_first:
         hm = lm
@@ -40,6 +43,8 @@ def softmax1(
     gm = hm
     sim_sub = sim - hm
     sim_sub = torch.exp(sim_sub.to(interm_dtype))
+    if sub_mask is not None:
+        sim_sub.masked_fill_(sub_mask.unsqueeze(0), 0)
     row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
     return sim_sub, row_sum, dm, gm
 
@@ -112,15 +117,13 @@ def ref_flash_attention(
         sub_key = key[:, :, kv_start: kv_start + sub_len]
         sub_mask = None
         if mask is not None:
-            sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len].to(interm_dtype) * (-1e4)
+            sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len]
         sub_value = value[:, kv_start: kv_start + sub_len, :]
         qk_result = qkMM1(query, sub_key).to(interm_dtype)
         qk_result = qk_result * scale
-        if mask is not None:
-            qk_result += sub_mask
         if kv_start == 0:
             gm = None
-        p_result, row_sum, dm, gm = softmax1(qk_result, kv_start == 0, gm, interm_dtype)
+        p_result, row_sum, dm, gm = softmax1(qk_result, sub_mask, kv_start == 0, gm, interm_dtype)
         p_result = p_result.to(data_type)
         if kv_start == 0:
             gm_high = None
@@ -142,8 +145,10 @@ def ref_flash_attention(
 test_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal)
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "TND"),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "TND"),
-    (torch.float16, 7, 1, 1, 512, 512, 128, 1, 128, False, "TND"),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, "TND"),
+    (torch.bfloat16, 5, 4, 2, 1024, 1024, 128, 0, 128, True, "TND"),
+    (torch.bfloat16, 5, 4, 2, 1024, 1024, 128, 0, 128, True, "BSND"),
+    (torch.float16, 7, 4, 1, 512, 512, 128, 1, 128, False, "TND"),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, "BSND"),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 1, 128, True, "BSND"),
 ]
@@ -218,8 +223,12 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             pre_seq_sum = 0
             for i in range(batch_size):
                 pre_seq_sum += kv_seqlen_list[i]
-                new_kv_seqlen_list.append(pre_seq_sum)
-            new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list)
+                new_kv_seqlen_list.append(pre_seq_sum.clone())
+            new_kv_seqlen_list = torch.tensor(new_kv_seqlen_list, dtype=torch.int32).npu()
+        else:
+            new_kv_seqlen_list = kv_seqlen_list
+    else:
+        new_kv_seqlen_list = kv_seqlen_list
     out_out, softmax_lse, *rest = flash_attn_with_kvcache(
         query,
         key_cache,
@@ -229,7 +238,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         None,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
-        cache_seqlens=kv_seqlen_list,
+        cache_seqlens=new_kv_seqlen_list,
         cache_batch_idx=cache_batch_idx,
         cache_leftpad=leftpad_k,
         page_table=block_tables,
