@@ -1,4 +1,4 @@
-__version__ = "0.1.1"
+__version__ = "0.2.0b1"
 
 from flash_attn_npu.flash_attn_interface import (
     flash_attn_func,
