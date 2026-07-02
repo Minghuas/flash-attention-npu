@@ -1,3 +1,5 @@
+# Copyright (c) 2026, Minghua Shen.
+
 import pytest
 import torch
 import torch_npu
