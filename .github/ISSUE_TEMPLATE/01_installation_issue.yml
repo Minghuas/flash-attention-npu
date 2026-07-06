@@ -1,4 +1,4 @@
-name: Installation Issue
+name: 🛠️ Installation Issue
 description: Report errors encountered while building or installing flash-attention-npu.
 title: "[INSTALL]: "
 labels: ["installation"]
@@ -17,14 +17,13 @@ body:
           required: true
         - label: I have sourced the CANN environment (`source /usr/local/Ascend/cann/set_env.sh`).
           required: true
-        - label: I have redacted any sensitive information from logs.
+        - label: I have removed any sensitive information from logs or code snippets.
           required: true
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: |
-        Provide detailed environment information.
+      description: Provide detailed environment information.
       value: |
         - Device (e.g., Ascend 910B):
         - CANN version:
@@ -39,19 +38,14 @@ body:
     id: command
     attributes:
       label: How did you install flash_attn_npu?
-      description: |
-        Paste the full command you are trying to execute.
-      value: |
-        ```sh
-        pip install flash_attn_npu --no-build-isolation
-        ```
+      description: Paste the full command you are trying to execute.
     validations:
       required: true
   - type: textarea
     id: error
     attributes:
       label: Error output
-      description: Paste the error / build log. Redact any sensitive content.
+      description: Paste the error log. Remove any sensitive content.
       render: shell
     validations:
       required: true

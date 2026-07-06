@@ -1,4 +1,4 @@
-name: Performance Discussion
+name: ⚡ Performance Discussion
 description: Propose ideas or discuss potential performance improvements for flash-attention-npu.
 title: "[PERF]: "
 labels: ["performance"]
@@ -13,7 +13,7 @@ body:
   - type: textarea
     id: current_issue
     attributes:
-      label: Current Performance Issue
+      label: Performance Issue
       description: Describe the current performance bottleneck, limitation, or optimization opportunity.
     validations:
       required: true

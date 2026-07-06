@@ -1,4 +1,4 @@
-name: Refactor Request
+name: ♻️ Refactor Request
 description: Propose a refactor to improve code or documentation quality.
 title: "[REFACTOR]: "
 labels: ["refactor"]
@@ -34,9 +34,9 @@ body:
     attributes:
       label: Are you willing to submit a PR?
       options:
-        - "Yes, I can submit a PR"
-        - "Maybe — I'd need guidance"
-        - "No, just proposing"
+        - No, just proposing
+        - Yes, but I'd need guidance
+        - Yes, I can submit a PR
     validations:
       required: true
   - type: textarea

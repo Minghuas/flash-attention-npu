@@ -1,4 +1,4 @@
-name: Bug Report
+name: 🐛 Bug Report
 description: Raise an issue here if you find a bug.
 title: "[BUG]: "
 labels: ["bug"]
@@ -19,15 +19,14 @@ body:
           required: true
         - label: I can reproduce this on the latest release.
           required: true
-        - label: I have redacted any sensitive information from logs.
+        - label: I have removed any sensitive information from logs or code snippets.
           required: true
 
   - type: textarea
     id: environment
     attributes:
       label: Environment
-      description: |
-        Provide detailed environment information.
+      description: Provide detailed environment information.
       value: |
         - Device (e.g., Ascend 910B):
         - CANN version:
@@ -58,7 +57,7 @@ body:
     id: error
     attributes:
       label: Error output
-      description: Paste the error log. Redact any sensitive content.
+      description: Paste the error log. Remove any sensitive content.
       render: shell
     validations:
       required: true
