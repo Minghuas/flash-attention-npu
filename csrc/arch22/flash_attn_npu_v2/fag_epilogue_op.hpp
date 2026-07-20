@@ -16,6 +16,7 @@
 #include "kernel_operator.h"
 #include "kernel_common_fag.hpp"
 #include "fag_common/common_header.h"
+#include "alibi.hpp"
 
 using AscendC::CopyRepeatParams;
 using AscendC::DataCopyExtParams;
@@ -39,16 +40,17 @@ template <
     uint32_t IS_DROP_,
     uint32_t IS_ATTEN_MASK_,
     class TilingData,
-    bool HAS_SOFTCAP_
+    bool HAS_SOFTCAP_,
+    bool HAS_ALIBI_
 >
 class BlockEpilogue<
-    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_>,
+    EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_>,
     OutputType_,
     InputType_,
     TilingData>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueAtlasA2SameAbVec<INPUT_LAYOUT_, IS_DROP_, IS_ATTEN_MASK_, HAS_SOFTCAP_, HAS_ALIBI_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using T1 = InputType_;
     using T2 = OutputType_;
@@ -56,6 +58,7 @@ public:
     static constexpr bool IS_DROP = IS_DROP_;
     static constexpr bool IS_ATTEN_MASK = IS_ATTEN_MASK_;
     static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
+    static constexpr bool HAS_ALIBI = HAS_ALIBI_;
 
     AscendC::TPipe *pipe;
     TBuf<> unifiedBuffer;
@@ -71,6 +74,7 @@ public:
     GlobalTensor<T1> keyGm, valueGm, dxGm, queryGm, forwardResGm;
     GlobalTensor<uint8_t> maskWorkSpaceGm, attenMaskU8Gm, dropMaskGm;
     GlobalTensor<float> softmaxLseGm;
+    GlobalTensor<float> alibiSlopesGm;
 
     GlobalTensor<float> dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm, sfmgWorkspaceGm;
 
@@ -108,6 +112,7 @@ public:
     float keepProb;
     float scaleValue;
     float softcapValue;
+    int64_t alibiSlopesBatchStride = 0;
     int64_t s1Token;
     int64_t s2Token;
     int64_t actualCalcS1Token;
@@ -190,6 +195,7 @@ public:
     constexpr static uint32_t PREFIX_COMPRESS_ALL_MASK_S1_SIZE = 1024;
     constexpr static int64_t GM_DOUBLE_BUFFER = 2;
     constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
+    constexpr static int64_t ALIBI_BWD_WORK_UB_OFFSET = 32 * 1024; 
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
     constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
@@ -219,7 +225,7 @@ public:
                   __gm__ uint8_t *softmax_lse,
                   __gm__ uint8_t *actual_seq_qlen, __gm__ uint8_t *actual_seq_kvlen,
                   __gm__ uint8_t *dq, __gm__ uint8_t *dk,
-                  __gm__ uint8_t *dv,
+                  __gm__ uint8_t *dv, __gm__ uint8_t *alibi_slopes,
                   __gm__ uint8_t *workspace, __gm__ uint8_t *tiling_in, TBuf<>& buf)
     {
         keyGm.SetGlobalBuffer((__gm__ T1 *)key);
@@ -229,6 +235,7 @@ public:
         forwardResGm.SetGlobalBuffer((__gm__ T1 *)forward_res);
         attenMaskU8Gm.SetGlobalBuffer((__gm__ uint8_t *)atten_mask);
         softmaxLseGm.SetGlobalBuffer((__gm__ float *)softmax_lse);
+        alibiSlopesGm.SetGlobalBuffer((__gm__ float *)alibi_slopes);
 
         cBlockIdx = GetBlockIdx();
         cCubeBlockIdx = cBlockIdx / 2;
@@ -296,6 +303,7 @@ public:
         keepProb = tilingData->keepProb;
         scaleValue = tilingData->scaleValue;
         softcapValue = tilingData->softcapValue;
+        alibiSlopesBatchStride = tilingData->alibiSlopesBatchStride;
         compressMode = tilingData->attenMaskCompressMode;
 
         int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
@@ -669,7 +677,7 @@ public:
 
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::Muls(vecClc2Buffer, vecClc2Buffer, (T2)scaleValue, s1ExtendSubGraph * s2ExtendAlign);
-        AscendC::PipeBarrier<PIPE_V>();
+            AscendC::PipeBarrier<PIPE_V>();
 
         // recompute softcap
         if constexpr (HAS_SOFTCAP) {
@@ -690,6 +698,21 @@ public:
                     (s1ExtendSubGraph*s2ExtendAlign)/64, {1, 1, 1, 8, 0, 8});
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        if constexpr (HAS_ALIBI) {
+            const int64_t slopeOffset =
+                dbParam.bIdx * alibiSlopesBatchStride + dbParam.n2Idx * static_cast<int64_t>(g) + dbParam.gIdx;
+            int64_t alibiDiffS = static_cast<int64_t>(dbParam.actualS2Len) - static_cast<int64_t>(dbParam.actualS1Len);
+            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
+            const int64_t alibiQPosBase = alibiDiffS +
+                static_cast<int64_t>(dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize);
+            LocalTensor<float> bwdWorkUb =
+                unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
+            Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
+                0, s1ExtendSubGraph, s1ExtendSubGraph, alibiQPosBase,
+                alibiSlopesGm, slopeOffset, bwdWorkUb,
+                static_cast<int64_t>(s2VBegin));
             AscendC::PipeBarrier<PIPE_V>();
         }
         ///////////////////////////////////////////////////////////////
@@ -713,7 +736,7 @@ public:
                 AscendC::WaitFlag<HardEvent::MTE2_V>(static_cast<int32_t>(vWaitMte2));
                 CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign, 1);
             }
-            AscendC::PipeBarrier<PIPE_V>();
+        AscendC::PipeBarrier<PIPE_V>();
         }
 
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(T2), DbBegin);
@@ -1039,17 +1062,19 @@ template <
     class ElementVecDtype,
     InputLayout inputLayout,
     class TilingData,
-    bool HAS_SOFTCAP_>
+    bool HAS_SOFTCAP_,
+    bool HAS_ALIBI_>
 class BlockEpilogue<
-    EpilogueAtlasA2FAGOp<HAS_SOFTCAP_>,
+    EpilogueAtlasA2FAGOp<HAS_SOFTCAP_, HAS_ALIBI_>,
     ElementVecDtype,
     std::integral_constant<InputLayout, inputLayout>,
     TilingData>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2FAGOp<HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueAtlasA2FAGOp<HAS_SOFTCAP_, HAS_ALIBI_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
+    static constexpr bool HAS_ALIBI = HAS_ALIBI_;
 
     static constexpr InputLayout getLayout()
     {
@@ -1064,6 +1089,7 @@ public:
     GlobalTensor<ElementVecDtype> dropWorkSpaceGm, mulWorkSpaceGm;
     GlobalTensor<float> rowLseGm;
     GlobalTensor<float> sfmgWorkspaceGm;
+    GlobalTensor<float> alibiSlopesGm;
 
     constexpr static uint32_t DTYPE_FACTOR = sizeof(float) / sizeof(ElementVecDtype);
     constexpr static uint32_t cal_block_num = 32 / sizeof(float);
@@ -1083,6 +1109,7 @@ public:
 
     constexpr static uint32_t DbBegin = 74 * 1024;
     constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
+    constexpr static uint32_t ALIBI_BWD_WORK_UB_OFFSET = 32 * 1024;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
     constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
@@ -1111,6 +1138,7 @@ public:
 
     float scaleValue;
     float softcapValue;
+    int64_t alibiSlopesBatchStride = 0;  
 
     int32_t cubeBaseMN;
 
@@ -1144,7 +1172,7 @@ public:
     CATLASS_DEVICE
     BlockEpilogue(Arch::Resource<ArchTag> &resource, AscendC::TPipe *pipe_in, __gm__ uint8_t *row_lse,
     __gm__ uint8_t *atten_mask, __gm__ uint8_t *cu_seq_qlen,
-    __gm__ uint8_t *cu_seq_kvlen, __gm__ uint8_t * workspace, int32_t batchIn, __gm__ uint8_t * tiling_in)
+    __gm__ uint8_t *cu_seq_kvlen, __gm__ uint8_t *alibi_slopes, __gm__ uint8_t * workspace, int32_t batchIn, __gm__ uint8_t * tiling_in)
     {
         b = batchIn;
         pipe = pipe_in;
@@ -1177,6 +1205,7 @@ public:
 
         scaleValue = tilingData->scaleValue;
         softcapValue = tilingData->softcapValue;
+        alibiSlopesBatchStride = tilingData->alibiSlopesBatchStride;
         softmaxTilingData.srcM = tilingData->softmaxTilingData.srcM;
         softmaxTilingData.srcK = tilingData->softmaxTilingData.srcK;
         softmaxTilingData.srcSize = tilingData->softmaxTilingData.srcSize;
@@ -1205,6 +1234,8 @@ public:
         dropWorkSpaceGm.SetGlobalBuffer((__gm__ ElementVecDtype *)(workspace + pWorkSpaceOffset));
 
         sfmgWorkspaceGm.SetGlobalBuffer((__gm__ float *)(workspace + sfmgWorkSpaceOffset));
+
+        alibiSlopesGm.SetGlobalBuffer((__gm__ float *)alibi_slopes);
     }
 
     CATLASS_DEVICE
@@ -1368,7 +1399,25 @@ public:
             AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1Extend * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
         }
-
+        if constexpr (HAS_ALIBI) {
+            const int64_t slopeOffset =
+                blockInfo.batchIdx * alibiSlopesBatchStride + blockInfo.nheadsKIdx * g + blockInfo.gIdx;
+            int64_t actualS1Len = ((__gm__ int32_t *)cu_seq_qlen_addr)[blockInfo.batchIdx];
+            int64_t actualS2Len = ((__gm__ int32_t *)cu_seq_kvlen_addr)[blockInfo.batchIdx];
+            int64_t alibiDiffS = actualS2Len - actualS1Len;
+            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
+            const int64_t alibiQPosBase = alibiDiffS +
+                static_cast<int64_t>(blockInfo.SeqQIdx) * S1_CUBESIZE + curSeqQIdx * s1VecSize;
+            LocalTensor<float> bwdWorkUb =
+                unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
+            // FIXME: Verify s2VStart is correct KV tile start for varlen (currently blockInfo.SeqKIdx * S2_CUBESIZE).
+            const int64_t s2VStart = static_cast<int64_t>(blockInfo.SeqKIdx) * S2_CUBESIZE;
+            Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
+                0, s1Extend, s1Extend, alibiQPosBase,
+                alibiSlopesGm, slopeOffset, bwdWorkUb,
+                s2VStart);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
         LocalTensor<uint8_t> attenMaskUbuint8 =
             unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), ubBufferOffset + BoolBegin);
         if (blockInfo.SeqQIdx == blockInfo.SeqKIdx) {
