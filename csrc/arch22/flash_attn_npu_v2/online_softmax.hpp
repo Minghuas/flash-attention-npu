@@ -16,6 +16,12 @@
 #include "catlass/matrix_coord.hpp"
 #include "fa_block.h"
 #include "alibi.hpp"
+#include "kernel_common.hpp"
+
+// Forward-path ALiBi: every operator calls ApplyAlibiRows<NO_MASK> directly. All mask
+// types (NO_MASK / MASK_CAUSAL / MASK_SWA) share the same bias formula
+// (-slope*|i-j|); the attention's causal/local MASK is applied separately by ApplyMask,
+// independent of ALiBi. (Backward uses its own dispatch in fag_epilogue_op.hpp.)
 
 namespace Catlass::Epilogue::Block {
 
@@ -879,13 +885,13 @@ public:
             sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, rowOffset, isFirstStackTile);
     }
 
-    __aicore__ inline
+    __aicore__ inline  // 无MASK
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput, GemmCoord actualBlockShape,
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, bool isSplitKV = false,
         bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false,
-        uint32_t kvSStartIdx = 0, int64_t alibiQPosBase = 0, uint64_t alibiSlopesGmOffset = 0)
+        uint32_t kvSStartIdx = 0, uint32_t qSBlockBaseIdx = 0, uint32_t qNBlockBaseIdx = 0, uint32_t alibiDiffS = 0, uint64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -942,9 +948,10 @@ public:
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
                 if constexpr (HAS_ALIBI_) {
-                    Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNumRound,
-                        rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize, alibiQPosBase,
-                        alibiSlopesGm, alibiSlopesGmOffset, alibiWorkUb,
+                    Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                        rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                        alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                         static_cast<int64_t>(kvSStartIdx));
                 }
                 SubCoreCompute<false>(
@@ -964,13 +971,13 @@ public:
         }
     }
 
-    __aicore__ inline
+    __aicore__ inline  // CASUAL Tri MASK
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, uint32_t triUp, uint32_t triDown,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false,
-        int64_t alibiQPosBase = 0, uint64_t alibiSlopesGmOffset = 0)
+        uint32_t qSBlockBaseIdx = 0, uint32_t qNBlockBaseIdx = 0, uint32_t alibiDiffS = 0, uint64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -989,7 +996,7 @@ public:
 
         uint32_t tokenNumPerHeadThisSubBlock = Min(qSBlockSize, rowActualThisSubBlock);
         uint32_t maskOffsetThisSubBlock = (qNBlockSize == 1) ?
-            rowOffsetThisSubBlock : 0;
+            rowOffsetThisSubBlock : 0;  // 加载到UB的对应Score shape的Mask的偏移，不是全局偏移
 
         // calc mask shift in gm
         uint32_t gmOffsetMaskRow;
@@ -1036,7 +1043,7 @@ public:
                 // loop 0 mask load before cross core sync
                 if (rowLoopIdx == 0) {
                     // the token idx of the start token of the prologue part
-                    uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
+                    uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock; // 当前SubBlock内的tokenIdx，应该还得加上一个全局偏移量
                     // the token num of the prologue part
                     uint32_t proTokenNum =
                         Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) % tokenNumPerHeadThisSubBlock;
@@ -1077,9 +1084,10 @@ public:
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
                 if constexpr (HAS_ALIBI_) {
-                    Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::MASK_CAUSAL>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNumRound,
-                        rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize, alibiQPosBase,
-                        alibiSlopesGm, alibiSlopesGmOffset, alibiWorkUb,
+                    Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                        rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                        alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                         static_cast<int64_t>(kvSStartIdx));
                 }
                 ApplyMask(
@@ -1129,14 +1137,14 @@ public:
         }
     }
 
-    __aicore__ inline
+    __aicore__ inline  // SWA Tri Mask
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, int32_t kvSStartIdx, bool doTriUPreMask,
         bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
         int32_t nextTokenEndLen,
-        int64_t alibiQPosBase = 0, uint64_t alibiSlopesGmOffset = 0)
+        uint32_t qSBlockBaseIdx = 0, uint32_t qNBlockBaseIdx = 0, uint32_t alibiDiffS = 0, uint64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1264,9 +1272,10 @@ public:
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     if constexpr (HAS_ALIBI_) {
-                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::MASK_SWA>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNumRound,
-                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize, alibiQPosBase,
-                            alibiSlopesGm, alibiSlopesGmOffset, alibiWorkUb,
+                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
@@ -1299,9 +1308,10 @@ public:
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     if constexpr (HAS_ALIBI_) {
-                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::MASK_SWA>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNumRound,
-                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize, alibiQPosBase,
-                            alibiSlopesGm, alibiSlopesGmOffset, alibiWorkUb,
+                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
@@ -1314,9 +1324,10 @@ public:
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     if constexpr (HAS_ALIBI_) {
-                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::MASK_SWA>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNumRound,
-                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize, alibiQPosBase,
-                            alibiSlopesGm, alibiSlopesGmOffset, alibiWorkUb,
+                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundNext,

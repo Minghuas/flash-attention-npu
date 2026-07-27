@@ -1,8 +1,8 @@
 /**
- * Copyright (c) 2025 Huawei Technologies Co., Ltd.
- * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * CANN Open Software License Agreement Version 2.0 (the "License").
  * Modified by Minghua Shen, 2026
- */
+ */
 #ifndef COMMON_ALIBI_BIAS_HPP
 #define COMMON_ALIBI_BIAS_HPP
 
@@ -13,160 +13,167 @@ enum class AlibiMaskType : uint32_t {
     MASK_SWA = 4
 };
 
-__aicore__ inline void BuildAbsBiasRow(AscendC::LocalTensor<float> &workUb,
-                                       int64_t baseColIdx, float slope, int32_t N)
-{
-    AscendC::CreateVecIndex<float>(workUb, static_cast<float>(-baseColIdx), N);  
-    AscendC::PipeBarrier<PIPE_V>();
-    if (baseColIdx >= 0) {
-        int64_t absCnt = baseColIdx < static_cast<int64_t>(N) ? baseColIdx : static_cast<int64_t>(N);
-        AscendC::Abs<float>(workUb, workUb, static_cast<int32_t>(absCnt));
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-    AscendC::Muls<float>(workUb, workUb, -slope, N);
-    AscendC::PipeBarrier<PIPE_V>();
-}
-
-__aicore__ inline void AdvanceAbsBiasRow(AscendC::LocalTensor<float> &workUb,
-                                         int64_t baseColIdx, float slope, int32_t N, float delta=1.0f)
-{
-    if (baseColIdx <= 0) {
-        AscendC::Adds<float>(workUb, workUb, delta * slope, N);                          
-    } else if (baseColIdx >= static_cast<int64_t>(N)) {
-        AscendC::Adds<float>(workUb, workUb, delta * -slope, N);                         
-    } else {
-        constexpr int32_t FLOAT_BLOCK_SIZE = 8;
-        const int32_t bci = static_cast<int32_t>(baseColIdx);
-        const int32_t alignedLeft = bci / FLOAT_BLOCK_SIZE * FLOAT_BLOCK_SIZE;
-        const int32_t x = bci - alignedLeft; 
-        if (alignedLeft > 0) {
-            AscendC::Adds<float>(workUb, workUb, -delta * slope, alignedLeft);                      
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-        AscendC::Adds<float>(workUb[alignedLeft], workUb[alignedLeft], delta * slope, N - alignedLeft);  
-        if (x != 0) {
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Adds<float>(workUb[alignedLeft], workUb[alignedLeft], -2.0f * delta * slope, x);    
-        }
-    }
-    AscendC::PipeBarrier<PIPE_V>();
-}
-
-__aicore__ inline void AddBiasToRow(AscendC::LocalTensor<float> &scoreUb, uint32_t rowOff,
-                                    AscendC::LocalTensor<float> &workUb, int32_t N)
-{
-    AscendC::Add<float>(scoreUb[rowOff], scoreUb[rowOff], workUb, N); 
-    AscendC::PipeBarrier<PIPE_V>();
-}
-
 __aicore__ inline void RescaleBiasRow(AscendC::LocalTensor<float> &workUb,
-                                      float slope, float preSlope, int32_t N)
+                                      const float slope, const float preSlope, uint32_t N)
 {
     AscendC::Muls<float>(workUb, workUb, slope / preSlope, N);  
     AscendC::PipeBarrier<PIPE_V>();
 }
 
+__aicore__ inline void BuildAbsBiasRow(AscendC::LocalTensor<float> &workUb,
+                                       int32_t baseColIdx, const float slope, uint32_t N)
+{
+    AscendC::CreateVecIndex<float>(workUb, static_cast<float>(-baseColIdx), N);
+    AscendC::PipeBarrier<PIPE_V>();
+    // if (baseColIdx >= 0) {
+    //     int32_t absCnt = baseColIdx < N ? baseColIdx : N;
+    //     AscendC::Abs<float>(workUb, workUb, absCnt);
+    //     AscendC::PipeBarrier<PIPE_V>();
+    // }
+    AscendC::Abs<float>(workUb, workUb, N);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::Muls<float>(workUb, workUb, -slope, N);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+__aicore__ inline void AddBiasToRow(AscendC::LocalTensor<float> &scoreUb, uint32_t rowOff,
+                                    AscendC::LocalTensor<float> &workUb, uint32_t N)
+{
+    AscendC::Add<float>(scoreUb[rowOff], scoreUb[rowOff], workUb, N);
+    AscendC::PipeBarrier<PIPE_V>();
+}
+
+// ============================================================================
+// ApplyAlibiRows — adds ALiBi bias to each score row.
+//
+// Team-confirmed formulas (2026-07-23):
+//   qSIdx   = qSBlockBaseIdx + token       (Q-sequence position)
+//   qKvSIdx  = alibiDiffS + qSIdx          (mapped to K-coordinate)
+//   qNIdx   = qNBlockBaseIdx + head        (global head index)
+//   baseColIdx = qKvSIdx - kvSStartIdx     (bias V-shape center, can be negative)
+//   slope   = slopesGm[slopesBatchOffset + qNIdx]
+//   bias[col] = -slope * |baseColIdx - col|
+//
+// Type convention: position indices are uint32_t; slopesBatchOffset is int64_t
+// (the only signed parameter — it's a GM byte offset that can be large).
+// ============================================================================
+
+
 template <AlibiMaskType MASK_TYPE>
 __aicore__ inline void ApplyAlibiRows(
     AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
-    uint32_t rowStride, uint32_t columnNumRound,
+    uint32_t rowStride, uint32_t columnNum,
     uint32_t absRowStart, uint32_t rowNumCurLoop,
-    uint32_t qSBlockSize, int64_t qPosBase,
-    AscendC::GlobalTensor<float> &slopesGm, uint64_t slopesGmOffset,
+    uint32_t qSBlockSize,
+    uint32_t qSBlockBaseIdx, uint32_t alibiDiffS,
+    uint32_t qNBlockBaseIdx,
+    AscendC::GlobalTensor<float> &slopesGm, int64_t slopesBatchOffset,
     AscendC::LocalTensor<float> &workUb,
-    int64_t kvSStartIdx);
+    int32_t kvSStartIdx);
 
-template <>
-__aicore__ inline void ApplyAlibiRows<AlibiMaskType::MASK_CAUSAL>(
-    AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
-    uint32_t rowStride, uint32_t columnNumRound,
-    uint32_t absRowStart, uint32_t rowNumCurLoop,
-    uint32_t qSBlockSize, int64_t qPosBase,
-    AscendC::GlobalTensor<float> &slopesGm, uint64_t slopesGmOffset,
-    AscendC::LocalTensor<float> &workUb,
-    int64_t kvSStartIdx)
-{
-    (void)qPosBase; 
-    if (rowNumCurLoop == 0 || qSBlockSize == 0 || columnNumRound == 0) {
-        return;
-    }
-    const int32_t count = static_cast<int32_t>(columnNumRound);
+// template <>
+// __aicore__ inline void ApplyAlibiRows<AlibiMaskType::MASK_CAUSAL>(
+//     AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
+//     uint32_t rowStride, uint32_t columnNum,
+//     uint32_t absRowStart, uint32_t rowNumCurLoop,
+//     uint32_t qSBlockSize,
+//     uint32_t qSBlockBaseIdx, uint32_t alibiDiffS,
+//     uint32_t qNBlockBaseIdx,
+//     AscendC::GlobalTensor<float> &slopesGm, int64_t slopesBatchOffset,
+//     AscendC::LocalTensor<float> &workUb,
+//     int32_t kvSStartIdx)
+// {
+//     if (rowNumCurLoop == 0 || qSBlockSize == 0 || columnNum == 0) {
+//         return;
+//     }
+//     const int32_t count = static_cast<int32_t>(columnNum);
 
-    AscendC::CreateVecIndex<float>(workUb, static_cast<float>(kvSStartIdx), count); 
-    AscendC::PipeBarrier<PIPE_V>();
-    float preSlope = 1.0f;
+//     AscendC::CreateVecIndex<float>(workUb, static_cast<float>(kvSStartIdx), count); 
+//     AscendC::PipeBarrier<PIPE_V>();
+//     float preSlope = 1.0f;
 
-    for (uint32_t ri = 0; ri < rowNumCurLoop; ++ri) {
-        const uint32_t absRow = absRowStart + ri;
-        const uint32_t head   = absRow / qSBlockSize;          
-        const float    slope  = slopesGm.GetValue(slopesGmOffset + head);  
-        if (slope != preSlope) {
-            RescaleBiasRow(workUb, slope, preSlope, count);
-            preSlope = slope;
-        }
-        AddBiasToRow(scoreUb, scoreOffset + ri * rowStride, workUb, count);
-    }
-}
+//     for (uint32_t ri = 0; ri < rowNumCurLoop; ++ri) {
+//         const uint32_t absRow = absRowStart + ri;
+//         const uint32_t head   = absRow / qSBlockSize;          
+//         uint32_t qNIdx      = qNBlockBaseIdx + head;
+//         const float slope  = slopesGm.GetValue(slopesBatchOffset + qNIdx);  
+//         if (slope != preSlope) {
+//             RescaleBiasRow(workUb, slope, preSlope, count);
+//             preSlope = slope;
+//         }
+//         AddBiasToRow(scoreUb, scoreOffset + ri * rowStride, workUb, count);
+//     }
+// }
+
 
 template <>
 __aicore__ inline void ApplyAlibiRows<AlibiMaskType::NO_MASK>(
     AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
-    uint32_t rowStride, uint32_t columnNumRound,
+    uint32_t rowStride, uint32_t columnNum,
     uint32_t absRowStart, uint32_t rowNumCurLoop,
-    uint32_t qSBlockSize, int64_t qPosBase,
-    AscendC::GlobalTensor<float> &slopesGm, uint64_t slopesGmOffset,
+    uint32_t qSBlockSize,
+    uint32_t qSBlockBaseIdx, uint32_t alibiDiffS,
+    uint32_t qNBlockBaseIdx,
+    AscendC::GlobalTensor<float> &slopesGm, int64_t slopesBatchOffset,
     AscendC::LocalTensor<float> &workUb,
-    int64_t kvSStartIdx)
+    int32_t kvSStartIdx)
 {
-    if (rowNumCurLoop == 0 || qSBlockSize == 0 || columnNumRound == 0) {
+    if (rowNumCurLoop == 0 || qSBlockSize == 0 || columnNum == 0) {
         return;
     }
-    const int32_t count = static_cast<int32_t>(columnNumRound);
-
-    uint32_t prevHead = 0xFFFFFFFFu; 
-    int64_t  prevIq = -1;             
-    float    preSlope = 0.0f;
-
     for (uint32_t ri = 0; ri < rowNumCurLoop; ++ri) {
-        const uint32_t absRow = absRowStart + ri;
-        const uint32_t head   = absRow / qSBlockSize;          
-        const uint32_t token  = absRow % qSBlockSize;          
-        const int64_t  i_q    = qPosBase + static_cast<int64_t>(token);
-        const int64_t  baseColIdx = i_q - kvSStartIdx;
-        const float    slope  = slopesGm.GetValue(slopesGmOffset + head); 
+        uint32_t absRow = absRowStart + ri;
+        uint32_t head   = absRow / qSBlockSize;
+        uint32_t token  = absRow % qSBlockSize;
 
-        if (prevHead == 0xFFFFFFFFu || head != prevHead) {
-            if (i_q == prevIq) {
-                RescaleBiasRow(workUb, slope, preSlope, count);
-            } else {
-                BuildAbsBiasRow(workUb, baseColIdx, slope, count);
-            }
-        } else {
-            AdvanceAbsBiasRow(workUb, baseColIdx, slope, count, i_q - prevIq);
-        }
-        AddBiasToRow(scoreUb, scoreOffset + ri * rowStride, workUb, count);
-        prevHead = head;
-        prevIq = i_q;
-        preSlope = slope;
+        uint32_t qSIdx      = qSBlockBaseIdx + token;
+        uint32_t qKvSIdx    = alibiDiffS + qSIdx;
+        uint32_t qNIdx      = qNBlockBaseIdx + head;
+        int32_t  baseColIdx = qKvSIdx - kvSStartIdx;   
+        const float    slope      = slopesGm.GetValue(slopesBatchOffset + qNIdx);
+
+        BuildAbsBiasRow(workUb, baseColIdx, slope, columnNum);
+        AddBiasToRow(scoreUb, scoreOffset + ri * rowStride, workUb, columnNum);
     }
 }
 
 template <>
 __aicore__ inline void ApplyAlibiRows<AlibiMaskType::MASK_SWA>(
     AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
-    uint32_t rowStride, uint32_t columnNumRound,
+    uint32_t rowStride, uint32_t columnNum,
     uint32_t absRowStart, uint32_t rowNumCurLoop,
-    uint32_t qSBlockSize, int64_t qPosBase,
-    AscendC::GlobalTensor<float> &slopesGm, uint64_t slopesGmOffset,
+    uint32_t qSBlockSize,
+    uint32_t qSBlockBaseIdx, uint32_t alibiDiffS,
+    uint32_t qNBlockBaseIdx,
+    AscendC::GlobalTensor<float> &slopesGm, int64_t slopesBatchOffset,
     AscendC::LocalTensor<float> &workUb,
-    int64_t kvSStartIdx)
+    int32_t kvSStartIdx)
 {
     // TODO: implement SWA-specific optimized handling.
-    ApplyAlibiRows<AlibiMaskType::NO_MASK>(scoreUb, scoreOffset, rowStride, columnNumRound,
-                                           absRowStart, rowNumCurLoop, qSBlockSize, qPosBase,
-                                           slopesGm, slopesGmOffset, workUb, kvSStartIdx);
+    ApplyAlibiRows<AlibiMaskType::NO_MASK>(scoreUb, scoreOffset, rowStride, columnNum,
+        absRowStart, rowNumCurLoop, qSBlockSize,
+        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+        slopesGm, slopesBatchOffset, workUb, kvSStartIdx);
 }
 
-} 
+template <>
+__aicore__ inline void ApplyAlibiRows<AlibiMaskType::MASK_CAUSAL>(
+    AscendC::LocalTensor<float> &scoreUb, uint32_t scoreOffset,
+    uint32_t rowStride, uint32_t columnNum,
+    uint32_t absRowStart, uint32_t rowNumCurLoop,
+    uint32_t qSBlockSize,
+    uint32_t qSBlockBaseIdx, uint32_t alibiDiffS,
+    uint32_t qNBlockBaseIdx,
+    AscendC::GlobalTensor<float> &slopesGm, int64_t slopesBatchOffset,
+    AscendC::LocalTensor<float> &workUb,
+    int32_t kvSStartIdx)
+{
+    
+    ApplyAlibiRows<AlibiMaskType::NO_MASK>(scoreUb, scoreOffset, rowStride, columnNum,
+        absRowStart, rowNumCurLoop, qSBlockSize,
+        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+        slopesGm, slopesBatchOffset, workUb, kvSStartIdx);
+}
 
-#endif 
+}
+#endif

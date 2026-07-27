@@ -356,8 +356,8 @@ namespace SplitFuse {
                             kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(curBatchTmp + 1)) - prevKvSeqlenSumCur;
                         }
                     }
-                    uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize);
-                    uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur);
+                    uint32_t curQNBlockTileCur = GetQNBlockTile(qSeqlenCur, groupSize); // 单个block内QN的数量
+                    uint32_t qNBlockNumPerGroupCur = CeilDiv(groupSize, curQNBlockTileCur); // 每个group内的Block数量（head num / QN)，上取整
                     uint32_t curQNBlockNumCur = qNBlockNumPerGroupCur * kvHeads;
 
                     uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNumTmp;
@@ -527,7 +527,7 @@ namespace SplitFuse {
 
             uint64_t gmOffsetQ = qBOffset +
                 static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * strideQ +
-                static_cast<uint64_t>(qNStartIdx * embed);
+                static_cast<uint64_t>(qNStartIdx * embed); // B S N_q D
             uint64_t gmOffsetK = kBOffset + static_cast<uint64_t>(kvNIdx * embed);
             uint64_t gmOffsetV = vBOffset + static_cast<uint64_t>(kvNIdx * embedV);
             uint64_t gmOffsetO = oBOffset +
@@ -625,11 +625,12 @@ namespace SplitFuse {
                 }
             }
 
-            int64_t alibiDiffS = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
+            uint32_t alibiDiffS = kvSeqlen - qSeqlen;
             alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
-            int64_t qKvSIdx = alibiDiffS + static_cast<int64_t>(qSBlockIdx * curQSBlockTile);
-            uint64_t alibiSlopesGmOffset =
-                static_cast<uint64_t>(BIdx) * static_cast<uint64_t>(alibiSlopesBatchStride) + qNStartIdx;
+            uint32_t qSBlockBaseIdx = qSBlockIdx * curQSBlockTile;
+            uint32_t qNBlockBaseIdx = qNStartIdx;
+            // uint32_t qNBlockBaseIdx = qNBlockIdx * curQNBlockTile;
+            uint64_t slopesBatchOffset = static_cast<uint64_t>(BIdx) * static_cast<uint64_t>(alibiSlopesBatchStride);
 #endif
 #ifdef __DAV_C220_CUBE__
             LayoutQ layoutQTemp(rowNum, embed);
@@ -690,6 +691,7 @@ namespace SplitFuse {
                     uint64_t gmOffsetP = gmOffsetS;
                     uint32_t kvSStartIdx = kvSIdx * MAX_KV_STACK_LEN;
                     uint32_t kvSEndIdx = kvSStartIdx + stackSeqTile;
+                    // FIXME: 注意，MASK_CAUSAL模式下，会根据是否doTriUMask，调用两种不同的online softmax的operator，所以其中内部的alibi调用时传入的Alibi::AlibiMaskType模板参数不对！
                     if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
                         uint32_t triUp = noSkipKvS - qSBlockSize;
                         uint32_t triDown = noSkipKvS;
@@ -714,9 +716,11 @@ namespace SplitFuse {
                                     kvSStartIdx,
                                     kvSEndIdx,
                                     isSplitKV,
-                                    qKvSIdx, 
-                                    alibiSlopesGmOffset);
-                            } else {
+                                    qSBlockBaseIdx, 
+                                    qNBlockBaseIdx, 
+                                    alibiDiffS,
+                                    slopesBatchOffset);
+                            } else {  // 两者差别仅在isSplitKV上
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
@@ -735,8 +739,10 @@ namespace SplitFuse {
                                     kvSStartIdx,
                                     kvSEndIdx,
                                     false,
-                                    qKvSIdx, 
-                                    alibiSlopesGmOffset);
+                                    qSBlockBaseIdx, 
+                                    qNBlockBaseIdx, 
+                                    alibiDiffS,
+                                    slopesBatchOffset);
                             }
                         } else {
                             uint32_t noMaskStackSeqNum = (triUp + 1) / MAX_KV_STACK_LEN;
@@ -744,7 +750,7 @@ namespace SplitFuse {
                             int32_t lastNoMaskStackId;
                             if constexpr (IS_FD) {
                                 lastNoMaskStackId = (int32_t)noMaskStackSeqNum - 1 - (int32_t)kvStart;
-                                epilogueOnlineSoftmax(
+                                epilogueOnlineSoftmax( // 无MASK版本
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
                                     layOutP,
@@ -755,10 +761,15 @@ namespace SplitFuse {
                                     qSBlockSize,
                                     qNBlockSize,
                                     curStackTileMod,
-                                    isSplitKV, kvSStartIdx,
-                                    qKvSIdx, 
-                                    alibiSlopesGmOffset);
-                            } else {
+                                    isSplitKV, 
+                                    false, 
+                                    false, 
+                                    kvSStartIdx,
+                                    qSBlockBaseIdx, 
+                                    qNBlockBaseIdx, 
+                                    alibiDiffS,
+                                    slopesBatchOffset);
+                            } else { // 两者差别在isSplitKV和stackSeqCount相关参数
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
@@ -770,9 +781,14 @@ namespace SplitFuse {
                                     qSBlockSize,
                                     qNBlockSize,
                                     curStackTileMod,
-                                    false, kvSStartIdx,
-                                    qKvSIdx, 
-                                    alibiSlopesGmOffset);
+                                    false, 
+                                    false, 
+                                    false, 
+                                    kvSStartIdx,
+                                    qSBlockBaseIdx, 
+                                    qNBlockBaseIdx, 
+                                    alibiDiffS,
+                                    slopesBatchOffset);
                             }
                         }
                     } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
@@ -788,7 +804,7 @@ namespace SplitFuse {
                         if (doTriUMask) {
                             startsWithMaskTile = true;
                             startsWithMaskThenNomaskFlag = true;
-                            epilogueOnlineSoftmax(
+                            epilogueOnlineSoftmax( // SWA版本
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
                                     gMask,
@@ -808,15 +824,17 @@ namespace SplitFuse {
                                     windowSizeLeftEndLen,
                                     windowSizeRightStartLen,
                                     windowSizeRightEndLen,
-                                    qKvSIdx, 
-                                    alibiSlopesGmOffset);
+                                    qSBlockBaseIdx, 
+                                    qNBlockBaseIdx, 
+                                    alibiDiffS,
+                                    slopesBatchOffset);
                         } else {
                             bool isLastNoMaskStackTile = (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
                             uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
                             uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile ? RoundUp(kvSeqlenLimit, MAX_KV_STACK_LEN) : RoundDown(kvSeqlenLimit, MAX_KV_STACK_LEN);
                             uint32_t noMaskStackSeqNum = (alignedKvSeqlenLimit - kvStart * MAX_KV_STACK_LEN) / MAX_KV_STACK_LEN;
                             Arch::CrossCoreWaitFlag(qkReady);
-                            epilogueOnlineSoftmax(
+                            epilogueOnlineSoftmax( // 无MASK版本
                                 gP[gmOffsetP],
                                 gS[gmOffsetS],
                                 layOutP,
@@ -829,9 +847,12 @@ namespace SplitFuse {
                                 curStackTileMod,
                                 false,
                                 startsWithMaskTile,
-                                startsWithMaskThenNomaskFlag, kvSStartIdx,
-                                qKvSIdx, 
-                                alibiSlopesGmOffset);
+                                startsWithMaskThenNomaskFlag, 
+                                kvSStartIdx,
+                                qSBlockBaseIdx, 
+                                qNBlockBaseIdx, 
+                                alibiDiffS,
+                                slopesBatchOffset);
                             startsWithMaskTile = false;
                         }
                     } else {
@@ -848,9 +869,14 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 curStackTileMod,
-                                isSplitKV, kvSStartIdx,
-                                qKvSIdx, 
-                                alibiSlopesGmOffset);
+                                isSplitKV, 
+                                false, 
+                                false, 
+                                kvSStartIdx,
+                                qSBlockBaseIdx, 
+                                qNBlockBaseIdx, 
+                                alibiDiffS,
+                                slopesBatchOffset);
                         } else {
                             epilogueOnlineSoftmax(
                                 gP[gmOffsetP],
@@ -863,9 +889,14 @@ namespace SplitFuse {
                                 qSBlockSize,
                                 qNBlockSize,
                                 curStackTileMod,
-                                false, kvSStartIdx,
-                                qKvSIdx, 
-                                alibiSlopesGmOffset);
+                                false, 
+                                false, 
+                                false, 
+                                kvSStartIdx,
+                                qSBlockBaseIdx, 
+                                qNBlockBaseIdx, 
+                                alibiDiffS,
+                                slopesBatchOffset);
                         }
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);

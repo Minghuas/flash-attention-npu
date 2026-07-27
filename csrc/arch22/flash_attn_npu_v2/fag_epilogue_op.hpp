@@ -701,19 +701,19 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
         }
         if constexpr (HAS_ALIBI) {
-            const int64_t slopeOffset =
-                dbParam.bIdx * alibiSlopesBatchStride + dbParam.n2Idx * static_cast<int64_t>(g) + dbParam.gIdx;
-            int64_t alibiDiffS = static_cast<int64_t>(dbParam.actualS2Len) - static_cast<int64_t>(dbParam.actualS1Len);
-            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
-            const int64_t alibiQPosBase = alibiDiffS +
-                static_cast<int64_t>(dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize);
-            LocalTensor<float> bwdWorkUb =
-                unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
-            Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
-                0, s1ExtendSubGraph, s1ExtendSubGraph, alibiQPosBase,
-                alibiSlopesGm, slopeOffset, bwdWorkUb,
-                static_cast<int64_t>(s2VBegin));
-            AscendC::PipeBarrier<PIPE_V>();
+            // const int64_t slopeOffset =
+            //     dbParam.bIdx * alibiSlopesBatchStride + dbParam.n2Idx * static_cast<int64_t>(g) + dbParam.gIdx;
+            // int64_t alibiDiffS = static_cast<int64_t>(dbParam.actualS2Len) - static_cast<int64_t>(dbParam.actualS1Len);
+            // alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
+            // const int64_t alibiQPosBase = alibiDiffS +
+            //     static_cast<int64_t>(dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize);
+            // LocalTensor<float> bwdWorkUb =
+            //     unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
+            // Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
+            //     0, s1ExtendSubGraph, s1ExtendSubGraph, alibiQPosBase,
+            //     alibiSlopesGm, slopeOffset, bwdWorkUb,
+            //     static_cast<int64_t>(s2VBegin));
+            // AscendC::PipeBarrier<PIPE_V>();
         }
         ///////////////////////////////////////////////////////////////
         // attenMask
@@ -1400,23 +1400,23 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
         }
         if constexpr (HAS_ALIBI) {
-            const int64_t slopeOffset =
-                blockInfo.batchIdx * alibiSlopesBatchStride + blockInfo.nheadsKIdx * g + blockInfo.gIdx;
-            int64_t actualS1Len = ((__gm__ int32_t *)cu_seq_qlen_addr)[blockInfo.batchIdx];
-            int64_t actualS2Len = ((__gm__ int32_t *)cu_seq_kvlen_addr)[blockInfo.batchIdx];
-            int64_t alibiDiffS = actualS2Len - actualS1Len;
-            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
-            const int64_t alibiQPosBase = alibiDiffS +
-                static_cast<int64_t>(blockInfo.SeqQIdx) * S1_CUBESIZE + curSeqQIdx * s1VecSize;
-            LocalTensor<float> bwdWorkUb =
-                unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
-            // FIXME: Verify s2VStart is correct KV tile start for varlen (currently blockInfo.SeqKIdx * S2_CUBESIZE).
-            const int64_t s2VStart = static_cast<int64_t>(blockInfo.SeqKIdx) * S2_CUBESIZE;
-            Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
-                0, s1Extend, s1Extend, alibiQPosBase,
-                alibiSlopesGm, slopeOffset, bwdWorkUb,
-                s2VStart);
-            AscendC::PipeBarrier<PIPE_V>();
+            // const int64_t slopeOffset =
+            //     blockInfo.batchIdx * alibiSlopesBatchStride + blockInfo.nheadsKIdx * g + blockInfo.gIdx;
+            // int64_t actualS1Len = ((__gm__ int32_t *)cu_seq_qlen_addr)[blockInfo.batchIdx];
+            // int64_t actualS2Len = ((__gm__ int32_t *)cu_seq_kvlen_addr)[blockInfo.batchIdx];
+            // int64_t alibiDiffS = actualS2Len - actualS1Len;
+            // alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
+            // const int64_t alibiQPosBase = alibiDiffS +
+            //     static_cast<int64_t>(blockInfo.SeqQIdx) * S1_CUBESIZE + curSeqQIdx * s1VecSize;
+            // LocalTensor<float> bwdWorkUb =
+            //     unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
+            // // FIXME: Verify s2VStart is correct KV tile start for varlen (currently blockInfo.SeqKIdx * S2_CUBESIZE).
+            // const int64_t s2VStart = static_cast<int64_t>(blockInfo.SeqKIdx) * S2_CUBESIZE;
+            // Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(vecClc2Buffer, 0, s2ExtendAlign, s2ExtendAlign,
+            //     0, s1Extend, s1Extend, alibiQPosBase,
+            //     alibiSlopesGm, slopeOffset, bwdWorkUb,
+            //     s2VStart);
+            // AscendC::PipeBarrier<PIPE_V>();
         }
         LocalTensor<uint8_t> attenMaskUbuint8 =
             unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), ubBufferOffset + BoolBegin);
