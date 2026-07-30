@@ -625,12 +625,12 @@ namespace SplitFuse {
                 }
             }
 
-            uint32_t alibiDiffS = kvSeqlen - qSeqlen;
-            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;
-            uint32_t qSBlockBaseIdx = qSBlockIdx * curQSBlockTile;
-            uint32_t qNBlockBaseIdx = qNStartIdx;
-            // uint32_t qNBlockBaseIdx = qNBlockIdx * curQNBlockTile;
-            uint64_t slopesBatchOffset = static_cast<uint64_t>(BIdx) * static_cast<uint64_t>(alibiSlopesBatchStride);
+            int64_t alibiDiffS = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
+            alibiDiffS = (alibiDiffS < 0) ? 0 : alibiDiffS;  // 有符号，clamp 现在生效
+            int64_t qSBlockBaseIdx = qSBlockIdx * curQSBlockTile;
+            int64_t qNBlockBaseIdx = qNStartIdx;
+            // int64_t qNBlockBaseIdx = qNBlockIdx * curQNBlockTile;
+            int64_t slopesBatchOffset = static_cast<int64_t>(BIdx) * alibiSlopesBatchStride;
 #endif
 #ifdef __DAV_C220_CUBE__
             LayoutQ layoutQTemp(rowNum, embed);
