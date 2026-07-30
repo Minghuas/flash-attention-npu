@@ -39,6 +39,7 @@ BASE_WHEEL_URL = (
 # SKIP_NPU_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any NPU compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
+DEBUG_MODE = os.getenv("DEBUG_MODE", "FALSE") == "TRUE"
 # FLASH_ATTN_BUILD_VERSION selects which API generations to build:
 #   "v2"   build flash_attn_npu_arch22_v2     (910B/C only)
 #   "v3"   build the v3 backends selected by FLASH_ATTN_BUILD_NPU:
@@ -157,6 +158,7 @@ class BishengBuildExt(build_ext):
             "-ltorch_npu",
             "-ltiling_api",
             "-lplatform",
+            "-g" if DEBUG_MODE else ""
         ]
 
         # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
@@ -168,7 +170,7 @@ class BishengBuildExt(build_ext):
         # support, reintroduce an opt-in wrapper here.
         compiler = ["bisheng"]
 
-        compile_common = [*compiler, "-O2", *compile_arch_flags, "-fPIC", "-std=c++17",
+        compile_common = [*compiler, *(["-O0", "-g3"] if DEBUG_MODE else ["-O2"]), *compile_arch_flags, "-fPIC", "-std=c++17",
                           abi_flag, *include_flags]
 
         self._toolchains[ext_name] = (compiler, compile_common, link_arch_flags, link_flags)
@@ -196,7 +198,7 @@ class BishengBuildExt(build_ext):
         hcc_cpp = os.path.join(hcc_isys, "c++/7.3.0")
         aicpu_cmd = [
             "bisheng",
-            "-O2",
+            *(["-O0", "-g3"] if DEBUG_MODE else ["-O2"]),
             "-std=c++17",
             "-fvisibility=default",
             "-fvisibility-inlines-hidden",
