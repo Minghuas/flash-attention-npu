@@ -92,7 +92,8 @@ public:
         constexpr uint32_t LL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 11 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t ALIBI_WORK_UB_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 14 * UB_UINT8_VECTOR_SIZE;
+        // constexpr uint32_t ALIBI_WORK_UB_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 14 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t ALIBI_WORK_UB_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
@@ -891,7 +892,7 @@ public:
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, bool isSplitKV = false,
         bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false,
-        uint32_t kvSStartIdx = 0, uint32_t qSBlockBaseIdx = 0, uint32_t qNBlockBaseIdx = 0, uint32_t alibiDiffS = 0, uint64_t slopesBatchOffset = 0)
+        uint32_t kvSStartIdx = 0, int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0, int64_t alibiDiffS = 0, int64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -949,8 +950,8 @@ public:
                 }
                 if constexpr (HAS_ALIBI_) {
                     Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                        rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                        static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                         alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                         static_cast<int64_t>(kvSStartIdx));
                 }
@@ -977,7 +978,7 @@ public:
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, uint32_t triUp, uint32_t triDown,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false,
-        uint32_t qSBlockBaseIdx = 0, uint32_t qNBlockBaseIdx = 0, uint32_t alibiDiffS = 0, uint64_t slopesBatchOffset = 0)
+        int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0, int64_t alibiDiffS = 0, int64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1085,8 +1086,8 @@ public:
                 }
                 if constexpr (HAS_ALIBI_) {
                     Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                        rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                        static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                         alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                         static_cast<int64_t>(kvSStartIdx));
                 }
@@ -1144,7 +1145,7 @@ public:
         uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, int32_t kvSStartIdx, bool doTriUPreMask,
         bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
         int32_t nextTokenEndLen,
-        uint32_t qSBlockBaseIdx = 0, uint32_t qNBlockBaseIdx = 0, uint32_t alibiDiffS = 0, uint64_t slopesBatchOffset = 0)
+        int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0, int64_t alibiDiffS = 0, int64_t slopesBatchOffset = 0)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -1273,8 +1274,8 @@ public:
                     }
                     if constexpr (HAS_ALIBI_) {
                         Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
@@ -1309,8 +1310,8 @@ public:
                     }
                     if constexpr (HAS_ALIBI_) {
                         Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
@@ -1325,8 +1326,8 @@ public:
                     }
                     if constexpr (HAS_ALIBI_) {
                         Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                            rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, alibiDiffS, qNBlockBaseIdx,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                             static_cast<int64_t>(kvSStartIdx));
                     }
