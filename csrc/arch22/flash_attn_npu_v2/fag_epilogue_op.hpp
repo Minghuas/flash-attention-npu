@@ -611,6 +611,7 @@ public:
         pingpongIdx = dbParam.taskId % 2;
         s2Extend = (curS2Idx == s2VecLoop - 1) ? (dbParam.s2CvExtend - (s2VecLoop - 1) * s2VecSize) : s2VecSize;
         s2ExtendAlign = (s2Extend + 15) / 16 * 16;
+        uint32_t s1VBegin = dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize;
         uint32_t s2VBegin = dbParam.s2oIdx * s2CvInner + curS2Idx * s2VecSize;
 
         uint32_t ubBufferOffset = 0;
