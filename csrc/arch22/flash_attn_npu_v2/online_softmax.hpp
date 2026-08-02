@@ -15,7 +15,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "fa_block.h"
-#include "alibi.hpp"
+#include "alibi2.hpp"
 #include "kernel_common.hpp"
 
 // Forward-path ALiBi: every operator calls ApplyAlibiRows<NO_MASK> directly. All mask
@@ -892,7 +892,7 @@ public:
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, bool isSplitKV = false,
         bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false,
-        uint32_t kvSStartIdx = 0, int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0, int64_t alibiDiffS = 0, int64_t slopesBatchOffset = 0)
+        uint32_t kvSStartIdx = 0, int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0, int64_t alibiDiffS = 0, int64_t slopesBatchOffset = 0, bool is_causal = false)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
@@ -949,11 +949,19 @@ public:
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
                 if constexpr (HAS_ALIBI_) {
-                    Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
-                        static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
-                        alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
-                        static_cast<int64_t>(kvSStartIdx));
+                    if (is_causal) {
+                        ApplyAlibiCausal(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                            qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                            static_cast<int64_t>(kvSStartIdx));
+                    } else {
+                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                            static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
+                            qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS,
+                            alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
+                            static_cast<int64_t>(kvSStartIdx));
+                    }
                 }
                 SubCoreCompute<false>(
                     gOutputCurLoop,
@@ -1085,9 +1093,9 @@ public:
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
                 if constexpr (HAS_ALIBI_) {
-                    Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                    ApplyAlibiCausal(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
                         static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
-                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
+                        qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS,
                         alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
                         static_cast<int64_t>(kvSStartIdx));
                 }
@@ -1273,7 +1281,7 @@ public:
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     if constexpr (HAS_ALIBI_) {
-                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
                             static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
                         qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
@@ -1309,7 +1317,7 @@ public:
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     if constexpr (HAS_ALIBI_) {
-                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
                             static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
                         qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
@@ -1325,7 +1333,7 @@ public:
                         ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                     }
                     if constexpr (HAS_ALIBI_) {
-                        Alibi::ApplyAlibiRows<Alibi::AlibiMaskType::NO_MASK>(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
+                        ApplyAlibi(lsUbTensor, (pingpongFlag * MAX_UB_S_ELEM_NUM), columnNumRound, columnNum,
                             static_cast<int64_t>(rowOffsetThisSubBlock + rowOffsetCurLoop), rowNumCurLoop, qSBlockSize,
                         qSBlockBaseIdx, qNBlockBaseIdx, alibiDiffS, 
                             alibiSlopesGm, slopesBatchOffset, alibiWorkUb,
