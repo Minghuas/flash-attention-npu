@@ -460,6 +460,8 @@ test_cases = [
     (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 50.0, True),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 30.0, True),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 50.0, True),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, False, 30.0, True),
+    
 ]
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap, use_alibi", test_cases)
 def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap, use_alibi):

@@ -187,7 +187,18 @@ test_cases_bsnd = [
     (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 0.0, True),
     (torch.float16, 5, 4, 4, 1024, 1024, 128, True, 30.0, True),
     (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, 30.0, True),
+    
+    (torch.bfloat16, 4, 2, 1, 512, 519, 128, True, 30.0, True),
+    (torch.bfloat16, 4, 2, 1, 567, 567, 128, True, 30.0, True),
+    (torch.bfloat16, 2, 2, 1, 513, 567, 128, False, 30.0, True),
+    (torch.bfloat16, 4, 2, 1, 256, 513, 128, False, 30.0, True),
+    
     (torch.bfloat16, 4, 2, 1, 513, 513, 128, False, 30.0, True),
+    (torch.bfloat16, 4, 2, 1, 519, 519, 128, True, 30.0, True),
+    (torch.bfloat16, 4, 2, 1, 567, 589, 128, True, 30.0, True),
+    (torch.bfloat16, 4, 2, 1, 515, 515, 128, False, 30.0, True),
+    
+
 ]
 
 

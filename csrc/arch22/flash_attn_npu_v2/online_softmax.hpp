@@ -92,8 +92,7 @@ public:
         constexpr uint32_t LL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 11 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
-        // constexpr uint32_t ALIBI_WORK_UB_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 14 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t ALIBI_WORK_UB_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t ALIBI_WORK_UB_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;

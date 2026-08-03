@@ -200,7 +200,7 @@ public:
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
     constexpr static int64_t SFMG_UB_SIZE = 8 * 1024;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
-    constexpr static int64_t ALIBI_BWD_WORK_UB_OFFSET = TMP_UB_OFFSET;
+    constexpr static int64_t ALIBI_BWD_WORK_UB_OFFSET = 32 * 1024;
 
     constexpr static uint32_t MMAD_BASE_SIZE = 128;
     constexpr static uint32_t S_BASE_SIZE = 512;
@@ -695,8 +695,8 @@ public:
                 cal_repeat_num, SOFTCAP_UB_OFFSET);
             AscendC::Duplicate<float, false>(softcapBuffer, 2 * softcapValue, (uint64_t)0, 1, 1, 8);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Div<float, false>(vecClc2Buffer, softcapBuffer, vecClc2Buffer, (uint64_t)0, 
-                    (s1ExtendSubGraph*s2ExtendAlign)/64, {1, 1, 1, 8, 0, 8});
+            AscendC::Div<float, false>(vecClc2Buffer, softcapBuffer, vecClc2Buffer, (uint64_t)0,
+                    (s1ExtendSubGraph*s2ExtendAlign + 63) / 64, {1, 1, 1, 8, 0, 8});
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1ExtendSubGraph * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
@@ -1125,7 +1125,7 @@ public:
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
 
     constexpr static  uint32_t AttenMaskDimS2 = 2048;
-    constexpr static uint32_t ALIBI_BWD_WORK_UB_OFFSET = TMP_UB_OFFSET;
+    constexpr static uint32_t ALIBI_BWD_WORK_UB_OFFSET = 32 * 1024;
 
     uint32_t blockIdx;
     uint32_t cubeBlockIdx;
@@ -1403,7 +1403,7 @@ public:
                 cal_repeat_num, SOFTCAP_UB_OFFSET);
             AscendC::Duplicate<float, false>(softcapBuffer, 2 * softcapValue, (uint64_t)0, 1, 1, 8);
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Div<float, false>(vecClc2Buffer, softcapBuffer, vecClc2Buffer, (uint64_t)0, s1Extend*s2ExtendAlign/64, {1, 1, 1, 8, 0, 8});
+            AscendC::Div<float, false>(vecClc2Buffer, softcapBuffer, vecClc2Buffer, (uint64_t)0, (s1Extend*s2ExtendAlign + 63) / 64, {1, 1, 1, 8, 0, 8});
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1Extend * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
