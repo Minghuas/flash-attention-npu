@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch_npu
 
-from flash_attn_npu_v2 import flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu import flash_attn_func, flash_attn_varlen_func
 
 torch_npu.npu.set_device(1)
 
