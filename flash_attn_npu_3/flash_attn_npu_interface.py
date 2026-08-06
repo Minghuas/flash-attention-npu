@@ -1139,10 +1139,11 @@ def get_scheduler_metadata(
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
     attention_chunk=0,
-    has_softcap=False,
+    softcap=0.0,   # 0.0 means deactivated
     num_splits=0,    # Can be tuned for speed
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
+    softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
 ):
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
@@ -1161,9 +1162,10 @@ def get_scheduler_metadata(
         causal,
         window_size[0], window_size[1],
         attention_chunk,
-        has_softcap,
+        softcap,
         num_splits,
         pack_gqa,
         sm_margin,
+        softmax_scale,
     )
     return scheduler_metadata

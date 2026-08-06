@@ -32,9 +32,9 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
 {
     FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
-    const bool causal = metaArgs->maskType != 0;
+    const bool hasMask = metaArgs->maskType != 0;
     FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
-        metaArgs->metaOutAddr + fa_metadata::TilingOffset(causal));
+        metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
     const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 
@@ -53,6 +53,9 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->maxNumBlocksPerBatch = metaArgs->maxNumBlocksPerBatch;
     tilingData->maskType = metaArgs->maskType;
     tilingData->scaleValue = metaArgs->scaleValue;
+    tilingData->softcapValue = metaArgs->softcapValue;
+    tilingData->windowSizeLeft = metaArgs->windowSizeLeft;
+    tilingData->windowSizeRight = metaArgs->windowSizeRight;
     tilingData->maxQSeqlen = metaArgs->maxQSeqlen;
     tilingData->numSplits = metaArgs->numSplits > 0u ? metaArgs->numSplits : 1u;
 
@@ -135,7 +138,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         }
     }
 
-    if (causal) {
+    if (hasMask) {
+        // Same triu(1) mask the host path uploads for both causal and band/SWA;
+        // the band restriction itself is applied by the kernel from
+        // windowSizeLeft/Right in the tiling data.
         int8_t *maskBase = reinterpret_cast<int8_t *>(metaArgs->metaOutAddr);
         const uint32_t maskDim = fa_metadata::MASK_DIM;
         for (uint32_t row = 0; row < maskDim; ++row) {
