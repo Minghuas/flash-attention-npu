@@ -456,3 +456,61 @@ def test_flash_attn_kvcache_metadata_tnd(
         data_type=data_type,
         is_causal=is_causal,
     )
+
+
+@pytest.mark.parametrize("is_causal", [False])
+def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
+    """FD + metadata path with idle cores (needCoreNum < blockDim)."""
+    batch_size, num_heads, kv_heads = 1, 1, 1
+    q_seqlen, kv_seqlen, head_size, block_size = 1, 1024, 128, 128
+    data_type = torch.bfloat16
+
+    query = _rand_npu((q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    key_cache, value_cache, page_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cu_seqlens_q = _int32_npu([0, q_seqlen])
+    cache_seqlens = _int32_npu([kv_seqlen])
+    scale = 1.0 / (head_size ** 0.5)
+
+    scheduler_metadata = _metadata(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        cu_seqlens_q=cu_seqlens_q,
+        page_size=block_size,
+        is_causal=is_causal,
+    )
+    output_npu, softmax_lse_npu, *_ = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=q_seqlen,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=WINDOW_SIZE,
+        rotary_interleaved=False,
+        scheduler_metadata=scheduler_metadata,
+        num_splits=0,
+        return_softmax_lse=True,
+    )
+
+    key_cpu, value_cpu = _paged_kv_for_batch(
+        key_cache.cpu(), value_cache.cpu(), page_table.cpu(), 0, kv_seqlen, block_size
+    )
+    golden_out, golden_lse = _ref_out_lse(
+        query.cpu(), key_cpu, value_cpu, scale, data_type, is_causal
+    )
+    torch.testing.assert_close(
+        output_npu.cpu().reshape(q_seqlen, num_heads, head_size), golden_out, rtol=RTOL, atol=ATOL
+    )
+    torch.testing.assert_close(softmax_lse_npu.cpu(), golden_lse, rtol=RTOL, atol=ATOL)
+

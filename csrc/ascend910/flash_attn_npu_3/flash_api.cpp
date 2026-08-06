@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 
 // mha_fwd_kvcache.cpp (SplitFuse::FAInfer) and fag_kernel.cpp (FAGGeneral) are
 // compiled separately in the autogen dispatch TUs; flash_api.cpp only needs
@@ -10,6 +11,7 @@
 // the fa_split / fa_metadata host helpers.
 #include "tilingdata.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "acl/acl.h"
 #include "runtime/rt_ffts.h"
@@ -40,18 +42,48 @@ extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args)
+static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
+                                           const at::Tensor &seqlensK,
+                                           const std::optional<at::Tensor> &cuSeqlensQ)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
-    aclrtStream aicpuStream = c10_npu::getNPUStreamFromPool().stream(false);
-    static thread_local FAMetadataArgs metaArgs;
-    metaArgs = args;
+    c10_npu::NPUStream currentStream = c10_npu::getCurrentNPUStream();
+    c10_npu::NPUStream aicpuStream = c10_npu::getNPUStreamFromPool();
+    aclrtStream curHandle = currentStream.stream(false);
+    aclrtStream aicpuHandle = aicpuStream.stream(false);
 
-    ComputeFAMetadata<<<1, nullptr, aicpuStream>>>(&metaArgs, sizeof(metaArgs));
-    ACL_CHECK(aclrtSynchronizeStream(aicpuStream));
+    struct MetadataEvents {
+        aclrtEvent inputReady = nullptr;
+        aclrtEvent metadataDone = nullptr;
+    };
+    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> eventsByDevice;
+    MetadataEvents &events = eventsByDevice[currentStream.device_index()];
+    if (events.inputReady == nullptr) {
+        ACL_CHECK(aclrtCreateEvent(&events.inputReady));
+        ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
+    }
+
+    FAMetadataArgs metaArgs = args;
+    auto metadata_task = [curHandle, aicpuHandle,
+                          inputReady = events.inputReady,
+                          metadataDone = events.metadataDone, metaArgs]() mutable -> int {
+        ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
+        ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
+        ComputeFAMetadata<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
+        ACL_CHECK(aclrtRecordEvent(metadataDone, aicpuHandle));
+        ACL_CHECK(aclrtStreamWaitEvent(curHandle, metadataDone));
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
+
+    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
+    c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
+    if (cuSeqlensQ.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
+    }
     return meta;
 }
 
@@ -592,7 +624,7 @@ at::Tensor get_scheduler_metadata(
     args.pagedKV = page_size.has_value() ? 1U : 0U;
     args.numSplits = static_cast<uint32_t>(num_splits);
     args.scaleValue = 1.0f / std::sqrt(static_cast<float>(headdim));
-    return GetSchedulerMetadataImpl(args);
+    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q);
 }
 
 std::vector<at::Tensor>
