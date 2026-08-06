@@ -80,7 +80,8 @@ def _flash_attn_forward(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
+    return_softmax: bool,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_npu.fwd(
@@ -97,6 +98,7 @@ def _flash_attn_forward(
         softcap,
         return_softmax,
         None,
+        scheduler_metadata,
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -113,7 +115,8 @@ def _flash_attn_forward_fake(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
+    return_softmax: bool,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
@@ -155,6 +158,7 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_npu.varlen_fwd(
@@ -179,6 +183,7 @@ def _flash_attn_varlen_forward(
         softcap,
         return_softmax,
         None,
+        scheduler_metadata,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -206,6 +211,7 @@ def _flash_attn_varlen_forward_fake(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    scheduler_metadata: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None
@@ -811,6 +817,23 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        # Training interfaces do not expose scheduler_metadata (aligned with
+        # official flash-attn); the scheduler metadata is computed internally on
+        # the AICPU so no D2H/H2D sync breaks the pipeline.
+        batch_size, seqlen_q, num_heads, head_size = q.shape
+        seqlen_k, num_heads_k = k.shape[1], k.shape[2]
+        cache_seqlens = torch.full(
+            (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
+        )
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k, head_size,
+            cache_seqlens,
+            qkv_dtype=q.dtype,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+        )
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
             q,
             k,
@@ -823,6 +846,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
+            scheduler_metadata=scheduler_metadata,
         )
         if is_grad:
             ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
@@ -899,6 +923,24 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
+        # Training interfaces do not expose scheduler_metadata (aligned with
+        # official flash-attn); the scheduler metadata is computed internally on
+        # the AICPU so no D2H/H2D sync breaks the pipeline. cache_seqlens holds
+        # the per-batch KV lengths and stays on device.
+        batch_size = cu_seqlens_q.shape[0] - 1
+        num_heads, head_size = q.shape[1], q.shape[2]
+        num_heads_k = k.shape[1]
+        cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, head_size,
+            cache_seqlens,
+            qkv_dtype=q.dtype,
+            cu_seqlens_q=cu_seqlens_q,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+        )
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
             q,
             k,
@@ -916,6 +958,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
+            scheduler_metadata=scheduler_metadata,
         )
         if is_grad:
             ctx.save_for_backward(
@@ -1454,6 +1497,7 @@ def flash_attn_with_kvcache(
     rotary_interleaved=True,
     alibi_slopes=None,
     num_splits=0,
+    scheduler_metadata=None,
     return_softmax_lse=False,
 ):
     """
@@ -1535,6 +1579,11 @@ def flash_attn_with_kvcache(
            If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
            to automatically determine the number of splits.
            Don't change this unless you know what you are doing.
+        scheduler_metadata: Optional scheduler metadata precomputed on the AICPU by
+            get_scheduler_metadata. When given, the forward consumes the AICPU-computed
+            tiling (and optional mask) directly and skips the host-side computation
+            (which would otherwise sync on cache_seqlens); it must have been created with
+            matching causal / window_size / softcap / softmax_scale / seqlen-bound arguments.
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Return:
@@ -1576,5 +1625,39 @@ def flash_attn_with_kvcache(
         softcap,
         rotary_interleaved,
         num_splits,
+        scheduler_metadata,
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+def get_scheduler_metadata(
+    batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
+    cache_seqlens: torch.Tensor,
+    qkv_dtype=torch.bfloat16,
+    headdim_v=None,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    page_size: Optional[int] = None,
+    causal=False,
+    window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,   # 0.0 means deactivated
+    softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+):
+    """Precompute the forward scheduler metadata (tiling, optional mask, and —
+    for paged KV cache — the flash-decode split schedule) on the AICPU. Pass the
+    result as scheduler_metadata to flash_attn_with_kvcache to keep the forward
+    free of D2H/H2D syncs."""
+    cache_seqlens = maybe_contiguous(cache_seqlens)
+    if headdim_v is None:
+        headdim_v = headdim
+    scheduler_metadata = flash_attn_npu.get_scheduler_metadata(
+        batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim, headdim_v,
+        qkv_dtype,
+        cache_seqlens,
+        cu_seqlens_q,
+        page_size,
+        causal,
+        window_size[0], window_size[1],
+        softcap,
+        softmax_scale,
+    )
+    return scheduler_metadata

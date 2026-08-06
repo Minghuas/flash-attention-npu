@@ -274,17 +274,22 @@ class BishengBuildExt(build_ext):
         return bool(getattr(self, "force", None)) or \
             os.getenv("FLASH_ATTN_FORCE_REBUILD", "FALSE") == "TRUE"
 
-    def _build_aicpu_metadata(self, ext_fullpath):
-        """Compile fa_metadata.aicpu (host AICPU object) for the ascend910 v3 extension
-        (flash_attn_npu_3). This is a separate `bisheng -x aicpu` invocation
-        (host CPU code cross-compiled with hcc, not ASC device code); the
-        resulting object is linked into flash_attn_npu_3 alongside the ASC device
-        objects. Returns the .o path, or None if there is no aicpu source.
-        Preserved from main's metadata feature through the parallel-pipeline
-        refactor."""
+    def _build_aicpu_metadata(self, ext_fullpath, ext_name):
+        """Compile fa_metadata.aicpu (host AICPU object) for the ascend910
+        extensions that carry the scheduler-metadata feature (v2 and v3). This
+        is a separate `bisheng -x aicpu` invocation (host CPU code
+        cross-compiled with hcc, not ASC device code); the resulting object is
+        linked into the extension alongside the ASC device objects. Returns the
+        .o path, or None if there is no aicpu source."""
         ascend_home = os.getenv("ASCEND_TOOLKIT_HOME", os.getenv("ASCEND_HOME_PATH", "/usr/local/Ascend"))
-        v3_dir = os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3")
-        aicpu_src = os.path.join(v3_dir, "fa_metadata.aicpu")
+        aicpu_src_dirs = {
+            "flash_attn_npu.flash_attn_npu": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu"),
+            "flash_attn_npu_3.flash_attn_npu_3": os.path.join(this_dir, "csrc/ascend910", "flash_attn_npu_3"),
+        }
+        src_dir = aicpu_src_dirs.get(ext_name)
+        if src_dir is None:
+            return None
+        aicpu_src = os.path.join(src_dir, "fa_metadata.aicpu")
         if not os.path.exists(aicpu_src):
             return None
         aicpu_obj = os.path.join(os.path.dirname(ext_fullpath), "fa_metadata.o")
@@ -310,7 +315,7 @@ class BishengBuildExt(build_ext):
             "-D_FORTIFY_SOURCE=2",
             "-D_GNU_SOURCE",
             f"-I{aicpu_inc}",
-            f"-I{v3_dir}",  # tilingdata.h
+            f"-I{src_dir}",  # tilingdata.h
             f"--cce-aicpu-L{aicpu_lib}",
             "--cce-aicpu-laicpu_api",
             f"--cce-aicpu-toolkit-path={os.path.join(hcc, 'bin')}",
@@ -385,15 +390,15 @@ class BishengBuildExt(build_ext):
                 ext_name, obj = fut.result()
                 objs_by_ext[ext_name].append(obj)
 
-        # AICPU metadata object for the ascend910 v3 extension: compiled separately
-        # (host code, `bisheng -x aicpu`) and appended to that extension's link
-        # set. Built after the parallel ASC compiles, before linking.
+        # AICPU metadata object for the ascend910 extensions carrying the
+        # scheduler-metadata feature: compiled separately (host code,
+        # `bisheng -x aicpu`) and appended to each extension's link set. Built
+        # after the parallel ASC compiles, before linking.
         for ext in self.extensions:
-            if ext.name == "flash_attn_npu_3.flash_attn_npu_3":
-                ext_fullpath = self.get_ext_fullpath(ext.name)
-                aicpu_obj = self._build_aicpu_metadata(ext_fullpath)
-                if aicpu_obj is not None:
-                    objs_by_ext[ext.name].append(aicpu_obj)
+            ext_fullpath = self.get_ext_fullpath(ext.name)
+            aicpu_obj = self._build_aicpu_metadata(ext_fullpath, ext.name)
+            if aicpu_obj is not None:
+                objs_by_ext[ext.name].append(aicpu_obj)
 
         # Link each extension from its own object files (serial; link is cheap
         # relative to compile - measured ~1s/ext - so parallelizing would save

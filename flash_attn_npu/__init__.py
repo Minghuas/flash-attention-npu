@@ -18,6 +18,7 @@ if is_ascend910():
         flash_attn_varlen_kvpacked_func,
         flash_attn_varlen_qkvpacked_func,
         flash_attn_with_kvcache,
+        get_scheduler_metadata,
     )
 else:
     raise RuntimeError(f"Unsupported Ascend device: {torch_npu.npu.get_device_name()}")
