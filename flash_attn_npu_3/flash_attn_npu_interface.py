@@ -582,10 +582,28 @@ class FlashAttnFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
-        scheduler_metadata=None,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+        # Training interfaces do not expose scheduler_metadata (aligned with
+        # official flash-attn); the scheduler metadata is computed internally on
+        # the AICPU so no D2H/H2D sync breaks the pipeline.
+        batch_size, seqlen_q, num_heads, head_size = q.shape
+        seqlen_k, num_heads_k = k.shape[1], k.shape[2]
+        cache_seqlens = torch.full(
+            (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
+        )
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k, head_size,
+            cache_seqlens,
+            qkv_dtype=q.dtype,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=num_splits,
+            sm_margin=sm_margin,
+            softmax_scale=softmax_scale,
+        )
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
         out, softmax_lse, *rest = _flash_attn_forward(
             q,
@@ -652,7 +670,7 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., :head_size_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_og]
         dv = dv[..., :head_size_og]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -681,10 +699,32 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic=False,
         sm_margin=0,
         return_softmax=False,
-        scheduler_metadata=None,
     ):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
+        # Training interfaces do not expose scheduler_metadata (aligned with
+        # official flash-attn); the scheduler metadata is computed internally on
+        # the AICPU so no D2H/H2D sync breaks the pipeline. cache_seqlens holds
+        # the per-batch KV lengths and stays on device.
+        batch_size = cu_seqlens_q.shape[0] - 1
+        num_heads, head_size = q.shape[1], q.shape[2]
+        num_heads_k = k.shape[1]
+        if seqused_k is not None:
+            cache_seqlens = seqused_k
+        else:
+            cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        scheduler_metadata = get_scheduler_metadata(
+            batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, head_size,
+            cache_seqlens,
+            qkv_dtype=q.dtype,
+            cu_seqlens_q=cu_seqlens_q,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            num_splits=num_splits,
+            sm_margin=sm_margin,
+            softmax_scale=softmax_scale,
+        )
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_varlen_forward(
         out, softmax_lse, *rest = _flash_attn_forward(
             q,
@@ -760,7 +800,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., :head_size_og]  # We could have padded the head dimension
         dk = dk[..., :head_size_og]
         dv = dv[..., :head_size_og]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -841,7 +881,6 @@ def flash_attn_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
-    scheduler_metadata=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -904,7 +943,6 @@ def flash_attn_func(
         deterministic,
         sm_margin,
         return_attn_probs,
-        scheduler_metadata,
     )
 
 
@@ -930,7 +968,6 @@ def flash_attn_varlen_func(
     deterministic=False,
     sm_margin=0,
     return_attn_probs=False,
-    scheduler_metadata=None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -954,7 +991,6 @@ def flash_attn_varlen_func(
         deterministic,
         sm_margin,
         return_attn_probs,
-        scheduler_metadata,
     )
 
 

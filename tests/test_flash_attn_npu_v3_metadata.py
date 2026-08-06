@@ -247,30 +247,36 @@ KV_CACHE_TND_CASES = [
 ]
 
 
+@pytest.fixture
+def metadata_spy(monkeypatch):
+    """Spy on get_scheduler_metadata to prove the training interfaces route
+    through the AICPU scheduler-metadata path internally (official flash-attn
+    only exposes scheduler_metadata on flash_attn_with_kvcache)."""
+    from flash_attn_npu_3 import flash_attn_npu_interface as interface
+    calls = []
+    original = interface.get_scheduler_metadata
+
+    def _spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(interface, "get_scheduler_metadata", _spy)
+    return calls
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
 )
 def test_flash_attn_func_metadata_bsnd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    metadata_spy,
 ):
     query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, WIDE_RANGE)
     key = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
     value = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
-    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
     scale = 1.0 / (head_size ** 0.5)
 
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        is_causal=is_causal,
-    )
     output_npu, softmax_lse_npu = flash_attn_func(
         query,
         key,
@@ -280,8 +286,8 @@ def test_flash_attn_func_metadata_bsnd(
         window_size=WINDOW_SIZE,
         num_splits=1,
         return_attn_probs=True,
-        scheduler_metadata=scheduler_metadata,
     )
+    assert len(metadata_spy) == 1
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -305,7 +311,8 @@ def test_flash_attn_func_metadata_bsnd(
     FLASH_ATTN_VARLEN_CASES,
 )
 def test_flash_attn_varlen_func_metadata_tnd(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    metadata_spy,
 ):
     q_lengths = [q_seqlen] * batch_size
     kv_lengths = [kv_seqlen] * batch_size
@@ -313,25 +320,12 @@ def test_flash_attn_varlen_func_metadata_tnd(
     kv_offsets = _prefix_sums(kv_lengths)
     cu_seqlens_q = _int32_npu(q_offsets)
     cu_seqlens_k = _int32_npu(kv_offsets)
-    cache_seqlens = _int32_npu(kv_lengths)
 
     query = _rand_npu((q_offsets[-1], num_heads, head_size), data_type, WIDE_RANGE)
     key = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
     value = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
     scale = 1.0 / (head_size ** 0.5)
 
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        cu_seqlens_q=cu_seqlens_q,
-        is_causal=is_causal,
-    )
     output_npu = flash_attn_varlen_func(
         query,
         key,
@@ -344,8 +338,8 @@ def test_flash_attn_varlen_func_metadata_tnd(
         causal=is_causal,
         window_size=WINDOW_SIZE,
         num_splits=1,
-        scheduler_metadata=scheduler_metadata,
     )
+    assert len(metadata_spy) == 1
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -593,26 +587,14 @@ KV_CACHE_SWA_SOFTCAP_CASES = [
     FLASH_ATTN_FUNC_SWA_CASES,
 )
 def test_flash_attn_func_metadata_swa(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
+    metadata_spy,
 ):
     query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, WIDE_RANGE)
     key = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
     value = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
-    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
     scale = 1.0 / (head_size ** 0.5)
 
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        is_causal=is_causal,
-        window_size=window_size,
-    )
     output_npu, softmax_lse_npu = flash_attn_func(
         query,
         key,
@@ -622,8 +604,8 @@ def test_flash_attn_func_metadata_swa(
         window_size=window_size,
         num_splits=1,
         return_attn_probs=True,
-        scheduler_metadata=scheduler_metadata,
     )
+    assert len(metadata_spy) == 1
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -649,27 +631,13 @@ def test_flash_attn_func_metadata_swa(
 )
 def test_flash_attn_func_metadata_softcap_scale(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
-    is_causal, softcap, softmax_scale
+    is_causal, softcap, softmax_scale, metadata_spy,
 ):
     query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, WIDE_RANGE)
     key = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
     value = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
-    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
     scale = softmax_scale if softmax_scale is not None else 1.0 / (head_size ** 0.5)
 
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        is_causal=is_causal,
-        softcap=softcap,
-        softmax_scale=softmax_scale,
-    )
     output_npu, softmax_lse_npu = flash_attn_func(
         query,
         key,
@@ -680,8 +648,8 @@ def test_flash_attn_func_metadata_softcap_scale(
         softcap=softcap,
         num_splits=1,
         return_attn_probs=True,
-        scheduler_metadata=scheduler_metadata,
     )
+    assert len(metadata_spy) == 1
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -706,7 +674,8 @@ def test_flash_attn_func_metadata_softcap_scale(
     FLASH_ATTN_VARLEN_SWA_CASES,
 )
 def test_flash_attn_varlen_func_metadata_swa(
-    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
+    metadata_spy,
 ):
     q_lengths = [q_seqlen] * batch_size
     kv_lengths = [kv_seqlen] * batch_size
@@ -714,26 +683,12 @@ def test_flash_attn_varlen_func_metadata_swa(
     kv_offsets = _prefix_sums(kv_lengths)
     cu_seqlens_q = _int32_npu(q_offsets)
     cu_seqlens_k = _int32_npu(kv_offsets)
-    cache_seqlens = _int32_npu(kv_lengths)
 
     query = _rand_npu((q_offsets[-1], num_heads, head_size), data_type, WIDE_RANGE)
     key = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
     value = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
     scale = 1.0 / (head_size ** 0.5)
 
-    scheduler_metadata = _metadata(
-        batch_size=batch_size,
-        q_seqlen=q_seqlen,
-        kv_seqlen=kv_seqlen,
-        num_heads=num_heads,
-        kv_heads=kv_heads,
-        head_size=head_size,
-        cache_seqlens=cache_seqlens,
-        data_type=data_type,
-        cu_seqlens_q=cu_seqlens_q,
-        is_causal=is_causal,
-        window_size=window_size,
-    )
     output_npu = flash_attn_varlen_func(
         query,
         key,
@@ -746,8 +701,8 @@ def test_flash_attn_varlen_func_metadata_swa(
         causal=is_causal,
         window_size=window_size,
         num_splits=1,
-        scheduler_metadata=scheduler_metadata,
     )
+    assert len(metadata_spy) == 1
 
     key_cpu = key.detach().cpu()
     value_cpu = value.detach().cpu()
@@ -839,15 +794,16 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
 
 
 @pytest.mark.parametrize("is_causal, window_size", [(True, (-1, -1)), (False, (128, 128))])
-def test_flash_attn_func_metadata_mask_mismatch_rejected(is_causal, window_size):
+def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(is_causal, window_size):
     """A mask-less metadata buffer must be rejected by a fwd call needing a mask."""
     data_type = torch.bfloat16
     batch_size, num_heads, kv_heads = 1, 2, 2
-    q_seqlen, kv_seqlen, head_size = 512, 512, 128
+    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
     query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
-    key = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, SMALL_RANGE)
-    value = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, SMALL_RANGE)
+    key_cache, value_cache, page_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
     cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
 
     scheduler_metadata = _metadata(
@@ -859,15 +815,18 @@ def test_flash_attn_func_metadata_mask_mismatch_rejected(is_causal, window_size)
         head_size=head_size,
         cache_seqlens=cache_seqlens,
         data_type=data_type,
+        page_size=block_size,
         is_causal=False,
     )
     with pytest.raises(RuntimeError, match="scheduler_metadata buffer is too small"):
-        flash_attn_func(
+        flash_attn_with_kvcache(
             query,
-            key,
-            value,
+            key_cache,
+            value_cache,
+            cache_seqlens=cache_seqlens,
+            page_table=page_table,
             causal=is_causal,
             window_size=window_size,
-            num_splits=1,
+            rotary_interleaved=False,
             scheduler_metadata=scheduler_metadata,
         )
