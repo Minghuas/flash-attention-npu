@@ -1039,17 +1039,20 @@ template <
     class ElementVecDtype,
     InputLayout inputLayout,
     class TilingData,
+    uint32_t MASK_TYPE_,
     bool HAS_SOFTCAP_>
 class BlockEpilogue<
-    EpilogueAtlasA2FAGOp<HAS_SOFTCAP_>,
+    EpilogueAtlasA2FAGOp<MASK_TYPE_, HAS_SOFTCAP_>,
     ElementVecDtype,
     std::integral_constant<InputLayout, inputLayout>,
     TilingData>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2FAGOp<HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueAtlasA2FAGOp<MASK_TYPE_, HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
+    static constexpr uint32_t MASK_TYPE = MASK_TYPE_;
     static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
+    static constexpr bool IS_ATTEN_MASK = (MASK_TYPE_ != static_cast<uint32_t>(MaskType::NO_MASK));
 
     static constexpr InputLayout getLayout()
     {
@@ -1369,12 +1372,14 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
         }
 
-        LocalTensor<uint8_t> attenMaskUbuint8 =
-            unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), ubBufferOffset + BoolBegin);
-        if (blockInfo.SeqQIdx == blockInfo.SeqKIdx) {
-            CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8[curSeqQIdx * s1VecSize * 128], s1Extend, s2ExtendAlign,
-                S2_CUBESIZE, 0);
-            AscendC::PipeBarrier<PIPE_V>();
+        if constexpr (IS_ATTEN_MASK) {
+            LocalTensor<uint8_t> attenMaskUbuint8 =
+                unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), ubBufferOffset + BoolBegin);
+            if (blockInfo.SeqQIdx == blockInfo.SeqKIdx) {
+                CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8[curSeqQIdx * s1VecSize * 128], s1Extend, s2ExtendAlign,
+                    S2_CUBESIZE, 0);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
         }
 
         ///////////////////////////////////////////////////////////////
@@ -1501,10 +1506,12 @@ public:
         event_t mte2WaitMte3 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE3_MTE2));
         AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3);
-        if (taskId == 0) {
-            LocalTensor<uint8_t> attenMaskUbuint8 =
-                    unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), BoolBegin);
-            CopyInAttenMaskBool(attenMaskUbuint8, 0, 128, 128);
+        if constexpr (IS_ATTEN_MASK) {
+            if (taskId == 0) {
+                LocalTensor<uint8_t> attenMaskUbuint8 =
+                        unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), BoolBegin);
+                CopyInAttenMaskBool(attenMaskUbuint8, 0, 128, 128);
+            }
         }
         AscendC::PipeBarrier<PIPE_V>();
 
