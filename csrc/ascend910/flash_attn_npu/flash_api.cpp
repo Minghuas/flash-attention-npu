@@ -30,6 +30,8 @@
 using namespace Catlass;
 using namespace KernelCommon;
 
+#define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+
 uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 {
     uint32_t qRowNumCeil = Q_TILE_CEIL;
@@ -882,7 +884,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     // 校验拦截不支持的模式
     TORCH_CHECK(is_bf16 || is_fp16, "NPU FlashAttention only supports Float16 or BFloat16.");
-    TORCH_CHECK(!block_table_.has_value(), "NPU FlashAttention does not support paged KV cache with block table.");
     TORCH_CHECK(!seqused_k_.has_value(), "NPU FlashAttention does not support seqused_k.");
     TORCH_CHECK(!leftpad_k_.has_value(), "NPU FlashAttention does not support leftpad_k.");
     TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
@@ -917,6 +918,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
     if (paged_KV) {
         block_table = block_table_.value();
+        TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype int32");
+        TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     }
 
     const auto sizes = q.sizes();
@@ -928,10 +931,26 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 128 : k.size(1);
-    const int num_heads_k = k.size(1);
+    const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
 
     TORCH_CHECK(head_size_og <= 256, "FlashAttention only supports head dimension at most 256");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
+
+    if (!paged_KV) {
+        const int total_k = k.size(0);
+        CHECK_SHAPE(k, total_k, num_heads_k, head_size_og);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size_og);
+    } else {
+        CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size_og);
+        CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size_og);
+        CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+    }
+
+    if (paged_KV) {
+        seqlens_k = (cu_seqlens_k.slice(0, 1, cu_seqlens_k.size(0)) -
+                     cu_seqlens_k.slice(0, 0, cu_seqlens_k.size(0) - 1))
+                        .to(torch::kInt).contiguous();
+    }
 
     bool is_local = false;
     // Match Tri Dao GPU: both sides vs max_seqlen_k.
@@ -1053,7 +1072,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     auto oDevice = static_cast<uint8_t *>(const_cast<void *>(out.data_ptr()));
     auto qSeqDevice = static_cast<uint8_t *>(const_cast<void *>(cu_seqlens_q.data_ptr()));
-    auto kvSeqDevice = static_cast<uint8_t *>(const_cast<void *>(cu_seqlens_k.data_ptr()));
+    auto kvSeqDevice = static_cast<uint8_t *>(const_cast<void *>(
+        paged_KV ? seqlens_k.data_ptr() : cu_seqlens_k.data_ptr()));
     auto workspaceDevice = static_cast<uint8_t *>(const_cast<void *>(workspace_tensor.data_ptr()));
     auto tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.data_ptr()));
     auto softmaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmaxlse.data_ptr()));
