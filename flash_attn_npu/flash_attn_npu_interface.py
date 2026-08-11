@@ -3,6 +3,7 @@
 
 from typing import Optional, Sequence, Tuple, Union
 
+import math
 import torch
 import torch.nn as nn
 import os
@@ -1582,8 +1583,12 @@ def flash_attn_with_kvcache(
         scheduler_metadata: Optional scheduler metadata precomputed on the AICPU by
             get_scheduler_metadata. When given, the forward consumes the AICPU-computed
             tiling (and optional mask) directly and skips the host-side computation
-            (which would otherwise sync on cache_seqlens); it must have been created with
-            matching causal / window_size / softcap / softmax_scale / seqlen-bound arguments.
+            (which would otherwise sync on cache_seqlens). The creation arguments are
+            validated against this call: causal / window_size / softcap / softmax_scale
+            must match, and max_seqlen_k must equal the effective KV cache capacity seen
+            by the forward (block_table: page_block_size * block_table.shape[1];
+            otherwise k_cache.shape[1]) — do not overprovision it. Pass the tensor
+            returned by get_scheduler_metadata unchanged (do not clone/copy it).
         return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Return:
@@ -1604,6 +1609,17 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
+    if scheduler_metadata is not None:
+        _validate_scheduler_metadata(
+            scheduler_metadata,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            softmax_scale=softmax_scale,
+            seqlen_q=q.shape[1],
+            block_table=block_table,
+            k_cache=k_cache,
+        )
     out, softmax_lse = flash_attn_npu.fwd_kvcache(
         q,
         k_cache,
@@ -1628,6 +1644,49 @@ def flash_attn_with_kvcache(
         scheduler_metadata,
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+def _validate_scheduler_metadata(scheduler_metadata, *, causal, window_size, softcap,
+                                 softmax_scale, seqlen_q, block_table, k_cache):
+    """Reject scheduler_metadata created with arguments that do not match this
+    call; the AICPU-written tiling bakes in the mask layout, paged geometry and
+    softcap-divided softmax scale."""
+    params = getattr(scheduler_metadata, "_fa_scheduler_params", None)
+    if params is None:
+        raise RuntimeError(
+            "scheduler_metadata has no creation-argument fingerprint; it must be "
+            "the unchanged tensor returned by get_scheduler_metadata"
+        )
+    expected = {
+        "causal": bool(causal),
+        "window_size": (int(window_size[0]), int(window_size[1])),
+        "softcap": float(softcap),
+        "softmax_scale": float(softmax_scale),
+        "max_seqlen_q": int(seqlen_q),
+    }
+    if block_table is not None:
+        # The fwd mask derivation and the block-table row stride both use the
+        # paged capacity (page_block_size * max_num_blocks_per_seq) as KV bound.
+        expected["page_size"] = int(k_cache.shape[1])
+        expected["max_seqlen_k"] = int(k_cache.shape[1]) * int(block_table.shape[1])
+    else:
+        expected["page_size"] = None
+        expected["max_seqlen_k"] = int(k_cache.shape[1])
+    mismatches = []
+    for key, call_val in expected.items():
+        meta_val = params.get(key, "<missing>")
+        # softcap/softmax_scale are baked into the tiling as float32; allow
+        # ulp-level differences from the resolution formula (h ** -0.5 vs 1 / h ** 0.5).
+        if key in ("softcap", "softmax_scale") and isinstance(meta_val, float):
+            same = math.isclose(meta_val, call_val, rel_tol=1e-6)
+        else:
+            same = meta_val == call_val
+        if not same:
+            mismatches.append(f"{key}: metadata={meta_val!r} vs call={call_val!r}")
+    if mismatches:
+        raise ValueError(
+            "scheduler_metadata arguments do not match this call: " + "; ".join(mismatches)
+        )
 
 
 def get_scheduler_metadata(
@@ -1660,4 +1719,17 @@ def get_scheduler_metadata(
         softcap,
         softmax_scale,
     )
+    # Fingerprint the creation arguments so flash_attn_with_kvcache can reject
+    # metadata whose baked-in tiling does not match the call consuming it.
+    if softmax_scale is None:
+        softmax_scale = headdim ** (-0.5)
+    scheduler_metadata._fa_scheduler_params = {
+        "causal": bool(causal),
+        "window_size": (int(window_size[0]), int(window_size[1])),
+        "softcap": float(softcap),
+        "softmax_scale": float(softmax_scale),
+        "page_size": None if page_size is None else int(page_size),
+        "max_seqlen_q": int(max_seqlen_q),
+        "max_seqlen_k": int(max_seqlen_k),
+    }
     return scheduler_metadata

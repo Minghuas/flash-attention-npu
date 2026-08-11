@@ -658,9 +658,18 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     )
 
 
-@pytest.mark.parametrize("is_causal, window_size", [(True, (-1, -1)), (False, (128, 128))])
-def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(is_causal, window_size):
-    """A mask-less metadata buffer must be rejected by a fwd call needing a mask."""
+@pytest.mark.parametrize(
+    "meta_causal, meta_window, call_causal, call_window",
+    [
+        (False, (-1, -1), True, (-1, -1)),     # call needs a causal mask, metadata has none
+        (False, (-1, -1), False, (128, 128)),  # call needs a band mask, metadata has none
+        (True, (-1, -1), False, (-1, -1)),     # metadata has a causal mask, call needs none
+    ],
+)
+def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
+    meta_causal, meta_window, call_causal, call_window
+):
+    """Mask-layout mismatches in either direction must be rejected loudly."""
     data_type = torch.bfloat16
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
@@ -681,16 +690,172 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(is_causal, window_si
         cache_seqlens=cache_seqlens,
         data_type=data_type,
         page_size=block_size,
-        is_causal=False,
+        is_causal=meta_causal,
+        window_size=meta_window,
     )
-    with pytest.raises(RuntimeError, match="scheduler_metadata buffer is too small"):
+    with pytest.raises(ValueError, match="do not match this call"):
         flash_attn_with_kvcache(
             query,
             key_cache,
             value_cache,
             cache_seqlens=cache_seqlens,
             block_table=block_table,
-            causal=is_causal,
-            window_size=window_size,
+            causal=call_causal,
+            window_size=call_window,
             scheduler_metadata=scheduler_metadata,
+        )
+
+
+def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
+    """Paged geometry baked into the tiling must match the call's cache/page table."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 1, 2, 2
+    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
+
+    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    key_cache, value_cache, block_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+    base = dict(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+    )
+
+    def call_with(metadata):
+        return flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            scheduler_metadata=metadata,
+        )
+
+    # Wrong page_size: the block-table page size baked into the tiling differs.
+    bad_page = _metadata(**base, kv_seqlen=kv_seqlen, page_size=2 * block_size)
+    with pytest.raises(ValueError, match="page_size"):
+        call_with(bad_page)
+
+    # Overprovisioned max_seqlen_k: the block-table row stride would not match.
+    overprovisioned = _metadata(**base, kv_seqlen=2 * kv_seqlen, page_size=block_size)
+    with pytest.raises(ValueError, match="max_seqlen_k"):
+        call_with(overprovisioned)
+
+    # Metadata created without paging consumed by a paged call (and vice versa).
+    unpaged = _metadata(**base, kv_seqlen=kv_seqlen, page_size=None)
+    with pytest.raises(ValueError, match="page_size"):
+        call_with(unpaged)
+
+
+def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
+    """softcap/softmax_scale are baked into the tiling; mismatches must be rejected."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 1, 2, 2
+    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
+
+    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    key_cache, value_cache, block_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+
+    scheduler_metadata = _metadata(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        page_size=block_size,
+        softcap=0.0,
+    )
+    with pytest.raises(ValueError, match="softcap"):
+        flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            softcap=30.0,
+            scheduler_metadata=scheduler_metadata,
+        )
+
+
+def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
+    """A copied metadata tensor loses its creation-argument fingerprint."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 1, 2, 2
+    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
+
+    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    key_cache, value_cache, block_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+
+    scheduler_metadata = _metadata(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        page_size=block_size,
+    ).clone()
+    with pytest.raises(RuntimeError, match="fingerprint"):
+        flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            scheduler_metadata=scheduler_metadata,
+        )
+
+
+def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
+    """A hand-crafted buffer with a forged fingerprint but the wrong size must be
+    rejected by the C++ exact-size check (defense in depth behind the Python
+    fingerprint validation)."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 1, 2, 2
+    q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
+
+    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    key_cache, value_cache, block_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+
+    good = _metadata(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        page_size=block_size,
+    )
+    bad = torch.empty(good.numel() - 8, dtype=torch.uint8).npu()
+    bad._fa_scheduler_params = good._fa_scheduler_params
+    with pytest.raises(RuntimeError, match="must exactly match"):
+        flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            scheduler_metadata=bad,
         )

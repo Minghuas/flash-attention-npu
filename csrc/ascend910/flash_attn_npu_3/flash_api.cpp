@@ -338,8 +338,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) >= fa_metadata::MetadataBytes(hasMask),
-                    "scheduler_metadata buffer is too small for this call's causal/window flags");
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
+                    "scheduler_metadata buffer size must exactly match this call's "
+                    "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
         maskDevice = hasMask ? metaBase : nullptr;

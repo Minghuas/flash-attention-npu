@@ -254,8 +254,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) >= fa_metadata::MetadataBytes(hasMask),
-                    "scheduler_metadata buffer is too small for this call's causal/window flags");
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
+                    "scheduler_metadata buffer size must exactly match this call's "
+                    "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
         maskDevice = hasMask ? metaBase : nullptr;
@@ -586,8 +587,9 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         // metadata must have been created with matching causal / window_size /
         // softcap / softmax_scale arguments.
         const bool hasMask = is_causal || is_local;
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) >= fa_metadata::MetadataBytes(hasMask),
-                    "scheduler_metadata buffer is too small for this call's causal/window flags");
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
+                    "scheduler_metadata buffer size must exactly match this call's "
+                    "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
         maskDevice = hasMask ? metaBase : nullptr;
@@ -860,8 +862,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         // metadata must have been created with matching causal / window_size /
         // softcap / softmax_scale arguments.
         const bool hasMask = is_causal || is_local;
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) >= fa_metadata::MetadataBytes(hasMask),
-                    "scheduler_metadata buffer is too small for this call's causal/window flags");
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
+                    "scheduler_metadata buffer size must exactly match this call's "
+                    "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
         maskDevice = hasMask ? metaBase : nullptr;
