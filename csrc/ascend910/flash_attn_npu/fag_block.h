@@ -56,9 +56,10 @@ struct EpilogueAtlasA2FAGPre {
 };
 
 // For AtlasA2, MLAG Op
-template <bool HAS_SOFTCAP_>
+template <uint32_t MASK_TYPE_, bool HAS_SOFTCAP_>
 struct EpilogueAtlasA2FAGOp {
     using ArchTag = Arch::AtlasA2;
+    static constexpr uint32_t MASK_TYPE = MASK_TYPE_;
     static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
 };
 
