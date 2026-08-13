@@ -21,10 +21,7 @@ from tests.common.test_utils import (
     make_varlen_seqlens,
     check_kvcache_inplace
 )
-if "Ascend950" in torch_npu.npu.get_device_name():
-    from flash_attn_npu_3 import flash_attn_with_kvcache
-else:
-    from flash_attn_npu_3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
+from flash_attn_npu_3 import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
 
 # flash_attn_with_kvcache test parameters
 # Single-option parameters: fixed values
@@ -156,6 +153,8 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     if is_varied and layout != "TND":
         pytest.skip("is_varied requires TND (varlen-q) layout")
     if new_kv:
+        if "Ascend950" in name:
+            pytest.skip("Ascend950 does not support append-KV")
         if head_size % 16 != 0:
             pytest.skip("append-KV requires head dim % 16 == 0")
         if window_size_left >= 0 or window_size_right >= 0:
@@ -535,8 +534,10 @@ func_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap", func_cases)
 def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" not in name:
-        pytest.skip("flash_attn_func only support Ascend910")
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_func only supports Ascend910/Ascend950")
+    if "Ascend950" in name and (softcap != 0.0):
+        pytest.skip("Ascend950 does not support softcap")
     query, key_cache, value_cache, dout = make_attention_inputs(
         (batch_size, q_seqlen, num_heads, head_size),
         (batch_size, kv_seqlen, kv_heads, head_size),
@@ -581,7 +582,7 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
         golden_lseL_pt[:, :, fully_masked] = torch.inf
 
     assert_fa_close(out_out, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    if return_attn_probs:
+    if return_attn_probs and "Ascend910" in name:
         assert_fa_close(
             softmax_lse,
             golden_lseL_ref,
@@ -589,22 +590,23 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
             softcap=softcap,
             name="softmax_lse",
         )
-    dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
-    dout_ref = dout.detach().cpu()
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-        golden_out_ref,
-        (query_ref, key_ref, value_ref),
-        dout_ref,
-        retain_graph=True,
-    )
-    dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-        golden_out_pt,
-        (query_ref, key_ref, value_ref),
-        dout_ref,
-    )
-    assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
-    assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
-    assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
+    if "Ascend910" in name:
+        dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
+        dout_ref = dout.detach().cpu()
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
+            golden_out_ref,
+            (query_ref, key_ref, value_ref),
+            dout_ref,
+            retain_graph=True,
+        )
+        dq_pt, dk_pt, dv_pt = torch.autograd.grad(
+            golden_out_pt,
+            (query_ref, key_ref, value_ref),
+            dout_ref,
+        )
+        assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
+        assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
+        assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
 
 
 # flash_attn_varlen_func test parameters
@@ -692,8 +694,10 @@ varlen_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap", varlen_cases)
 def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
-    if "Ascend910" not in name:
-        pytest.skip("flash_attn_varlen_func only support Ascend910")
+    if "Ascend910" not in name and "Ascend950" not in name:
+        pytest.skip("flash_attn_varlen_func only supports Ascend910/Ascend950")
+    if "Ascend950" in name and (softcap != 0.0):
+        pytest.skip("Ascend950 does not support softcap")
     seqlens_q, seqlens_k = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen)
     cu_q = make_cu_seqlens(seqlens_q)
     cu_k = make_cu_seqlens(seqlens_k)
@@ -751,23 +755,24 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     golden_lseL_ref = golden_lse_ref.permute(0, 2, 1)[q_valid].transpose(0, 1)
     golden_lseL_pt = golden_lse_pt.permute(0, 2, 1)[q_valid].transpose(0, 1)
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
-    assert_fa_close(softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse")
-    dout = make_random_tensor(output_npu.shape, output_npu.dtype, low=-0.5, high=0.5, device="npu")
-    dq_ag, dk_ag, dv_ag = torch.autograd.grad(output_npu, (query, key, value), dout)
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-        golden_out_ref,
-        (query_ref, key_ref, value_ref),
-        dout.detach().cpu(),
-        retain_graph=True,
-    )
-    dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-        golden_out_pt,
-        (query_ref, key_ref, value_ref),
-        dout.detach().cpu(),
-    )
-    assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
-    assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
-    assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
+    if "Ascend910" in name:
+        assert_fa_close(softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse")
+        dout = make_random_tensor(output_npu.shape, output_npu.dtype, low=-0.5, high=0.5, device="npu")
+        dq_ag, dk_ag, dv_ag = torch.autograd.grad(output_npu, (query, key, value), dout)
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
+            golden_out_ref,
+            (query_ref, key_ref, value_ref),
+            dout.detach().cpu(),
+            retain_graph=True,
+        )
+        dq_pt, dk_pt, dv_pt = torch.autograd.grad(
+            golden_out_pt,
+            (query_ref, key_ref, value_ref),
+            dout.detach().cpu(),
+        )
+        assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
+        assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
+        assert_fa_close(dv_ag, dv_ref, dv_pt, softcap=softcap, name="dV")
 
 # flash_attn_with_kvcache test parameters (Ascend950 head_dim<=256 coverage, NPU only)
 # Single-option parameters: fixed values
@@ -870,4 +875,8 @@ def test_fa_kvcache_ops_with_hd_le_256(data_type, batch_size, num_heads, kv_head
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if "Ascend910" in name:
         pytest.skip("Sq > Sk not support in Ascend910")
-    test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, softcap, num_splits)
+    test_fa_kvcache_ops(
+        data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
+        cache_mode, block_size, is_causal, layout, is_varied,
+        window_size_left, window_size_right, softcap, num_splits, new_kv=False,
+    )
