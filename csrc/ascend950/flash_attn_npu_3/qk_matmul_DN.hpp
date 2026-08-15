@@ -152,6 +152,7 @@ public:
     static constexpr uint32_t V0_V1_FLAG_ID_OFFSET = 16; // 核间同步mode4，AIC侧需要两个flagId分别对应两个AIV
 
     static constexpr uint32_t STRIDE_LIMIT = 65535;
+    static constexpr uint32_t C0_ELEMS = 16;
 
     __aicore__ inline
     BlockMmadTla(Arch::Resource<ArchTag> &resource, BlockMmadQKTileHelper &BlockMmadQKTileHelper)
@@ -194,9 +195,8 @@ public:
         CopyGmToL1B copyGmToL1B;
         uint32_t rowNum = actualOriShape[0];
         uint32_t embed = actualOriShape[1];
-        // cce::printf("rowNum:%d\n", rowNum);
-        // cce::printf("embed:%d\n", embed);
-        auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embed, rowNum);
+        uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
+        auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embedPhysical, rowNum);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
         auto l1ATensorTlaTile = GetTile(l1ATensorTla,
                 tla::MakeCoord(0, 0), tla::MakeShape(embed, rowNum));
@@ -299,12 +299,13 @@ public:
         CopyGmToL1A copyGmToL1A;
         uint32_t rowNum = actualOriShape[0];
         uint32_t embed = actualOriShape[2];
+        uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
         uint32_t curBaseTileSize = actualOriShape[1];
 
         uint32_t l1BBufId = kvSTileIdx % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 1;
 
-        auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embed, rowNum);
+        auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embedPhysical, rowNum);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         // P full base tile already on L1
@@ -326,7 +327,7 @@ public:
             uint32_t l0CEventId = l0CBufId;
             auto l0CLayoutTla = tla::MakeLayoutL0C(l0TileNAct, rowNum);
             auto l0CTensorTla = tla::MakeTensor(l0CTensor[l0CBufId], l0CLayoutTla, Arch::PositionL0C{});
-            auto l1BLayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(l0TileNAct, embed);
+            auto l1BLayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(l0TileNAct, embedPhysical);
             auto l1BTensorTla = tla::MakeTensor(l1BTensor[l1BBufId], l1BLayoutTla, Arch::PositionL1{});
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventId);
             auto l1BTensorTlaTile = GetTile(l1BTensorTla,

@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include "fai_tilingdata.h"
@@ -28,6 +29,8 @@ namespace optiling{
     const uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
     const uint32_t BASE_KV_SIZE = 128;
     const uint32_t PRELANCH_NUM = 3;
+    const uint64_t ASCEND950_L1_SIZE = 512ULL * 1024ULL;
+    const uint64_t RESCALE_OTMP_STAGE_SIZE = 32ULL * 1024ULL;
 
     enum class MaskType : uint32_t {
         NO_MASK = 0,
@@ -95,7 +98,6 @@ namespace optiling{
             uint32_t GetCoreNum() {
                 return this->blockNum_; 
             }
-            uint64_t GetTilingKey();
         private:
             void FillSplitCoreTilingData(FAInferTilingData &tilingdata);
             void FillWorkSpaceTilingData(FAInferTilingData &faTilingData);
@@ -123,7 +125,7 @@ namespace optiling{
 
     uint32_t FAInferTiling::GetQSBlockTile(int64_t kvSeqlen)
     {
-        uint32_t qSBlockTile = Q_TILE_CEIL;
+        uint32_t qSBlockTile = faInfo_.embeddingSizeV > 128 ? 64 : Q_TILE_CEIL;
         return qSBlockTile;
     }
     uint32_t FAInferTiling::GetKSBlockTile(int64_t kvSeqlen)
@@ -156,8 +158,14 @@ namespace optiling{
         faTilingData.set_preToken(static_cast<int64_t>(faInfo_.preToken));
         faTilingData.set_nextToken(static_cast<int64_t>(faInfo_.nextToken));
         
-        auto qkL1TileM_ = 128;
-        auto qkL1TileKLeft_ = 192;
+        auto qBaseTile_ = GetQSBlockTile(faInfo_.maxKvSeqlen);
+        auto kvBaseTile_ = BASE_KV_SIZE;
+        auto embeddingSizeAligned16_ =
+            (static_cast<uint32_t>(faInfo_.embeddingSize) + 15U) / 16U * 16U;
+        auto embeddingSizeVAligned16_ =
+            (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
+        auto qkL1TileM_ = qBaseTile_;
+        auto qkL1TileKLeft_ = embeddingSizeAligned16_;
         auto qL1BufNum_ = 1;
         // K矩阵开启2buf，D按128分割，S2按256分割
         auto qkL1TileN_ = 256;
@@ -165,17 +173,18 @@ namespace optiling{
         auto kL1BufNum_ = 2;
         // V矩阵开启db，D按128分割，kvBaseTile_不分割，指令同样提前于核间同步下发
         // 如果kvBaseTile_进一步增大，考虑关闭db，使得kvBaseTile_不分割
-        auto pvL1TileN_ = 128;
-        auto pvL1TileKLeft_ = 256;
+        auto pvL1TileN_ = embeddingSizeVAligned16_;
+        auto pvL1TileKLeft_ = kvBaseTile_;
         auto vL1BufNum_ = 2;
         // P矩阵在950上会常驻L1，由于基块的prelaunch为2，因此最好有3 buf，以免基块间流水阻塞
-        auto pvL1TileM_ = 128;
-        auto pvL1TileKRight_ = 128;
+        auto pvL1TileM_ = qBaseTile_;
+        auto pvL1TileKRight_ = kvBaseTile_;
         auto pL1BufNum_ = 3;
+
         faTilingData.set_innerPrec(0);
         faTilingData.set_actSeqAval(0);
-        faTilingData.set_qBaseTile(128);
-        faTilingData.set_kvBaseTile(128);
+        faTilingData.set_qBaseTile(qBaseTile_);
+        faTilingData.set_kvBaseTile(kvBaseTile_);
         faTilingData.set_qkL1TileM(qkL1TileM_);
         faTilingData.set_qkL1TileN(qkL1TileN_);
         faTilingData.set_qkL1TileKLeft(qkL1TileKLeft_);
@@ -188,58 +197,6 @@ namespace optiling{
         faTilingData.set_kL1BufNum(kL1BufNum_);
         faTilingData.set_vL1BufNum(vL1BufNum_);
         faTilingData.set_pL1BufNum(pL1BufNum_);
-    }
-
-    uint64_t FAInferTiling::GetTilingKey() 
-    {
-        constexpr uint64_t SPLIT_FUSE_BASE_KEY = 5000000000000000000;
-        constexpr uint64_t PAGED_CACHE_KEY = 10000000;
-        constexpr uint64_t COMP_CAUSAL_MASK_KEY = 3;
-         constexpr uint64_t COMP_SWA_MASK_KEY = 5;
-        constexpr uint64_t LAYOUTQ_BSND_KEY = 100000;
-        constexpr uint64_t LAYOUTQ_TND_KEY = 200000;
-        constexpr uint64_t DTYPE_FP16_KEY = 100;
-        constexpr uint64_t KVCACHE_NZ_KEY = 10;
-        constexpr uint64_t DTYPE_BF16_KEY = 200;
-        constexpr uint64_t LSE_OUT_ONLY_KEY = 1000;
-        constexpr uint64_t INNER_LOW_PREC_KEY = 10000;
-        constexpr uint64_t LEARNABLE_SINK_KEY = 100000000;
-        constexpr uint64_t FLASH_DECODE_KEY = 100000000000000000;
-        uint64_t tilingKey = SPLIT_FUSE_BASE_KEY;
-        std::cout << "faInfo_.pagedCacheFlag:" << faInfo_.pagedCacheFlag << std::endl;
-        std::cout << "faInfo_.maskType:" << (uint32_t)faInfo_.maskType << std::endl;
-        std::cout << "faInfo_.layout:" << faInfo_.layout << std::endl;
-        if (faInfo_.pagedCacheFlag) {
-            tilingKey += static_cast<uint64_t>(PAGED_CACHE_KEY);
-        }
-        if (faInfo_.pagedShapeFlag) { // 20000000 表示 BnNBsD
-            tilingKey += static_cast<uint64_t>(PAGED_CACHE_KEY);
-        }
-        if (faInfo_.maskType == MaskType::MASK_SPEC) {
-            tilingKey += static_cast<uint64_t>(COMP_CAUSAL_MASK_KEY);
-        }
-        if (faInfo_.layout == "TND") {
-            tilingKey += static_cast<uint64_t>(LAYOUTQ_TND_KEY);
-        } else if (faInfo_.layout == "BSND") {
-            tilingKey += static_cast<uint64_t>(LAYOUTQ_BSND_KEY);
-        }
-        if (faInfo_.dataType == DataType::FP16) {
-            std::cout << "faInfo_.dataType:" << "fp16" << std::endl;
-            tilingKey += static_cast<uint64_t>(DTYPE_FP16_KEY);
-        } else if (faInfo_.dataType == DataType::BF16) {
-            std::cout << "faInfo_.dataType:" << "bf16" << std::endl;
-            tilingKey += static_cast<uint64_t>(DTYPE_BF16_KEY);
-        }
-        if (faInfo_.lseFlag) {
-            tilingKey += static_cast<uint64_t>(LSE_OUT_ONLY_KEY);
-        }
-        if (faInfo_.learnableSinkFlag) {
-            tilingKey += static_cast<uint64_t>(LEARNABLE_SINK_KEY);
-        }
-        if (faInfo_.innerPrecise == 1) {
-            tilingKey += static_cast<uint64_t>(INNER_LOW_PREC_KEY);
-        }
-        return tilingKey;
     }
 
     void FAInferTiling::FillWorkSpaceTilingData(FAInferTilingData &faTilingData)

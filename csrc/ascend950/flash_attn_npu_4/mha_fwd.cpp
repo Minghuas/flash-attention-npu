@@ -19,6 +19,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <vector>
 #include <c10/core/Device.h>
 #include <torch/extension.h>
 
@@ -75,11 +76,15 @@ mha_fwd(at::Tensor q,
     const bool is_fp16 = (q_dtype == torch::kFloat16);
     TORCH_CHECK(is_bf16 || is_fp16,
                 "FlashAttention only supports FP16 and BF16 data types");
+    TORCH_CHECK(q.device().type() == at::kPrivateUse1,
+                "query must be on NPU");
+    TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
+                "query, key and value must be on the same NPU device");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
-    TORCH_CHECK(q.stride(-1) == 1, "Input tensor q must have contiguous last dimension");
-    TORCH_CHECK(k.stride(-1) == 1, "Input tensor k must have contiguous last dimension");
-    TORCH_CHECK(v.stride(-1) == 1, "Input tensor v must have contiguous last dimension");
+    CHECK_CONTIGUOUS(q);
+    CHECK_CONTIGUOUS(k);
+    CHECK_CONTIGUOUS(v);
 
     // ============================================================
     // 2. reject list
@@ -109,10 +114,11 @@ mha_fwd(at::Tensor q,
 
     if (paged_KV) {
         page_table = page_table_.value();
+        TORCH_CHECK(page_table.device() == q.device(),
+                    "page_table must be on the same NPU device as query");
         TORCH_CHECK(page_table.dtype() == torch::kInt32,
                     "page_table must have dtype int32");
-        TORCH_CHECK(page_table.stride(-1) == 1,
-                    "page_table must have contiguous last dimension");
+        CHECK_CONTIGUOUS(page_table);
     }
     if (is_varlen_q) {
         cu_seqlens_q = cu_seqlens_q_.value();
@@ -142,23 +148,26 @@ mha_fwd(at::Tensor q,
     TORCH_CHECK(seqlens_k.device().type() == at::kPrivateUse1,
                 "seqused_k must be on NPU");
     TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqused_k must have dtype int32");
+    TORCH_CHECK(seqlens_k.dim() == 1, "seqused_k must be rank 1");
 
     // ============================================================
-    // 4. Output tensor
+    // 4. Shape extraction
     // ============================================================
-    at::Tensor out;
-    if (out_.has_value()) {
-        out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype,
-                    "output must have the same dtype as inputs");
-        TORCH_CHECK(out.stride(-1) == 1,
-                    "Output tensor must have contiguous last dimension");
-    } else {
-        out = torch::empty_like(q);
+    const int64_t expected_q_dim = is_varlen_q ? 3 : 4;
+    const int64_t expected_kv_dim = (is_varlen_q && !paged_KV) ? 3 : 4;
+    TORCH_CHECK(q.dim() == expected_q_dim,
+                "query must be rank ", expected_q_dim,
+                is_varlen_q ? " in TND layout" : " in BSND layout");
+    TORCH_CHECK(k.dim() == expected_kv_dim && v.dim() == expected_kv_dim,
+                "key and value must both be rank ", expected_kv_dim);
+    TORCH_CHECK(k.dim() == v.dim(), "key and value must have the same rank");
+    if (is_varlen_q) {
+        TORCH_CHECK(cu_seqlens_q.dim() == 1 && cu_seqlens_q.numel() >= 2,
+                    "cu_seqlens_q must be a rank-1 tensor with at least two elements");
     }
 
     // ============================================================
-    // 5. Shape extraction
+    // 5. Extract logical dimensions
     // ============================================================
     const auto sizes = q.sizes();
     int batch_size, seqlen_q, num_heads, head_size_q;
@@ -180,14 +189,47 @@ mha_fwd(at::Tensor q,
     const int head_size_v = static_cast<int>(v.size(-1));
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(!(head_size_q != 64 && head_size_q != 128),
-                "FlashAttention only supports q head dimension 64 or 128");
-    TORCH_CHECK(!(head_size_v != 64 && head_size_v != 128),
-                "FlashAttention only supports v head dimension 64 or 128");
+    TORCH_CHECK(seqlen_q > 0 && num_heads > 0,
+                "query sequence length and head count must be positive");
+    TORCH_CHECK(seqlens_k.numel() == batch_size || seqlens_k.numel() == batch_size + 1,
+                "seqused_k must contain per-batch lengths or batch_size + 1 cumulative offsets");
+    TORCH_CHECK(k.size(-1) == head_size_q,
+                "query and key must have the same head dimension");
+    TORCH_CHECK(head_size_q >= 1 && head_size_q <= 256,
+                "FlashAttention supports q/k head dimensions in [1, 256]");
+    TORCH_CHECK(head_size_v >= 1 && head_size_v <= 256,
+                "FlashAttention supports value head dimensions in [1, 256]");
     TORCH_CHECK(!(page_block_size != 128 && page_block_size != 256 && page_block_size != 512 && page_block_size != 1024),
                 "FlashAttention only supports page_block_size dimension 128 or 256 or 512 or 1024");
+    TORCH_CHECK(num_heads_k > 0, "key/value head count must be positive");
     TORCH_CHECK(num_heads % num_heads_k == 0,
                 "Number of heads in key/value must divide number of heads in query");
+    if (!is_varlen_q && !paged_KV) {
+        TORCH_CHECK(q.size(0) == k.size(0),
+                    "query and key/value batch sizes must match in BSND layout");
+    }
+    if (paged_KV) {
+        TORCH_CHECK(num_blocks > 0 && max_num_blocks_per_seq > 0,
+                    "paged KV cache and page_table must contain at least one block");
+        TORCH_CHECK(page_table.size(0) == batch_size,
+                    "page_table batch dimension must match query batch size");
+    }
+
+    std::vector<int64_t> output_sizes(q.sizes().begin(), q.sizes().end());
+    output_sizes.back() = head_size_v;
+    at::Tensor out;
+    if (out_.has_value()) {
+        out = out_.value();
+        TORCH_CHECK(out.dtype() == q_dtype,
+                    "output must have the same dtype as inputs");
+        TORCH_CHECK(out.device() == q.device(),
+                    "output must be on the same device as query");
+        TORCH_CHECK(out.sizes().vec() == output_sizes,
+                    "output shape must match query except for the last dimension, which must match value");
+        CHECK_CONTIGUOUS(out);
+    } else {
+        out = at::empty(output_sizes, q.options());
+    }
 
     // ============================================================
     // 6. Pull cu_seqlens_q / seqused_k to host as int32 — the 950
@@ -324,7 +366,7 @@ mha_fwd(at::Tensor q,
     }
 
     const bool enableDN =
-        (!is_causal) && (head_size_q <= 128) && (head_size_v <= 128) && (innerPrec == 0u);
+        (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256) && (innerPrec == 0u);
 
     const aclError err = fai_host::LaunchFAI(
         kernelKey, enableDN,
@@ -346,5 +388,6 @@ mha_fwd(at::Tensor q,
                 sync_err);
 
     at::Tensor empty_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
-    return {out, softmaxlse, empty_accum, empty_accum};
+    at::Tensor empty_softmax_lse_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    return {out, softmaxlse, empty_accum, empty_softmax_lse_accum};
 }

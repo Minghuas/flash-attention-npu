@@ -32,6 +32,7 @@
 
 #include "rescale_o.hpp"
 #include "online_softmax.hpp"
+#include "init_outputs.hpp"
 #include "qk_matmul.hpp"
 #include "qk_matmul_DN.hpp"
 #include "pv_matmul.hpp"
@@ -101,6 +102,8 @@ public:
         gBlockTable.SetGlobalBuffer((__gm__ int32_t *)(params.blockTables));
         AscendC::GlobalTensor<ElementO> gO;
         gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
+        AscendC::GlobalTensor<float> gLse;
+        gLse.SetGlobalBuffer((__gm__ float *)params.lse);
         AscendC::GlobalTensor<ElementMask> gMask;
         gMask.SetGlobalBuffer((__gm__ ElementMask *)params.mask);
         //tiling data
@@ -180,10 +183,14 @@ public:
         Gemm::Block::BlockMmadPVTileHelper pvL1TileHelper(pvL1TileM_, pvL1TileN_, pvL1TileKLeft_, pvL1TileKRight_,
             pL1BufNum_, vL1BufNum_);
 
-        qkL0ATotalStages_ = (qBaseTile_ / BlockMmadQK::L0_TILE_M) * (embed_ / BlockMmadQK::L0_TILE_K);
-        qkL0BTotalStages_ = (kvBaseTile_ / BlockMmadQK::L0_TILE_N) * (embed_ / BlockMmadQK::L0_TILE_K);
-        pvL0ATotalStages_ = (qBaseTile_ / BlockMmadPV::L0_TILE_M) * (kvBaseTile_ / BlockMmadPV::L0_TILE_K);
-        pvL0BTotalStages_ = (kvBaseTile_ / BlockMmadPV::L0_TILE_K) * (embed_ / BlockMmadPV::L0_TILE_N);
+        qkL0ATotalStages_ = CeilDiv(qBaseTile_, BlockMmadQK::L0_TILE_M) *
+            CeilDiv(embed_, BlockMmadQK::L0_TILE_K);
+        qkL0BTotalStages_ = CeilDiv(kvBaseTile_, BlockMmadQK::L0_TILE_N) *
+            CeilDiv(embed_, BlockMmadQK::L0_TILE_K);
+        pvL0ATotalStages_ = CeilDiv(qBaseTile_, BlockMmadPV::L0_TILE_M) *
+            CeilDiv(kvBaseTile_, BlockMmadPV::L0_TILE_K);
+        pvL0BTotalStages_ = CeilDiv(kvBaseTile_, BlockMmadPV::L0_TILE_K) *
+            CeilDiv(embedV_, BlockMmadPV::L0_TILE_N);
 
         uint32_t coreIdx = AscendC::GetBlockIdx();
         uint32_t coreNum = AscendC::GetBlockNum();
@@ -199,13 +206,20 @@ public:
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
         EpilogueOnlineSoftmax epilogueOnlineSoftmax(resource, scaleValue_);
         EpilogueRescaleO epilogueRescaleO(resource);
+        Epilogue::Block::InitOutputs950<ArchTag, ElementO> initOutputs(resource);
 #endif
 
         int64_t strideQ = 0;
         int64_t strideO = 0;
         int64_t strideK = 0;
         int64_t strideV = 0;
-        int64_t kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1); // used for TND_NZ
+        int64_t kvNumTokens;
+        if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
+            kvNumTokens = gActualKvseqlen.GetValue(batch_);
+        } else {
+            kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1);
+        }
+        // int64_t kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1); // used for TND_NZ
 
         strideQ = qHeads_ * embed_;
         if constexpr (cacheLayout == CacheLayout::nd) {
@@ -266,7 +280,7 @@ public:
             int64_t gmOffsetK = 0;
             int64_t gmOffsetV = 0;
             int64_t gmOffsetO = 0;
-            int64_t qSOffset = qSTileIdx * 128;
+            int64_t qSOffset = qSTileIdx * qBaseTile_;
             gmOffsetQ = qBOffset + qSOffset * strideQ + qHeadIdx * embed_;
             gmOffsetO = oBOffset + qSOffset * strideO + qHeadIdx * embedV_;
             int64_t kvSOffset = 0;
@@ -292,14 +306,32 @@ public:
             }
             uint32_t kvSTileSizeAct = kvBaseTile_;
 
-            uint32_t noSkipKvS = kvSeqlen;
+            uint32_t noSkipKvS = static_cast<uint32_t>(kvSeqlen);
             if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
-                uint32_t diffS = kvSeqlen - qSeqlen;
-                noSkipKvS = (qSTileIdx + 1U) * qBaseTile_ + diffS;
-                noSkipKvS = AscendC::Std::min((uint32_t)kvSeqlen, noSkipKvS);
-            } 
+                int64_t causalKvEnd = static_cast<int64_t>(qSTileIdx + 1U) * qBaseTile_
+                    + kvSeqlen - qSeqlen;
+                if (causalKvEnd < 0) {
+                    causalKvEnd = 0;
+                }
+                noSkipKvS = AscendC::Std::min((uint32_t)kvSeqlen, (uint32_t)causalKvEnd);
+            }
 
             uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
+            uint32_t fullyMaskedRows = noSkipKvS < rowNum ? rowNum - noSkipKvS : 0;
+            if (kvSLoopNum == 0) {
+                uint64_t qTokenOffset = static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
+                uint64_t lseOffset = qTokenOffset * qHeads_ + qHeadIdx;
+#ifdef __DAV_VEC__
+                initOutputs(
+                    gO[gmOffsetO],
+                    gLse[lseOffset],
+                    rowNum,
+                    qHeads_,
+                    embedV_,
+                    static_cast<uint32_t>(strideO));
+#endif
+                continue;
+            }
 #ifdef __DAV_CUBE__
             uint32_t qShapeCol = strideQ;
             uint32_t kShapeCol = strideK;
@@ -393,11 +425,11 @@ public:
                     if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                         auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
                         auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
-                        uint32_t triUp = noSkipKvS - rowNum;
+                        int64_t triUp = static_cast<int64_t>(noSkipKvS) - rowNum;
                         uint32_t triDown = noSkipKvS;
                         uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
                         uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
-                        bool doTriUMask = triUp < kvSEndIdx - 1;
+                        bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1);
                         if (doTriUMask) {
                             epilogueOnlineSoftmax(
                                 l1PTensorTla,
@@ -489,14 +521,16 @@ public:
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
-                            pvReadyFlag, 1);
+                            pvReadyFlag, 1,
+                            fullyMaskedRows);
                     } else {
                         epilogueRescaleO(
                             gmOTensorTla, actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
-                            pvReadyFlag, 0);
+                            pvReadyFlag, 0,
+                            fullyMaskedRows);
                     }
 #endif
                 }
@@ -554,6 +588,8 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID5);
         // rescale
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
 
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
@@ -611,6 +647,8 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID5);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(EVENT_ID1);

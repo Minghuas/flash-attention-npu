@@ -215,7 +215,7 @@ test_cases = [
     (torch.bfloat16, 4, 32, 8, 32, 2048, 128, 128, False, "TND", False, -1, -1, 0.0),# g=4,Sq=32, qNBlockTile=4
     (torch.bfloat16, 8, 64, 8, 32, 4096, 128, 128, False, "TND", False, -1, -1, 0.0),# g=8,Sq=32, qNBlockTile=4
     (torch.bfloat16, 4, 32, 8, 64, 4096, 128, 128, False, "TND", False, -1, -1, 0.0),# g=4,Sq=64, qNBlockTile=2
-    (torch.bfloat16, 8, 64, 8, 64, 2048, 128, 128, True, "TND", False, -1, -1, 0.0), # g=8,Sq=64, qNBlockTile=2
+    (torch.bfloat16, 8, 64, 8, 64, 4096, 128, 128, True, "TND", False, -1, -1, 0.0), # g=8,Sq=64, qNBlockTile=2
     (torch.bfloat16, 4, 64, 8, 48, 2048, 128, 128, False, "TND", False, -1, -1, 0.0),# g=8,Sq=48, qNBlockTile=2
     (torch.bfloat16, 4, 64, 4, 32, 1024, 128, 128, False, "TND", False, -1, -1, 0.0),# g=16, Sq=32, qNBlockTile=4
     (torch.bfloat16, 4, 32, 8, 64, 2048, 256, 128, False, "TND", False, -1, -1, 0.0),# g=4,Sq=64, D=256
@@ -322,8 +322,8 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     if "Ascend950" in name and num_splits > 1:
         pytest.skip("Ascend950 does not support num_splits>1")
-    if "Ascend950" in name and (head_size not in [64, 128]):
-        pytest.skip("Ascend950 support head_size in 64,128")
+    if "Ascend950" in name and not (1 <= head_size <= 256):
+        pytest.skip("Ascend950 supports head_size in [1, 256]")
     if "Ascend950" in name and (window_size_right != -1 or window_size_left != -1):
         pytest.skip("Ascend950 support SWA")
     if "Ascend950" in name and (softcap != 0.0):
@@ -339,10 +339,10 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     num_blocks = max(64, max_num_blocks_per_seq * batch_size)
     gen = torch.Generator().manual_seed(1234)
     if is_varied:
-        # Per-batch q in [1, q_seqlen], kv in [q, kv_seqlen] (kv>=q so q>kv never occurs).
-        # Seeded for reproducibility; does not perturb the query/key/value RNG streams above.
+        # Per-batch q in [1, q_seqlen], kv in [min(q,kv_seqlen), kv_seqlen] (kv>=q when q<=kv_seqlen).
+        # When q > kv_seqlen (e.g. causal with qSeqlen > kvSeqlen), clamp low to kv_seqlen.
         q_sequences = torch.randint(low=1, high=q_seqlen + 1, size=(batch_size,), generator=gen).tolist()
-        kv_sequences = [int(torch.randint(low=q, high=kv_seqlen + 1, size=(1,), generator=gen))
+        kv_sequences = [int(torch.randint(low=min(q, kv_seqlen), high=kv_seqlen + 1, size=(1,), generator=gen))
                         for q in q_sequences]
     else:
         q_sequences = [q_seqlen] * batch_size
@@ -542,6 +542,10 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             # Soft mask (-1e4) still yields finite garbage on fully-masked rows;
             # NPU zeroes them / sets lse=inf. Infinite window (-1) must not go
             # through the numeric pre/nextTokensError heuristics.
+            fully_masked = atten_mask.all(dim=-1)
+            out[fully_masked, :, :] = 0
+            golden_lse[:, fully_masked] = torch.inf
+        if is_causal_golden and atten_mask is not None:
             fully_masked = atten_mask.all(dim=-1)
             out[fully_masked, :, :] = 0
             golden_lse[:, fully_masked] = torch.inf
@@ -757,9 +761,44 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             fully_masked = atten_mask.all(dim=-1)
             out[fully_masked, :, :] = 0
             golden_lse[:, fully_masked] = torch.inf
+        if is_causal_golden and atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            out[fully_masked, :, :] = 0
+            golden_lse[:, fully_masked] = torch.inf
         golden_out[(i - 1) * q_seqlen : i * q_seqlen] = out
         golden_lseL[:, (i - 1) * q_seqlen : i * q_seqlen] = golden_lse.reshape(num_heads, q_seqlen)
     rtol = 1e-2
     atol = 1e-2
     torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
     torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+
+@pytest.mark.parametrize("data_type", [torch.float16])
+@pytest.mark.parametrize("num_heads", [16])
+@pytest.mark.parametrize("kv_heads", [2])
+@pytest.mark.parametrize("head_size", [35,64,101,128,151,192,201,256])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("window_size_left", [-1])
+@pytest.mark.parametrize("window_size_right", [-1])
+@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("batch_size, q_seqlen, kv_seqlen", [
+    (1, 256, 128),
+    (1, 136, 128),
+    (2, 256, 256),
+    (4, 128, 256),
+    (2, 128, 128),
+    (1, 1024, 128),
+    (1, 256, 384),
+    (1, 128, 128),
+    (1, 256, 512),
+    (1, 256, 192),
+])
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
+@pytest.mark.parametrize("cache_mode", [0, 1])
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("is_causal", [True, False])
+def test_fa_custom_ops_with_hd_le_256(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap):
+    is_varied = layout == 'TND'
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend910" in name:
+        pytest.skip("Sq > Sk not support in Ascend910")
+    test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, num_splits, window_size_left, window_size_right, softcap)

@@ -90,20 +90,20 @@ public:
         }
     }
 
-    template < uint32_t VHeadSize, class TensorDst>
+    template <uint32_t ColBlocks, bool HeadDimAligned64, class TensorDst>
     __aicore__ inline
     void SubCoreCompute(TensorDst &gOTensorTlaTile,
+                        uint32_t colStride,
                         uint32_t curTileMod,
                         uint32_t ubOTmpBufId,
                         bool isFirstKvSTile,
                         bool isLastKvSTile,
-                        Arch::CrossCoreFlag pvReadyFlag)
+                        Arch::CrossCoreFlag pvReadyFlag,
+                        uint32_t zeroRowCount,
+                        uint32_t tailCols)
     {
         uint32_t rowNumCurSubCore = tla::get<0>(gOTensorTlaTile.shape());
         uint32_t colNumCurSubCore = tla::get<1>(gOTensorTlaTile.shape());
-        uint32_t vlElemNum = AscendC::GetVecLen() / sizeof(ElementOTmp);
-        uint32_t colFullLoop = CeilDiv(colNumCurSubCore, vlElemNum) - 1;
-        uint32_t colTail = (colNumCurSubCore - 1) % vlElemNum + 1;
 
         __ubuf__ ElementOTmp *goUb = (__ubuf__ ElementOTmp *) goUbTensor32.GetPhyAddr();
         __ubuf__ ElementOTmp *loUb = (__ubuf__ ElementOTmp *) loUbTensor[ubOTmpBufId].GetPhyAddr();
@@ -115,19 +115,26 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         if (isFirstKvSTile) {
             if (!isLastKvSTile) {
-                uint32_t totalCopyElems = rowNumCurSubCore * VHeadSize;
+                uint32_t totalCopyElems = rowNumCurSubCore * colStride;
                 AscendC::DataCopy(goUbTensor32, loUbTensor[ubOTmpBufId], totalCopyElems);
                 AscendC::PipeBarrier<PIPE_V>();
             } else {
-                DivFuncLastAndFirst<ElementOTmp, VHeadSize>(
-                    goUb, loUb, glUb, rowNumCurSubCore, colFullLoop, colTail, vlElemNum);
+                DivFuncLastAndFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
+                    goUb, loUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols);
             }
         } else if (!isLastKvSTile) {
-            RescaleFunc<ElementOTmp, VHeadSize>(
-                goUb, loUb, dmUb, rowNumCurSubCore, colFullLoop, colTail, vlElemNum);
+            RescaleFunc<ElementOTmp, ColBlocks, HeadDimAligned64>(
+                goUb, loUb, dmUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols);
         } else {
-            RescaleFuncLastNotFirst<ElementOTmp, VHeadSize>(
-                goUb, loUb, dmUb, glUb, rowNumCurSubCore, colFullLoop, colTail, vlElemNum);
+            RescaleFuncLastNotFirst<ElementOTmp, ColBlocks, HeadDimAligned64>(
+                goUb, loUb, dmUb, glUb, rowNumCurSubCore, colNumCurSubCore, colStride, tailCols);
+        }
+        if (zeroRowCount > 0) {
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Duplicate(
+                goUbTensor32,
+                static_cast<ElementOTmp>(0),
+                zeroRowCount * colStride);
         }
         // release lo buf
         SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
@@ -137,20 +144,20 @@ public:
                 AscendC::Cast(
                     goUbTensor16, goUbTensor32,
                     AscendC::RoundMode::CAST_RINT,
-                    rowNumCurSubCore * VHeadSize
+                    rowNumCurSubCore * colStride
                     );
             } else {
                 AscendC::Cast(
                     goUbTensor16, goUbTensor32,
                     AscendC::RoundMode::CAST_NONE,
-                    rowNumCurSubCore * VHeadSize
+                    rowNumCurSubCore * colStride
                     );
             }
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             auto ubOLayoutTla = tla::MakeLayout(
                 tla::MakeShape(rowNumCurSubCore, colNumCurSubCore),
-                tla::MakeStride(VHeadSize, tla::Int<1>{})
+                tla::MakeStride(colStride, tla::Int<1>{})
             );
             auto ubOTensorTla = tla::MakeTensor(goUbTensor16, ubOLayoutTla, Arch::PositionUB{});
             copyUbToGmO(gOTensorTlaTile, ubOTensorTla);
@@ -158,99 +165,273 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
     }
     
-    template <typename T, uint32_t VHeadSize>
+    template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
     __simd_vf__ inline void RescaleFunc(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *dmUb,
-                                        uint32_t row, uint32_t colFullLoop, 
-                                        uint32_t colTail, uint32_t vlElemNum)
+                                        uint32_t row, uint32_t col, uint32_t rowStride,
+                                        uint32_t tailCols)
     {
         using namespace AscendC::MicroAPI;
-        RegTensor<float> dmVreg;
-        RegTensor<float> goPreVreg;
-        RegTensor<float> goPreRollVreg;
-        RegTensor<float> loVreg;
-        RegTensor<float> loRollVreg;
-        RegTensor<float> mulVreg;
-        RegTensor<float> mulRollVreg;
-        RegTensor<float> goCurVreg;
-        RegTensor<float> goCurRollVreg;
-        MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
-        MaskReg pregTail = UpdateMask<float>(colTail);
-        for (uint32_t i = 0; i < row; i++) {
-            LoadAlign<T, LoadDist::DIST_BRC_B32>(dmVreg, dmUb + i);
-            LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg, goUb + i * VHeadSize);
-            LoadAlign<T, LoadDist::DIST_NORM>(goPreRollVreg, goUb + i * VHeadSize +vlElemNum);
-            LoadAlign<T, LoadDist::DIST_NORM>(loVreg, loUb + i * VHeadSize);
-            LoadAlign<T, LoadDist::DIST_NORM>(loRollVreg, loUb + i * VHeadSize + vlElemNum);
-            Mul(mulVreg, goPreVreg, dmVreg, pregFull);
-            Mul(mulRollVreg, goPreRollVreg, dmVreg, pregTail);
-            Add(goCurVreg, mulVreg, loVreg, pregFull);
-            Add(goCurRollVreg, mulRollVreg, loRollVreg, pregTail);
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(goUb + i * VHeadSize, goCurVreg, pregFull);
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(
-                goUb + i * VHeadSize + vlElemNum, goCurRollVreg, pregTail);
+        const uint32_t VL_ELEM_NUM = 64;
+        RegTensor<float> dm, go0, go1, go2, go3, lo0, lo1, lo2, lo3;
+        RegTensor<float> mul0, mul1, mul2, mul3, out0, out1, out2, out3;
+        MaskReg p0 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p1 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p2 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p3 = CreateMask<float, MaskPattern::ALL>();
+        if constexpr (ColBlocks == 64) {
+            p0 = UpdateMask<float>(tailCols);
+        } else if constexpr (ColBlocks == 128) {
+            p1 = UpdateMask<float>(tailCols);
+        } else if constexpr (ColBlocks == 192) {
+            p2 = UpdateMask<float>(tailCols);
+        } else {
+            p3 = UpdateMask<float>(tailCols);
+        }
+
+        for (uint32_t i = 0; i < row; ++i) {
+            LoadAlign<T, LoadDist::DIST_BRC_B32>(dm, dmUb + i);
+            __ubuf__ T *go;
+            __ubuf__ T *lo;
+            if constexpr (HeadDimAligned64) {
+                go = goUb + i * ColBlocks;
+                lo = loUb + i * ColBlocks;
+            } else {
+                go = goUb + i * rowStride;
+                lo = loUb + i * rowStride;
+            }
+            LoadAlign<T, LoadDist::DIST_NORM>(go0, go);
+            LoadAlign<T, LoadDist::DIST_NORM>(lo0, lo);
+            if constexpr (ColBlocks >= 128) {
+                LoadAlign<T, LoadDist::DIST_NORM>(go1, go + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(lo1, lo + VL_ELEM_NUM);
+            }
+            if constexpr (ColBlocks >= 192) {
+                LoadAlign<T, LoadDist::DIST_NORM>(go2, go + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(lo2, lo + VL_ELEM_NUM * 2);    
+            }
+            if constexpr (ColBlocks >= 256) {
+                LoadAlign<T, LoadDist::DIST_NORM>(go3, go + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(lo3, lo + VL_ELEM_NUM * 3);
+            }
+
+            Mul(mul0, go0, dm, p0);
+            if constexpr (ColBlocks >= 128) {
+                Mul(mul1, go1, dm, p1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                Mul(mul2, go2, dm, p2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                Mul(mul3, go3, dm, p3);
+            }
+
+            Add(out0, mul0, lo0, p0);
+            if constexpr (ColBlocks >= 128) {
+                Add(out1, mul1, lo1, p1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                Add(out2, mul2, lo2, p2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                Add(out3, mul3, lo3, p3);
+            }
+
+            StoreAlign<T, StoreDist::DIST_NORM_B32>(go, out0, p0);
+            if constexpr (ColBlocks >= 128) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM, out1, p1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM * 2, out2, p2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM * 3, out3, p3);
+            }
         }
     }
 
-    template <typename T, uint32_t VHeadSize>
+    template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
     __simd_vf__ inline void RescaleFuncLastNotFirst(__ubuf__ T *goUb, __ubuf__ T *loUb,
-                                                    __ubuf__ T *dmUb, __ubuf__ T *glUb,
-                                                    uint32_t row, uint32_t colFullLoop, 
-                                                    uint32_t colTail, uint32_t vlElemNum)
+                                        __ubuf__ T *dmUb, __ubuf__ T *glUb,
+                                        uint32_t row, uint32_t col, uint32_t rowStride,
+                                        uint32_t tailCols)
     {
         using namespace AscendC::MicroAPI;
+        const uint32_t VL_ELEM_NUM = 64;
+
         RegTensor<float> dmVreg;
-        RegTensor<float> goPreVreg;
-        RegTensor<float> goPreRollVreg;
-        RegTensor<float> loVreg;
-        RegTensor<float> loRollVreg;
-        RegTensor<float> mulVreg;
-        RegTensor<float> mulRollVreg;
-        RegTensor<float> goCurVreg;
-        RegTensor<float> goCurRollVreg;
         RegTensor<float> glVreg;
-        RegTensor<float> divVreg;
-        RegTensor<float> divRollVreg;
-        MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
-        MaskReg pregTail = UpdateMask<float>(colTail);
-        for (uint32_t i = 0; i < row; i++) {
+        RegTensor<float> goPreVreg0;
+        RegTensor<float> goPreVreg1;
+        RegTensor<float> goPreVreg2;
+        RegTensor<float> goPreVreg3;
+        RegTensor<float> loVreg0;
+        RegTensor<float> loVreg1;
+        RegTensor<float> loVreg2;
+        RegTensor<float> loVreg3;
+        RegTensor<float> mulVreg0;
+        RegTensor<float> mulVreg1;
+        RegTensor<float> mulVreg2;
+        RegTensor<float> mulVreg3;
+        RegTensor<float> goCurVreg0;
+        RegTensor<float> goCurVreg1;
+        RegTensor<float> goCurVreg2;
+        RegTensor<float> goCurVreg3;
+        RegTensor<float> divVreg0;
+        RegTensor<float> divVreg1;
+        RegTensor<float> divVreg2;
+        RegTensor<float> divVreg3;
+
+        MaskReg preg0 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg preg1 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg preg2 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg preg3 = CreateMask<float, MaskPattern::ALL>();
+        if constexpr (ColBlocks == 64) {
+            preg0 = UpdateMask<float>(tailCols);
+        } else if constexpr (ColBlocks == 128) {
+            preg1 = UpdateMask<float>(tailCols);
+        } else if constexpr (ColBlocks == 192) {
+            preg2 = UpdateMask<float>(tailCols);
+        } else {
+            preg3 = UpdateMask<float>(tailCols);
+        }
+
+        for (uint32_t i = 0; i < row; ++i) {
             LoadAlign<T, LoadDist::DIST_BRC_B32>(dmVreg, dmUb + i);
             LoadAlign<T, LoadDist::DIST_BRC_B32>(glVreg, glUb + i);
-            LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg, goUb + i * VHeadSize);
-            LoadAlign<T, LoadDist::DIST_NORM>(goPreRollVreg, goUb + i * VHeadSize + vlElemNum);
-            LoadAlign<T, LoadDist::DIST_NORM>(loVreg, loUb + i * VHeadSize);
-            LoadAlign<T, LoadDist::DIST_NORM>(loRollVreg, loUb + i * VHeadSize + vlElemNum);
-            Mul(mulVreg, goPreVreg, dmVreg, pregFull);
-            Mul(mulRollVreg, goPreRollVreg, dmVreg, pregTail);
-            Add(goCurVreg, mulVreg, loVreg, pregFull);
-            Add(goCurRollVreg, mulRollVreg, loRollVreg, pregTail);
-            Div(divVreg, goCurVreg, glVreg, pregFull);
-            Div(divRollVreg, goCurRollVreg, glVreg, pregTail);
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(goUb + i * VHeadSize, divVreg, pregFull);
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(goUb + i * VHeadSize + vlElemNum, divRollVreg, pregTail);
+
+            __ubuf__ T *goRow;
+            __ubuf__ T *loRow;
+            if constexpr (HeadDimAligned64) {
+                goRow = goUb + i * ColBlocks;
+                loRow = loUb + i * ColBlocks;
+            } else {
+                goRow = goUb + i * rowStride;
+                loRow = loUb + i * rowStride;
+            }
+            LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg0, goRow);
+            LoadAlign<T, LoadDist::DIST_NORM>(loVreg0, loRow);
+            if constexpr (ColBlocks >= 128) {
+                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg1, goRow + VL_ELEM_NUM);
+                LoadAlign<T, LoadDist::DIST_NORM>(loVreg1, loRow + VL_ELEM_NUM);
+            }
+            if constexpr (ColBlocks >= 192) {
+                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg2, goRow + VL_ELEM_NUM * 2);
+                LoadAlign<T, LoadDist::DIST_NORM>(loVreg2, loRow + VL_ELEM_NUM * 2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                LoadAlign<T, LoadDist::DIST_NORM>(goPreVreg3, goRow + VL_ELEM_NUM * 3);
+                LoadAlign<T, LoadDist::DIST_NORM>(loVreg3, loRow + VL_ELEM_NUM * 3);
+            }
+
+            Mul(mulVreg0, goPreVreg0, dmVreg, preg0);
+            if constexpr (ColBlocks >= 128) {
+                Mul(mulVreg1, goPreVreg1, dmVreg, preg1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                Mul(mulVreg2, goPreVreg2, dmVreg, preg2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                Mul(mulVreg3, goPreVreg3, dmVreg, preg3);
+            }
+
+            Add(goCurVreg0, mulVreg0, loVreg0, preg0);
+            if constexpr (ColBlocks >= 128) {
+                Add(goCurVreg1, mulVreg1, loVreg1, preg1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                Add(goCurVreg2, mulVreg2, loVreg2, preg2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                Add(goCurVreg3, mulVreg3, loVreg3, preg3);
+            }
+
+            Div(divVreg0, goCurVreg0, glVreg, preg0);
+            if constexpr (ColBlocks >= 128) {
+                Div(divVreg1, goCurVreg1, glVreg, preg1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                Div(divVreg2, goCurVreg2, glVreg, preg2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                Div(divVreg3, goCurVreg3, glVreg, preg3);
+            }
+
+            StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow, divVreg0, preg0);
+            if constexpr (ColBlocks >= 128) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow + VL_ELEM_NUM, divVreg1, preg1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow + VL_ELEM_NUM * 2, divVreg2, preg2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(goRow + VL_ELEM_NUM * 3, divVreg3, preg3);
+            }
         }
     }
 
-    template <typename T, uint32_t VHeadSize>
+    template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
     __simd_vf__ inline void DivFuncLastAndFirst(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *glUb,
-                                                uint32_t row, uint32_t colFullLoop, 
-                                                uint32_t colTail, uint32_t vlElemNum)
+                                                uint32_t row, uint32_t col, uint32_t rowStride,
+                                                uint32_t tailCols)
     {
         using namespace AscendC::MicroAPI;
-        RegTensor<float> goCurVreg;
-        RegTensor<float> goCurRollVreg;
-        RegTensor<float> glVreg;
-        RegTensor<float> divVreg;
-        RegTensor<float> divRollVreg;
-        MaskReg pregFull = CreateMask<float, MaskPattern::ALL>();
-        MaskReg pregTail = UpdateMask<float>(colTail);
-        for (uint32_t i = 0; i < row; i++) {
-            LoadAlign<T, LoadDist::DIST_BRC_B32>(glVreg, glUb + i);
-            LoadAlign<T, LoadDist::DIST_NORM>(goCurVreg, loUb + i * VHeadSize);
-            LoadAlign<T, LoadDist::DIST_NORM>(goCurRollVreg, loUb + i * VHeadSize + vlElemNum);
-            Div(divVreg, goCurVreg, glVreg, pregFull);
-            Div(divRollVreg, goCurRollVreg, glVreg, pregFull);
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(goUb + i * VHeadSize, divVreg, pregFull);
-            StoreAlign<T, StoreDist::DIST_NORM_B32>(goUb + i * VHeadSize + vlElemNum, divRollVreg, pregFull);
+        const uint32_t VL_ELEM_NUM = 64;
+        RegTensor<float> gl, in0, in1, in2, in3, out0, out1, out2, out3;
+        MaskReg p0 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p1 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p2 = CreateMask<float, MaskPattern::ALL>();
+        MaskReg p3 = CreateMask<float, MaskPattern::ALL>();
+        if constexpr (ColBlocks == 64) {
+            p0 = UpdateMask<float>(tailCols);
+        } else if constexpr (ColBlocks == 128) {
+            p1 = UpdateMask<float>(tailCols);
+        } else if constexpr (ColBlocks == 192) {
+            p2 = UpdateMask<float>(tailCols);
+        } else {
+            p3 = UpdateMask<float>(tailCols);
+        }
+        for (uint32_t i = 0; i < row; ++i) {
+            LoadAlign<T, LoadDist::DIST_BRC_B32>(gl, glUb + i);
+            __ubuf__ T *go;
+            __ubuf__ T *lo;
+            if constexpr (HeadDimAligned64) {
+                go = goUb + i * ColBlocks;
+                lo = loUb + i * ColBlocks;
+            } else {
+                go = goUb + i * rowStride;
+                lo = loUb + i * rowStride;
+            }
+            LoadAlign<T, LoadDist::DIST_NORM>(in0, lo);
+            if constexpr (ColBlocks >= 128) {
+                LoadAlign<T, LoadDist::DIST_NORM>(in1, lo + VL_ELEM_NUM);
+            }
+            if constexpr (ColBlocks >= 192) {
+                LoadAlign<T, LoadDist::DIST_NORM>(in2, lo + VL_ELEM_NUM * 2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                LoadAlign<T, LoadDist::DIST_NORM>(in3, lo + VL_ELEM_NUM * 3);
+            }
+
+            Div(out0, in0, gl, p0);
+            if constexpr (ColBlocks >= 128) {
+                Div(out1, in1, gl, p1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                Div(out2, in2, gl, p2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                Div(out3, in3, gl, p3);
+            }
+            StoreAlign<T, StoreDist::DIST_NORM_B32>(go, out0, p0);
+            if constexpr (ColBlocks >= 128) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM, out1, p1);
+            }
+            if constexpr (ColBlocks >= 192) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM * 2, out2, p2);
+            }
+            if constexpr (ColBlocks >= 256) {
+                StoreAlign<T, StoreDist::DIST_NORM_B32>(go + VL_ELEM_NUM * 3, out3, p3);
+            }
         }
     }
 
@@ -263,7 +444,8 @@ public:
                     bool isFirstKvSTile,
                     bool isLastKvSTile,
                     Arch::CrossCoreFlag pvReadyFlag,
-                    bool isDN)
+                    bool isDN,
+                    uint32_t fullyMaskedRows)
     {
         uint32_t rowNumOri = actualOriShape[0];
         uint32_t colNumOri = actualOriShape[1];
@@ -271,35 +453,50 @@ public:
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
 
         uint32_t rowNumOriAligned = isDN ? RoundUp(rowNumOri, 32) : RoundUp(rowNumOri, 8);
-        uint32_t colNumOriAligned8 = RoundUp(colNumOri, 8);
+        uint32_t colNumOriAligned16 = RoundUp(colNumOri, 16);
 
         uint32_t rowNumSplit = rowNumOriAligned / subBlockNum;
         rowNumSplit = (rowNumOri < rowNumSplit) ? rowNumOri : rowNumSplit;
         uint32_t rowNumCurSubCore = (subBlockIdx == 0) ? rowNumSplit : (rowNumOri - rowNumSplit);
         uint32_t rowOffsetCurSubCore = rowNumSplit * subBlockIdx;
         uint32_t colNumCurSubCore = colNumOri;
-        uint32_t colStrideCurSubCore = colNumOriAligned8;
+        uint32_t colStrideCurSubCore = colNumOriAligned16;
+        uint32_t zeroRowCount = 0;
+        if (rowOffsetCurSubCore < fullyMaskedRows) {
+            uint32_t remainingRows = fullyMaskedRows - rowOffsetCurSubCore;
+            zeroRowCount = remainingRows < rowNumCurSubCore ? remainingRows : rowNumCurSubCore;
+        }
 
         auto gOTensorTlaTile = GetTile(gOTensor,
             tla::MakeCoord(rowOffsetCurSubCore, 0), tla::MakeShape(rowNumCurSubCore, colNumCurSubCore));
         uint32_t ubOTmpBufId = gatheredKvSTileIdx % UB_OTMP_BUF_STAGES;
+        uint32_t vlElemNum = AscendC::GetVecLen() / sizeof(ElementOTmp);
+        bool headdimAligned64 = (colNumOri % 64 == 0);
         if (rowNumCurSubCore > 0) {
-            if(colStrideCurSubCore == 128){
-                SubCoreCompute<128>(
-                    gOTensorTlaTile,
-                    curTileMod,
-                    ubOTmpBufId,
-                    isFirstKvSTile,
-                    isLastKvSTile,
-                    pvReadyFlag);
-            } else if(colStrideCurSubCore == 64){
-                SubCoreCompute<64>(
-                    gOTensorTlaTile,
-                    curTileMod,
-                    ubOTmpBufId,
-                    isFirstKvSTile,
-                    isLastKvSTile,
-                    pvReadyFlag);
+            if (colNumCurSubCore <= vlElemNum) {
+                if (headdimAligned64) {
+                    SubCoreCompute<64, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore);
+                } else {
+                    SubCoreCompute<64, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore);
+                }
+            } else if (colNumCurSubCore <= 2 * vlElemNum) {
+                if (headdimAligned64) {
+                    SubCoreCompute<128, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum);
+                } else {
+                    SubCoreCompute<128, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum);
+                }
+            } else if (colNumCurSubCore <= 3 * vlElemNum) {
+                if (headdimAligned64) {
+                    SubCoreCompute<192, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum);
+                } else {
+                    SubCoreCompute<192, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum);
+                }
+            } else {
+                if (headdimAligned64) {
+                    SubCoreCompute<256, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum);
+                } else {
+                    SubCoreCompute<256, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum);
+                }
             }
         } else {
             Arch::CrossCoreWaitFlag<4, PIPE_V>(pvReadyFlag);
