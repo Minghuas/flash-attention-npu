@@ -930,13 +930,24 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # the per-batch KV lengths and stays on device.
         batch_size = cu_seqlens_q.shape[0] - 1
         num_heads, head_size = q.shape[1], q.shape[2]
-        num_heads_k = k.shape[1]
+        if block_table is not None:
+            # Paged KV: k/v are (num_blocks, page_size, num_heads_k, headdim);
+            # the metadata seqlen bound is the cache capacity, matching the
+            # flash_attn_with_kvcache contract.
+            page_size = k.shape[1]
+            num_heads_k = k.shape[2]
+            metadata_max_seqlen_k = block_table.shape[1] * page_size
+        else:
+            page_size = None
+            num_heads_k = k.shape[1]
+            metadata_max_seqlen_k = max_seqlen_k
         cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         scheduler_metadata = get_scheduler_metadata(
-            batch_size, max_seqlen_q, max_seqlen_k, num_heads, num_heads_k, head_size,
+            batch_size, max_seqlen_q, metadata_max_seqlen_k, num_heads, num_heads_k, head_size,
             cache_seqlens,
             qkv_dtype=q.dtype,
             cu_seqlens_q=cu_seqlens_q,
+            page_size=page_size,
             causal=causal,
             window_size=window_size,
             softcap=softcap,

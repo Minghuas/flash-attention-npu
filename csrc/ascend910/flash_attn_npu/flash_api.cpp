@@ -52,16 +52,18 @@ struct FwdMaskDerivation {
 // Window normalization + mask-type derivation, mirroring the host tiling code,
 // but bounding the KV side with a host-known upper bound (cache capacity)
 // instead of the device-side actual max KV seqlen, so it is usable on the
-// scheduler-metadata path where no D2H sync is allowed. An over-long window
-// only collapses to "no window" earlier than the host branch would, which is
-// semantically identical (a window covering the whole sequence masks nothing).
+// scheduler-metadata path where no D2H sync is allowed. Both sides compare
+// against the KV bound (matching the host's "both sides vs seqlen_k" rule);
+// an over-long window collapses to "no window", and a window that covers the
+// whole sequence masks nothing, so a bound larger than the actual seqlen is
+// still semantically identical.
 static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
-                                       int64_t max_seqlen_q, int64_t max_seqlen_k_bound)
+                                       int64_t /*max_seqlen_q*/, int64_t max_seqlen_k_bound)
 {
-    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound - 1) {
+    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
         window_left = -1;
     }
-    if (max_seqlen_q > 0 && window_right >= max_seqlen_q - 1) {
+    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
         window_right = -1;
     }
     if (causal) {
@@ -70,6 +72,16 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
     FwdMaskDerivation derived;
     derived.is_causal = (window_left < 0 && window_right == 0);
     derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
+    // Match the host tiling: infinite local side -> finite KV bound, not
+    // SPARSE_MODE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
+    if (derived.is_local) {
+        if (window_left < 0) {
+            window_left = max_seqlen_k_bound;
+        }
+        if (window_right < 0) {
+            window_right = max_seqlen_k_bound;
+        }
+    }
     derived.window_left = window_left;
     derived.window_right = window_right;
     derived.maskType = derived.is_local ? static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND)
