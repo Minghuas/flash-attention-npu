@@ -20,13 +20,19 @@ import pytest
 import torch
 import torch_npu
 
+if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""):
+    pytest.skip("flash_attn_npu (v2) not supported on Ascend950", allow_module_level=True)
+
 from flash_attn_npu import flash_attn_func, flash_attn_varlen_func
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 
-from fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd  # noqa: E402
+from fa_small_op_golden import (  # noqa: E402
+    golden_bsnd_bwd_from_fwd,
+    golden_tnd_bwd_from_fwd,
+)
 
 RTOL_GOLDEN = 1e-2
 ATOL_GOLDEN = 1e-2
