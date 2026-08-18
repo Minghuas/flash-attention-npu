@@ -72,6 +72,21 @@ pytest -q -s tests/test_flash_attn_npu_v3.py
 pytest -q -s tests/test_flash_attn_npu_v4.py
 ```
 
+## 使用 msSanitizer 进行内存检测
+
+编译时设置环境变量 `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` 即可使能 Ascend msSanitizer 内存异常检测：
+
+```bash
+# 使能内存检测编译
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
+
+# Ascend 910：静态插桩已编译进算子，直接运行测试即可
+pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# Ascend 950：通过 msSanitizer 运行时注入检测内存（注意 `--` 分隔符）
+mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+```
+
 ## 使用方法
 
 ### FlashAttention v2
