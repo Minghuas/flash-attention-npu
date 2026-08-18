@@ -51,6 +51,7 @@ jobs:
       CI_DOCKER_IMAGE: ${{ matrix.clone_image }}
       CI_MATRIX_MAX_JOBS: ${{ inputs.max_jobs }}
       ARCH_FILTER: ${{ matrix.arch_filter }}
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
     steps:
       - name: Clone repo (docker first 3x as root, then host 3x)
         env:
@@ -65,6 +66,7 @@ jobs:
           # 容器内用 git init + fetch (不要求空目录), checkout 前用 git clean 删 untracked。
           docker_ok=false
           if docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             --network host \
             -v "$PWD:/workspace" \
             -w /workspace \
@@ -123,14 +125,7 @@ jobs:
           set -euo pipefail
           bash ci/run_ci_matrix.sh
 
-      - name: Kill orphaned CI containers
+      - name: Clean up this job's CI containers
         if: always()
         run: |
-          echo "cleaning up orphaned containers from image: $CI_DOCKER_IMAGE"
-          orphans=$(docker ps -q --filter "ancestor=$CI_DOCKER_IMAGE")
-          if [ -n "$orphans" ]; then
-            echo "killing orphaned containers: $orphans"
-            docker kill $orphans 2>/dev/null || true
-          else
-            echo "no orphaned containers found"
-          fi
+          bash ci/cleanup_ci_containers.sh

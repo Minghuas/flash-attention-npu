@@ -19,6 +19,7 @@
 #   IMAGE_PREFIX          (默认 fa-npu-ci)
 #   CI_MATRIX_MAX_JOBS    (默认 0=不限) 并发容器数上限 (内存吃紧时调小, 如 3)
 #   CI_DOCKER_PRIVILEGED  (默认 true)
+#   CI_CONTAINER_SCOPE   （默认 -local-$(id -u)-$$）当前 CI job 的唯一容器归属标识
 #   FLASH_ATTN_BUILD_VERSION (默认 all) 编译哪些 API 代 (all/v2/v3/v4)
 
 set -euo pipefail
@@ -29,13 +30,32 @@ MATRIX_FILE="${MATRIX_FILE:-$REPO_ROOT/ci/build_matrix.tsv}"
 IMAGE_PREFIX="${IMAGE_PREFIX:-fa-npu-ci}"
 CI_MATRIX_MAX_JOBS="${CI_MATRIX_MAX_JOBS:-0}"
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
+CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
 LOG_DIR="${REPO_ROOT}/build/matrix-logs"
+# 每个 combo 一个 docker CLI PID 文件; 取消时先终止这些客户端, 再按 scope 清理容器。
+PID_DIR="$LOG_DIR/pids"
 # 架构过滤: 非空时只跑 tsv 第 7 列 (arch) 匹配的 combo。用于多机器分架构跑:
 # 950 机器设 ARCH_FILTER=x86_64, 910B 机器设 ARCH_FILTER=aarch64, 各跑各的。
 ARCH_FILTER="${ARCH_FILTER:-}"
 
 log() { printf '[matrix-build] %s\n' "$*"; }
 die() { printf '[matrix-build][ERROR] %s\n' "$*" >&2; exit 1; }
+
+cleanup_on_signal() {
+  log "received cancel/terminate signal, stopping matrix docker clients for scope=$CI_CONTAINER_SCOPE"
+  shopt -s nullglob
+  for pidfile in "$PID_DIR"/*.pid; do
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then
+      log "stopping docker client pid=$pid ($(basename "$pidfile"))"
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+  CI_CONTAINER_SCOPE="$CI_CONTAINER_SCOPE" bash "$SCRIPT_DIR/cleanup_ci_containers.sh" || true
+  rm -f "$PID_DIR"/*.pid 2>/dev/null || true
+  exit 130
+}
+trap cleanup_on_signal SIGTERM SIGINT
 
 command -v docker >/dev/null 2>&1 || die "docker not found"
 [ -f "$MATRIX_FILE" ] || die "matrix file not found: $MATRIX_FILE"
@@ -75,6 +95,8 @@ combo_image() {
 }
 
 mkdir -p "$LOG_DIR"
+mkdir -p "$PID_DIR"
+find "$PID_DIR" -maxdepth 1 -type f -name '*.pid' -delete
 
 # 检查镜像是否都已构建
 missing=()
@@ -99,25 +121,41 @@ log "logs dir: $LOG_DIR"
 first_name="${COMBOS[0]%%|*}"
 first_img="$(combo_image "${COMBOS[0]}")"
 log "pre-init submodule csrc/catlass (once, via $first_img)"
+preinit_pidfile="$PID_DIR/preinit.pid"
+rm -f "$preinit_pidfile"
+set +e
 docker run --rm \
+  --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
   "${privileged_args[@]}" \
   --network host \
   -v "$REPO_ROOT:/workspace/flash-attention-npu" \
   -w /workspace/flash-attention-npu \
   "$first_img" \
-  bash -lc 'git config --global --add safe.directory "*" && git submodule update --init --recursive csrc/catlass' \
-  || die "submodule pre-init failed"
+  bash -lc 'git config --global --add safe.directory "*" && git submodule update --init --recursive csrc/catlass' &
+preinit_pid=$!
+printf '%s\n' "$preinit_pid" > "$preinit_pidfile"
+if wait "$preinit_pid"; then
+  preinit_rc=0
+else
+  preinit_rc=$?
+fi
+set -e
+rm -f "$preinit_pidfile"
+[ "$preinit_rc" -eq 0 ] || die "submodule pre-init failed"
 
 # ---------- 2. 每个 combo 一个容器, 并发编译 ----------
 build_one() {
-  local line="$1" name logf rc img
+  local line="$1" name logf rc img docker_pid pidfile
   name="${line%%|*}"
   img="$(combo_image "$line")"
   logf="$LOG_DIR/${name}.log"
+  pidfile="$PID_DIR/${name}.pid"
   : > "$logf"
+  rm -f "$pidfile"
   echo "[matrix-build] >>> $name ($img) -> $logf"
   set +e
   docker run --rm \
+    --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
     --network host \
     -v "$REPO_ROOT:/workspace/flash-attention-npu" \
@@ -127,8 +165,15 @@ build_one() {
     -w /workspace/flash-attention-npu \
     "$img" \
     bash -lc 'git config --global --add safe.directory "*" && python3 setup.py build --build-base=/tmp/build' \
-    > "$logf" 2>&1
-  rc=$?
+    > "$logf" 2>&1 &
+  docker_pid=$!
+  printf '%s\n' "$docker_pid" > "$pidfile"
+  if wait "$docker_pid"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  rm -f "$pidfile"
   echo "$rc" > "$LOG_DIR/${name}.rc"
 }
 
