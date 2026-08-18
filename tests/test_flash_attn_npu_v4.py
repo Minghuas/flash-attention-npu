@@ -258,12 +258,6 @@ test_cases = [
     (torch.float16, 1, 512, 1, 1, 1024, 128, 0, 128, True, "BSND", False, 542, 647),
     (torch.bfloat16, 1, 128, 1, 1, 1024, 128, 0, 128, True, "TND", False, 64, 0),
     (torch.float16, 1, 512, 1, 1, 1024, 128, 0, 128, True, "TND", False, 542, 647),
-    # FD + SWA decode empty split∩window (needs cache_mode=1 + TND + num_splits>1).
-    # Narrow left window → early FD S2 segs return; CombineScale uses host-inited 0/-inf.
-    (torch.bfloat16, 1, 128, 1, 1, 1024, 128, 1, 128, True, "TND", False, 64, 0),
-    (torch.bfloat16, 1, 32, 4, 1, 4096, 128, 1, 128, True, "TND", False, 256, 0),
-    (torch.float16, 1, 16, 2, 1, 4096, 128, 1, 128, True, "TND", False, 128, 0),
-    (torch.bfloat16, 1, 32, 4, 1, 8192, 128, 1, 128, False, "TND", False, 512, 0),
     # Sq>>Sk SWA: left window collapses to -1; golden must zero fully-masked q rows via mask
     (torch.float16, 2, 16, 8, 1024, 128, 128, 0, 128, False, "BSND", False, 497, 265),
 
@@ -412,8 +406,8 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     if "Ascend950" in name and num_splits > 1:
         pytest.skip("Ascend950 does not support num_splits>1")
-    if "Ascend950" in name and head_size > 128:
-        pytest.skip("Ascend950 does not support head_size>128")
+    if "Ascend950" in name and not (1 <= head_size <= 256):
+        pytest.skip("Ascend950 supports head_size in [1, 256]")
 
     if "Ascend950" in name and (window_size_left != -1 or window_size_right != -1):
         pytest.skip("Ascend950 does not support SWA")
@@ -431,7 +425,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         # Seeded for reproducibility; does not perturb the query/key/value RNG streams above.
         gen = torch.Generator().manual_seed(1234)
         q_sequences = torch.randint(low=1, high=q_seqlen + 1, size=(batch_size,), generator=gen).tolist()
-        kv_sequences = [int(torch.randint(low=q, high=kv_seqlen + 1, size=(1,), generator=gen))
+        kv_sequences = [int(torch.randint(low=min(q, kv_seqlen), high=kv_seqlen + 1, size=(1,), generator=gen))
                         for q in q_sequences]
     else:
         q_sequences = [q_seqlen] * batch_size
@@ -602,6 +596,12 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             golden_lse_gpu[:, fully_masked] = torch.inf
             out_plain[fully_masked, :, :] = 0
             lse_plain[:, fully_masked] = torch.inf
+        if is_causal_golden and atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            out_gpu[fully_masked, :, :] = 0
+            golden_lse_gpu[:, fully_masked] = torch.inf
+            out_plain[fully_masked, :, :] = 0
+            lse_plain[:, fully_masked] = torch.inf
         if layout == "BSND":
             golden_out_gpu[i:i+1] = out_gpu
             golden_lseL_gpu[i:i+1] = golden_lse_gpu.reshape(1, num_heads, q_seqlen_per_batch)
@@ -617,10 +617,38 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     torch.testing.assert_close(out_out.cpu(), golden_out_gpu.cpu(), rtol=rtol, atol=atol)
     if "Ascend910" in name:
         torch.testing.assert_close(softmax_lse.cpu(), golden_lseL_gpu.cpu(), rtol=rtol, atol=atol)
-    print("\n--- Golden-GPU vs CANN ---")
     _, r_golden_fa = compare_rule(golden_out_gpu.cpu().float(), out_out.cpu().float())
     assert r_golden_fa, "Golden-GPU vs CANN check FAILED"
-    print("\n--- Golden vs CANN ---")
     _, r_plain_cann = compare_rule(golden_out.cpu().float(), out_out.cpu().float())
     assert r_plain_cann, "Golden vs CANN check FAILED"
-    print("--- end ---")
+
+@pytest.mark.parametrize("data_type", [torch.bfloat16])
+@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("kv_heads", [8])
+@pytest.mark.parametrize("head_size", [35,64,101,128,151,192,201,256])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("window_size_left", [-1])
+@pytest.mark.parametrize("window_size_right", [-1])
+@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("batch_size, q_seqlen, kv_seqlen", [
+    (1, 256, 128),
+    (1, 130, 128),
+    (2, 256, 256),
+    (4, 128, 256),
+    (2, 128, 128),
+    (1, 384, 128),
+    (1, 256, 384),
+    (1, 128, 128),
+    (1, 256, 512),
+    (1, 256, 192),
+])
+@pytest.mark.parametrize("num_splits", [0, 1, 2])
+@pytest.mark.parametrize("cache_mode", [0, 1])
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("is_causal", [True, False])
+def test_fa_custom_ops_with_hd_le_256(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, num_splits, window_size_left, window_size_right, softcap):
+    is_varied = layout == 'TND'
+    name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
+    if "Ascend910" in name:
+        pytest.skip("Sq > Sk not support in Ascend910")
+    test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits)

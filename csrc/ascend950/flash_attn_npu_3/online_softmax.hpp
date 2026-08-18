@@ -353,7 +353,7 @@ public:
     void operator()(TensorP &l1PTensorTla, TensorMask &gmMaskTensorTla, GemmCoord actualBlockShape,
         uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
          Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
-         uint32_t triUp,  uint32_t triDown, uint32_t globalWindowSize,  uint32_t localWindowSize,
+         int64_t triUp,  uint32_t triDown, uint32_t globalWindowSize,  uint32_t localWindowSize,
          uint32_t kvSStartIdx, uint32_t kvSEndIdx, uint32_t maskType)
     {
         uint32_t mCopyOffset = RoundUp(actualBlockShape.m(), 8) / 2;
@@ -383,13 +383,14 @@ public:
         uint32_t maskColumn = 0;
         uint32_t addMaskUbOffset = 0;
         if (maskType == 1) {
-            if (triUp >= kvSStartIdx) {
-                gmOffsetMaskRow = triUp - kvSStartIdx;
+            if (triUp >= static_cast<int64_t>(kvSStartIdx)) {
+                gmOffsetMaskRow = static_cast<uint32_t>(triUp - kvSStartIdx);
                 gmOffsetMaskColumn = 0;
                 maskColumn = kvSEndIdx - kvSStartIdx;
             } else {
                 gmOffsetMaskRow = 0;
-                gmOffsetMaskColumn = kvSStartIdx - triUp;
+                gmOffsetMaskColumn = static_cast<uint32_t>(
+                    static_cast<int64_t>(kvSStartIdx) - triUp);
                 maskColumn = n;
                 addMaskUbOffset = 0;
             }
