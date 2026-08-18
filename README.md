@@ -70,6 +70,21 @@ pytest -q -s tests/test_flash_attn_npu.py
 pytest -q -s tests/test_flash_attn_npu_v3.py
 ```
 
+## Memory Checking with msSanitizer
+
+Set env `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` at compile time to enable Ascend msSanitizer memory exception detection:
+
+```bash
+# Build with memory checking enabled
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
+
+# Ascend 910: static instrumentation is compiled into the kernels - run tests directly
+pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# Ascend 950: memory checking via runtime injection (note the `--` separator)
+mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+```
+
 ## Usage
 
 ### FlashAttention v2
