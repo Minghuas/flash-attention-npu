@@ -15,16 +15,12 @@ import torch
 小算子 FlashAttention 正向golden相关实现
 """
 
-def group_matmul(head, kv_head, left, right, high_prec = 1):
+def group_matmul(head, kv_head, left, right):
     group_num = head // kv_head
     score = None
     for i in range(kv_head):
-        if high_prec == 0:
-            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
-                                        right[i:(i + 1), :, :].to(torch.float32)).to(torch.float32)
-        else:
-            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
-                                        right[i:(i + 1), :, :].to(torch.float32))
+        group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :],
+                                    right[i:(i + 1), :, :])
         if score is None:
             score = group_score
         else:
@@ -68,7 +64,7 @@ def qkMM1(
         sub_k = 128 if qk_k_loop_idx != (qk_k_loop - 1) else (qk_k - qk_k_loop_idx * 128)
         partial_Query = query[:, :, qk_k_loop_idx * 128: qk_k_loop_idx * 128 + sub_k]
         partial_Key = key[:, qk_k_loop_idx * 128: qk_k_loop_idx * 128 + sub_k, :]
-        result_split = group_matmul(partial_Query.shape[0], partial_Key.shape[0], partial_Query, partial_Key, 0)
+        result_split = group_matmul(partial_Query.shape[0], partial_Key.shape[0], partial_Query, partial_Key)
         if result is None:
             result = result_split
         else:
@@ -87,7 +83,7 @@ def pvMM2(
         sub_k = 128 if pv_k_loop_idx != (pv_k_loop - 1) else (pv_k - pv_k_loop_idx * 128)
         partial_P = p[:, :, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k]
         partial_Value = value[:, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k, :]
-        result_split = group_matmul(partial_P.shape[0], partial_Value.shape[0], partial_P, partial_Value, 0)
+        result_split = group_matmul(partial_P.shape[0], partial_Value.shape[0], partial_P, partial_Value)
         if result is None:
             result = result_split
         else:
@@ -103,14 +99,17 @@ def ref_flash_attention(
     data_type,
     softcap=0.0,
     rescale_threshold = 0.0,
+    upcast=True,
+    reorder_ops=False,
     ):
-    inner_prec = 0
-    interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
+    dtype_og = query.dtype
+    if upcast:
+        query, key, value = query.float(), key.float(), value.float()
+    interm_dtype = value.dtype
     query = query.permute(1, 0, 2)
     key = key.permute(1, 2, 0)
     value = value.permute(1, 0, 2)
-    scale = torch.tensor(scale)
-    scale = scale.to(torch.float16) if inner_prec == 1 else scale.to(torch.float32)
+    scale = torch.tensor(scale).to(query.dtype)
     context_len = key.shape[2]
     context_size = 512
     group_num = query.shape[0] // key.shape[0]
@@ -129,8 +128,10 @@ def ref_flash_attention(
         if mask is not None:
             sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len].to(interm_dtype) * (-1e4)
         sub_value = value[:, kv_start: kv_start + sub_len, :]
-        qk_result = qkMM1(query, sub_key).to(interm_dtype)
-        qk_result = qk_result * scale
+        if reorder_ops:
+            qk_result = qkMM1(query, sub_key * scale).to(interm_dtype)
+        else:
+            qk_result = qkMM1(query * scale, sub_key).to(interm_dtype)
         if softcap > 0.0:
             qk_result = softcap * torch.tanh(qk_result / softcap)
         if mask is not None:
@@ -138,7 +139,7 @@ def ref_flash_attention(
         if kv_start == 0:
             gm = None
         p_result, row_sum, dm, gm = softmax1(qk_result, kv_start == 0, gm, interm_dtype, rescale_threshold)
-        p_result = p_result.to(data_type)
+        p_result = p_result.to(value.dtype)
         if kv_start == 0:
             gm_high = None
         lo = pvMM2(p_result, sub_value).to(interm_dtype)
@@ -154,7 +155,7 @@ def ref_flash_attention(
     go = go / gl
     go = go.permute(1, 0, 2)
     lse = torch.squeeze((torch.log(gl) + gm), dim=-1).to(torch.float32)
-    return go.to(data_type), lse
+    return go.to(dtype_og), lse
 
 def softmax_numpy(sim, sink_matrix):
     import numpy as np
@@ -203,24 +204,38 @@ def ref_masked_attention(
             scale: float,
             mask,    # (q_seqlen, k_seqlen)
             sink_matrix,
+            upcast=True,
+            reorder_ops=False,
 ):
+    dtype_og = query.dtype
+    if upcast:
+        query, key, value = query.float(), key.float(), value.float()
     query = query.permute(1, 0, 2)
     key = key.permute(1, 2, 0)
     value = value.permute(1, 0, 2)
-    sim_high = group_matmul(query.shape[0], key.shape[0], query, key, 1)  # (head_num, q_seqlen, k_seqlen)
-    sim_high = sim_high * scale
+    scale = torch.tensor(scale).to(query.dtype)
+    if reorder_ops:
+        sim_high = group_matmul(query.shape[0], key.shape[0], query, key * scale)  # (head_num, q_seqlen, k_seqlen)
+    else:
+        sim_high = group_matmul(query.shape[0], key.shape[0], query * scale, key)  # (head_num, q_seqlen, k_seqlen)
     if mask is not None:
         sim_high = sim_high + (
             mask[:sim_high.shape[-2], :sim_high.shape[-1]]
-            ).to(torch.float32) * (-1e4)
-    p_high, lse_high, gm = softmax_numpy(sim_high, sink_matrix)
-    lse_high = lse_high.astype(np.float64)
-    p = torch.from_numpy(p_high).to(query.dtype)
-    p_high = torch.from_numpy(p_high).to(torch.float32)
+            ).to(sim_high.dtype) * (-1e4)
 
-    out_high = group_matmul(query.shape[0], key.shape[0], p_high, value, 1)
+    if upcast or sink_matrix is not None:
+        import numpy as np
+
+        p_high, lse_high, gm = softmax_numpy(sim_high, sink_matrix)
+        lse_high = lse_high.astype(np.float64)
+        p_high = torch.from_numpy(p_high).to(value.dtype)
+    else:
+        p_high = torch.softmax(sim_high, dim=-1).to(value.dtype)
+        lse_high = torch.logsumexp(sim_high.to(torch.float32), dim=-1).cpu().numpy()
+
+    out_high = group_matmul(query.shape[0], key.shape[0], p_high, value)
     out_high = out_high.permute(1, 0, 2)
-    return out_high, lse_high
+    return out_high.to(dtype_og), lse_high
 
 """
 小算子 FlashAttention 反向golden相关实现
