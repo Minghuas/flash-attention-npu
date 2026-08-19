@@ -249,7 +249,10 @@ namespace SplitFuse {
                 totalQTokens = static_cast<uint32_t>(gActualQseqlen.GetValue(batch));
             }
 
-            if (flashDecodeFlag != 0U) {
+            const bool idleCoreFD = (flashDecodeFlag != 0U) &&
+                (fATilingData->needCoreNum != 0U) &&
+                (coreIdx >= fATilingData->needCoreNum);
+            if (flashDecodeFlag != 0U && !idleCoreFD) {
                 uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;
                 uint32_t startN1Idx = fATilingData->coreInfo[coreIdx].startN1Idx;
                 uint32_t startS1Idx = fATilingData->coreInfo[coreIdx].startS1Idx;
@@ -316,7 +319,7 @@ namespace SplitFuse {
                         }
                     }
                 }
-            } else {
+            } else if (flashDecodeFlag == 0U) {
                 for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
                     uint32_t curBatchTmp = 0;
                     uint32_t preTotalTaskNumTmp = 0;

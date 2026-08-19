@@ -9,10 +9,12 @@
 // explicitly instantiates one launch_fwd_impl<DType, IS_TND>, so the FAInfer
 // template instantiations land in separate (parallel-compiled) object files.
 //
-// The launch tree below reproduces the exact dtype x paged x mask x
-// flash-decode x layout combinations of the three original host functions
-// (mha_fwd_kvcache: BSND with FD; mha_fwd: BSND non-paged; mha_varlen_fwd: TND).
-// mha_fwd and mha_fwd_kvcache share the BSND path; mha_varlen_fwd uses TND.
+// The launch tree below reproduces the exact dtype x paged x mask x layout
+// combinations of the three original host functions (mha_fwd_kvcache: BSND
+// with FD; mha_fwd: BSND non-paged; mha_varlen_fwd: TND). Flash-decode is NOT
+// a template axis: it is a runtime tiling flag (FAInferTilingData
+// .flashDecodeFlag) so the AICPU scheduler-metadata path can decide it on
+// device; idle cores past needCoreNum are skipped inside the kernel.
 
 #pragma once
 
@@ -27,6 +29,16 @@
 // mha_fwd_kvcache.cpp provides the SplitFuse::FAInfer kernel template, the
 // FAInferKernel class, FAIKernelParams, and the FaiKenel enum namespace.
 #include "mha_fwd_kvcache.cpp"
+
+// 8-param FAInfer (no IS_FD template arg — flash-decode moved to tiling).
+#define FWD_LAUNCH(DTYPE, PAGED, MASK, LAYOUT_ENUM, SOFTCAP)                       \
+    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED,                                 \
+                       FaiKenel::MaskType::MASK, LAYOUT_ENUM,                      \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP>             \
+        <<<blockDim, nullptr, aclStream>>>(                                        \
+            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
+            oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
+            workspaceDevice, tilingDevice)
 
 template <typename DType, bool IS_TND>
 void launch_fwd_impl(const FwdLaunchArgs &a) {
@@ -56,157 +68,44 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     if (paged_KV) {
         if (is_local) {
             if (has_softcap) {
-                SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_SWA,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true);
             } else {
-                SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_SWA,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false);
             }
         } else if (is_causal) {
-            // Flash-decode (8th template param = true) is a BSND-only path
-            // (mha_fwd_kvcache); compiled out for TND so no FD+TND combo is
-            // instantiated.
-            if constexpr (!IS_TND) {
-                if (flashDecodeFlag) {
-                    if (has_softcap) {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_CAUSAL,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, true, true>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_CAUSAL,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, true, false>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
-                } else {
-                    if (has_softcap) {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_CAUSAL,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_CAUSAL,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
-                }
+            if (has_softcap) {
+                FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true);
             } else {
-                if (has_softcap) {
-                    SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_CAUSAL,
-                        LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                        <<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                } else {
-                    SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::MASK_CAUSAL,
-                        LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                        <<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                }
+                FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false);
             }
         } else {
-            if constexpr (!IS_TND) {
-                if (flashDecodeFlag) {
-                    if (has_softcap) {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::NO_MASK,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, true, true>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::NO_MASK,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, true, false>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
-                } else {
-                    if (has_softcap) {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::NO_MASK,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    } else {
-                        SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::NO_MASK,
-                            LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                            <<<blockDim, nullptr, aclStream>>>(
-                                fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                                qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                    }
-                }
+            if (has_softcap) {
+                FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true);
             } else {
-                if (has_softcap) {
-                    SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::NO_MASK,
-                        LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                        <<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                } else {
-                    SplitFuse::FAInfer<DType, DType, float, true, FaiKenel::MaskType::NO_MASK,
-                        LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                        <<<blockDim, nullptr, aclStream>>>(
-                            fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                            qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
-                }
+                FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false);
             }
         }
     } else {
         if (is_local) {
             if (has_softcap) {
-                SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::MASK_SWA,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true);
             } else {
-                SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::MASK_SWA,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false);
             }
         } else if (is_causal) {
             if (has_softcap) {
-                SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::MASK_CAUSAL,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true);
             } else {
-                SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::MASK_CAUSAL,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false);
             }
         } else {
             if (has_softcap) {
-                SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::NO_MASK,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, true>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true);
             } else {
-                SplitFuse::FAInfer<DType, DType, float, false, FaiKenel::MaskType::NO_MASK,
-                    LAYOUT, Catlass::Epilogue::LseModeT::OUT_ONLY, false, false>
-                    <<<blockDim, nullptr, aclStream>>>(
-                        fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice,
-                        qSeqDevice, kvSeqDevice, workspaceDevice, tilingDevice);
+                FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false);
             }
         }
     }
 }
+
+#undef FWD_LAUNCH

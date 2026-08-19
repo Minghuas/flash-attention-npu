@@ -1,6 +1,13 @@
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * Modified by Minghua Shen, 2026
+ *
+ * AICPU scheduler-metadata kernel for FA v2 (Ascend 910): reproduces the host
+ * forward tiling (including the BSND paged flash-decode split scheduling) on
+ * the AICPU so the forward no longer needs D2H/H2D syncs. Mirrors
+ * csrc/ascend910/flash_attn_npu_3/fa_metadata.aicpu; the v2 differences are
+ * the BSND flash-decode trigger (paged && !varlen) and a distinct kernel
+ * symbol so both backends can be loaded in one process.
  */
 
 #include "aicpu_api.h"
@@ -29,7 +36,7 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
 }
 }
 
-__global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
+__global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
 {
     FAMetadataArgs *metaArgs = reinterpret_cast<FAMetadataArgs *>(args);
     const bool hasMask = metaArgs->maskType != 0;
@@ -57,7 +64,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->windowSizeLeft = metaArgs->windowSizeLeft;
     tilingData->windowSizeRight = metaArgs->windowSizeRight;
     tilingData->maxQSeqlen = metaArgs->maxQSeqlen;
-    tilingData->numSplits = metaArgs->numSplits > 0u ? metaArgs->numSplits : 1u;
 
     uint32_t maxKvSeqlen = 0;
     if (seqlensK != nullptr) {
@@ -102,23 +108,16 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     tilingData->totalTaskNum = totalTaskNum;
 
     {
-        uint32_t maxQ = 0;
-        uint32_t minQ = 0xFFFFFFFFu;
-        for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
-            uint32_t qLen = metaArgs->maxQSeqlen;
-            if (metaArgs->isVarlen != 0) {
-                qLen = static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
-            }
-            if (qLen > maxQ) maxQ = qLen;
-            if (qLen < minQ) minQ = qLen;
-        }
+        // v2 flash-decode is a BSND-only heuristic: paged KV cache, tiny Q,
+        // long KV (mha_fwd_kvcache); the varlen (TND) path never splits.
         const uint32_t bd = metaArgs->blockDim;
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
+        const uint32_t maxQ = metaArgs->maxQSeqlen;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
-        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
+        const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen == 0) &&
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
-            (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
+            (maxKvSeqlen >= 1024u) && (maxQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;
         if (fdFlag) {
             fa_split::SplitContext ctx;
@@ -129,9 +128,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
             ctx.head_size_v = static_cast<int32_t>(metaArgs->embeddingSizeV);
             ctx.cu_seqlen_q_cpu = const_cast<int32_t *>(cuSeqlensQ);
             ctx.seqlens_k_cpu = const_cast<int32_t *>(seqlensK);
-            ctx.is_varlen_q = metaArgs->isVarlen != 0;
+            ctx.is_varlen_q = false;
             ctx.blockDim = bd;
-            ctx.num_splits = static_cast<int32_t>(metaArgs->numSplits);
             fa_split::splitBN2S1GS2(tilingData, ctx);
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;

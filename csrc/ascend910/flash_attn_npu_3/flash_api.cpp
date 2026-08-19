@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstring>
 #include <limits>
+#include <unordered_map>
 
 // mha_fwd_kvcache.cpp (SplitFuse::FAInfer) and fag_kernel.cpp (FAGGeneral) are
 // compiled separately in the autogen dispatch TUs; flash_api.cpp only needs
@@ -10,6 +11,7 @@
 // the fa_split / fa_metadata host helpers.
 #include "tilingdata.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "acl/acl.h"
 #include "runtime/rt_ffts.h"
@@ -40,18 +42,97 @@ extern __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
-static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args)
+struct FwdMaskDerivation {
+    bool is_causal;
+    bool is_local;
+    int64_t window_left;
+    int64_t window_right;
+    uint32_t maskType;
+};
+
+// Window normalization + mask-type derivation, mirroring the host tiling branch
+// in mha_fwd, but bounding the KV side with a host-known upper bound
+// (max_seqlen_k / cache capacity) instead of the device-side actual max KV
+// seqlen, so it is usable on the scheduler-metadata path where no D2H sync is
+// allowed. Both sides compare against the KV bound (matching the host's "both
+// sides vs seqlen_k" rule); an over-long window collapses to "no window", and
+// a window that covers the whole sequence masks nothing, so a bound larger
+// than the actual seqlen is still semantically identical.
+static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t window_right,
+                                       int64_t /*max_seqlen_q*/, int64_t max_seqlen_k_bound)
+{
+    if (max_seqlen_k_bound > 0 && window_left >= max_seqlen_k_bound) {
+        window_left = -1;
+    }
+    if (max_seqlen_k_bound > 0 && window_right >= max_seqlen_k_bound) {
+        window_right = -1;
+    }
+    if (causal) {
+        window_right = 0;
+    }
+    FwdMaskDerivation derived;
+    derived.is_causal = (window_left < 0 && window_right == 0);
+    derived.is_local = (window_left >= 0 || window_right >= 0) && !derived.is_causal;
+    // Match the host tiling: infinite local side -> finite KV bound, not
+    // SPARSE_MODE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
+    if (derived.is_local) {
+        if (window_left < 0) {
+            window_left = max_seqlen_k_bound;
+        }
+        if (window_right < 0) {
+            window_right = max_seqlen_k_bound;
+        }
+    }
+    derived.window_left = window_left;
+    derived.window_right = window_right;
+    derived.maskType = derived.is_local ? static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND)
+        : (derived.is_causal ? static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL)
+                             : static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK));
+    return derived;
+}
+
+static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
+                                           const at::Tensor &seqlensK,
+                                           const std::optional<at::Tensor> &cuSeqlensQ)
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
-    aclrtStream aicpuStream = c10_npu::getNPUStreamFromPool().stream(false);
-    static thread_local FAMetadataArgs metaArgs;
-    metaArgs = args;
+    c10_npu::NPUStream currentStream = c10_npu::getCurrentNPUStream();
+    c10_npu::NPUStream aicpuStream = c10_npu::getNPUStreamFromPool();
+    aclrtStream curHandle = currentStream.stream(false);
+    aclrtStream aicpuHandle = aicpuStream.stream(false);
 
-    ComputeFAMetadata<<<1, nullptr, aicpuStream>>>(&metaArgs, sizeof(metaArgs));
-    ACL_CHECK(aclrtSynchronizeStream(aicpuStream));
+    struct MetadataEvents {
+        aclrtEvent inputReady = nullptr;
+        aclrtEvent metadataDone = nullptr;
+    };
+    static thread_local std::unordered_map<c10::DeviceIndex, MetadataEvents> eventsByDevice;
+    MetadataEvents &events = eventsByDevice[currentStream.device_index()];
+    if (events.inputReady == nullptr) {
+        ACL_CHECK(aclrtCreateEvent(&events.inputReady));
+        ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
+    }
+
+    FAMetadataArgs metaArgs = args;
+    auto metadata_task = [curHandle, aicpuHandle,
+                          inputReady = events.inputReady,
+                          metadataDone = events.metadataDone, metaArgs]() mutable -> int {
+        ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
+        ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
+        ComputeFAMetadata<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));
+        ACL_CHECK(aclrtRecordEvent(metadataDone, aicpuHandle));
+        ACL_CHECK(aclrtStreamWaitEvent(curHandle, metadataDone));
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_metadata", metadata_task);
+
+    c10_npu::NPUCachingAllocator::recordStream(meta.storage().data_ptr(), aicpuStream);
+    c10_npu::NPUCachingAllocator::recordStream(seqlensK.storage().data_ptr(), aicpuStream);
+    if (cuSeqlensQ.has_value()) {
+        c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
+    }
     return meta;
 }
 
@@ -250,11 +331,30 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         TORCH_CHECK(schedMd.dtype() == at::kByte, "scheduler_metadata must be a byte tensor");
         TORCH_CHECK(schedMd.is_contiguous(), "scheduler_metadata must be contiguous");
         TORCH_CHECK(schedMd.device().type() == at::kPrivateUse1, "scheduler_metadata must be an NPU tensor");
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) >= fa_metadata::MetadataBytes(is_causal),
-                    "scheduler_metadata buffer is too small for this call's causal flag");
+        // Derive the mask axes (causal/SWA) from this call's arguments the same
+        // way get_scheduler_metadata did when producing the buffer, so that the
+        // template selection and the tiling offset match the AICPU-written
+        // tiling. The metadata must have been created with matching causal /
+        // window_size / softcap / softmax_scale / seqlen-bound arguments.
+        int64_t kvSeqlenBound = 0;
+        if (is_varlen_kv) {
+            kvSeqlenBound = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
+        } else if (paged_KV) {
+            kvSeqlenBound = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
+        } else {
+            kvSeqlenBound = k.size(1);
+        }
+        FwdMaskDerivation maskDer = DeriveFwdMask(is_causal, window_size_left, window_size_right,
+                                                  seqlen_q, kvSeqlenBound);
+        is_causal = maskDer.is_causal;
+        is_local = maskDer.is_local;
+        const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
+                    "scheduler_metadata buffer size must exactly match this call's "
+                    "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t *>(schedMd.data_ptr());
-        tilingDevice = metaBase + fa_metadata::TilingOffset(is_causal);
-        maskDevice = is_causal ? metaBase : nullptr;
+        tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
+        maskDevice = hasMask ? metaBase : nullptr;
         int64_t wsBase = static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim));
         int64_t wsSplit = 0;
         if (paged_KV && is_varlen_q) {
@@ -549,10 +649,11 @@ at::Tensor get_scheduler_metadata(
         int64_t window_size_left,
         int64_t window_size_right,
         int64_t attention_chunk,
-        bool has_softcap,
+        double softcap,
         int64_t num_splits,
         std::optional<bool> pack_gqa,
-        int64_t sm_margin)
+        int64_t sm_margin,
+        std::optional<double> softmax_scale)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     const bool is_varlen_q = cu_seqlens_q.has_value();
@@ -571,6 +672,16 @@ at::Tensor get_scheduler_metadata(
                 "] (0 = auto; upper bound = number of AI cores). ");
     TORCH_CHECK(num_splits <= 1 || (page_size.has_value() && is_varlen_q),
                 "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
+    TORCH_CHECK(softcap >= 0.0, "softcap must be non-negative (0.0 disables softcap)");
+    // Mask axes are fully derived on host from the declared seqlen bounds; the
+    // AICPU kernel only copies the final values into the tiling blob.
+    FwdMaskDerivation maskDer = DeriveFwdMask(causal, window_size_left, window_size_right,
+                                              max_seqlen_q, max_seqlen_k);
+    float scaleValue = softmax_scale.has_value() ? static_cast<float>(softmax_scale.value())
+        : 1.0f / std::sqrt(static_cast<float>(headdim));
+    if (softcap > 0.0) {
+        scaleValue /= static_cast<float>(softcap);
+    }
     FAMetadataArgs args;
     args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cuSeqlensQDev) : 0ULL;
     args.seqlensKAddr = reinterpret_cast<uint64_t>(cache_seqlens.data_ptr());
@@ -585,14 +696,17 @@ at::Tensor get_scheduler_metadata(
     args.maxNumBlocksPerBatch = page_size.has_value()
         ? ((static_cast<uint32_t>(max_seqlen_k) + ps - 1) / ps) : 0;
     args.maxQSeqlen = static_cast<uint32_t>(max_seqlen_q);
-    args.maskType = causal ? 1U : 0U;
+    args.maskType = maskDer.maskType;
+    args.windowSizeLeft = maskDer.window_left;
+    args.windowSizeRight = maskDer.window_right;
     args.blockDim = blockDim;
     args.isVarlen = is_varlen_q ? 1U : 0U;
     args.isVarlenKv = is_varlen_kv ? 1U : 0U;
     args.pagedKV = page_size.has_value() ? 1U : 0U;
     args.numSplits = static_cast<uint32_t>(num_splits);
-    args.scaleValue = 1.0f / std::sqrt(static_cast<float>(headdim));
-    return GetSchedulerMetadataImpl(args);
+    args.scaleValue = scaleValue;
+    args.softcapValue = static_cast<float>(softcap);
+    return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q);
 }
 
 std::vector<at::Tensor>
