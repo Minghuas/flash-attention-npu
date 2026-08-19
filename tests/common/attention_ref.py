@@ -1,12 +1,230 @@
 # Copyright (c) 2026, Minghua Shen.
-"""
-小算子 FlashAttention 反向标杆（传入 FA 前向 out/lse，仅算反传）。
-
-供 test_flash_attn_npu_v2_bwd.py / test_flash_attn_npu_v3_bwd.py 使用。
-"""
-
 import torch
+"""
+  FlashAttention NPU 公共 reference / golden 实现。
 
+  - 正向golden：
+    ref_flash_attention / ref_masked_attention，用于 v2/v3/v4 forward 测
+    试计算 golden out/lse。
+  - 反向golden：
+    golden_bsnd_bwd_from_fwd / golden_tnd_bwd_from_fwd，传入 FA forward
+    的 out/lse，仅计算 backward golden。
+"""
+
+"""
+小算子 FlashAttention 正向golden相关实现
+"""
+
+def group_matmul(head, kv_head, left, right, high_prec = 1):
+    group_num = head // kv_head
+    score = None
+    for i in range(kv_head):
+        if high_prec == 0:
+            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
+                                        right[i:(i + 1), :, :].to(torch.float32)).to(torch.float32)
+        else:
+            group_score = torch.matmul(left[i * group_num:(i + 1) * group_num, :, :].to(torch.float32),
+                                        right[i:(i + 1), :, :].to(torch.float32))
+        if score is None:
+            score = group_score
+        else:
+            score = torch.cat((score, group_score), 0)
+    return score
+
+
+def softmax1(
+    qk_result,
+    is_first,
+    gm,
+    interm_dtype = torch.float16,
+    rescale_threshold = 0.0,
+    ):
+    sim = qk_result.to(interm_dtype)
+    lm = torch.max(sim, dim=-1, keepdims=True)[0]
+    if is_first:
+        hm = lm
+        dm = torch.zeros_like(lm)
+    else:
+        hm = torch.maximum(gm, lm)
+        dm = gm - hm
+        if rescale_threshold > 0:
+            hm = torch.maximum(gm, lm - rescale_threshold)
+            dm = gm - hm
+    gm = hm
+    sim_sub = sim - hm
+    sim_sub = torch.exp(sim_sub.to(interm_dtype))
+    row_sum = torch.sum(sim_sub, dim=-1, keepdims=True)
+    return sim_sub, row_sum, dm, gm
+
+def qkMM1(
+    query,
+    key
+    ):
+    result = None
+    qk_k = key.shape[1]
+    qk_k_split = 128
+    qk_k_loop = (qk_k + 127) // 128
+    for qk_k_loop_idx in range(qk_k_loop):
+        sub_k = 128 if qk_k_loop_idx != (qk_k_loop - 1) else (qk_k - qk_k_loop_idx * 128)
+        partial_Query = query[:, :, qk_k_loop_idx * 128: qk_k_loop_idx * 128 + sub_k]
+        partial_Key = key[:, qk_k_loop_idx * 128: qk_k_loop_idx * 128 + sub_k, :]
+        result_split = group_matmul(partial_Query.shape[0], partial_Key.shape[0], partial_Query, partial_Key, 0)
+        if result is None:
+            result = result_split
+        else:
+            result = result + result_split
+    return result
+
+def pvMM2(
+    p,
+    value
+    ):
+    result = None
+    pv_k = value.shape[1]
+    pv_k_split = 128
+    pv_k_loop = (pv_k + 127) // 128
+    for pv_k_loop_idx in range(pv_k_loop):
+        sub_k = 128 if pv_k_loop_idx != (pv_k_loop - 1) else (pv_k - pv_k_loop_idx * 128)
+        partial_P = p[:, :, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k]
+        partial_Value = value[:, pv_k_loop_idx * 128: pv_k_loop_idx * 128 + sub_k, :]
+        result_split = group_matmul(partial_P.shape[0], partial_Value.shape[0], partial_P, partial_Value, 0)
+        if result is None:
+            result = result_split
+        else:
+            result = result + result_split
+    return result
+
+def ref_flash_attention(
+    query,
+    key,
+    value,
+    scale,
+    mask,
+    data_type,
+    softcap=0.0,
+    rescale_threshold = 0.0,
+    ):
+    inner_prec = 0
+    interm_dtype = torch.float16 if inner_prec == 1 else torch.float32
+    query = query.permute(1, 0, 2)
+    key = key.permute(1, 2, 0)
+    value = value.permute(1, 0, 2)
+    scale = torch.tensor(scale)
+    scale = scale.to(torch.float16) if inner_prec == 1 else scale.to(torch.float32)
+    context_len = key.shape[2]
+    context_size = 512
+    group_num = query.shape[0] // key.shape[0]
+    gl = None
+    gl_high = None
+    go = None
+    go_high = None
+    if mask is not None:
+        mask = mask.cpu()
+    for kv_start in range(0, context_len, context_size):
+        sub_len = context_size
+        if kv_start + context_size > context_len:
+            sub_len = context_len - kv_start
+        sub_key = key[:, :, kv_start: kv_start + sub_len]
+        sub_mask = None
+        if mask is not None:
+            sub_mask = mask[:query.shape[1], kv_start : kv_start + sub_len].to(interm_dtype) * (-1e4)
+        sub_value = value[:, kv_start: kv_start + sub_len, :]
+        qk_result = qkMM1(query, sub_key).to(interm_dtype)
+        qk_result = qk_result * scale
+        if softcap > 0.0:
+            qk_result = softcap * torch.tanh(qk_result / softcap)
+        if mask is not None:
+            qk_result += sub_mask
+        if kv_start == 0:
+            gm = None
+        p_result, row_sum, dm, gm = softmax1(qk_result, kv_start == 0, gm, interm_dtype, rescale_threshold)
+        p_result = p_result.to(data_type)
+        if kv_start == 0:
+            gm_high = None
+        lo = pvMM2(p_result, sub_value).to(interm_dtype)
+        if kv_start == 0:
+            gl = row_sum
+            go = lo
+        else:
+            dm = torch.exp(dm)
+            gl = gl * dm
+            gl = gl + row_sum
+            go = go * dm
+            go = go + lo
+    go = go / gl
+    go = go.permute(1, 0, 2)
+    lse = torch.squeeze((torch.log(gl) + gm), dim=-1).to(torch.float32)
+    return go.to(data_type), lse
+
+def softmax_numpy(sim, sink_matrix):
+    import numpy as np
+
+    if isinstance(sim, torch.Tensor):
+        sim = sim.detach().cpu().numpy()
+    if sink_matrix is not None and isinstance(sink_matrix, torch.Tensor):
+        sink_matrix = sink_matrix.detach().cpu().numpy()
+    row_max = np.max(sim, axis=-1, keepdims=True)
+    valid_row_mask = ~np.isneginf(row_max)
+    # add sink rowmax
+    if sink_matrix is not None:
+        assert sink_matrix.shape == row_max.shape, \
+            f"sink_matrix 形状 {sink_matrix.shape} 与 row_max 形状 {row_max.shape} 不一致！"
+        # 更新含sink的rowmax
+        # row_max = np.maximum(row_max, sink_matrix)
+        row_max[valid_row_mask] = np.maximum(
+            row_max[valid_row_mask],
+            sink_matrix[valid_row_mask]
+        )
+
+    sim_sub = sim - row_max
+    sim_sub_high = sim.astype(np.float64) - row_max.astype(np.float64)
+
+    sim_sub = np.exp(sim_sub)
+    sim_sub_high = np.exp(sim_sub_high)
+    row_sum = np.sum(sim_sub, axis=-1, keepdims=True)
+    row_sum_high = np.sum(sim_sub_high, axis=-1, keepdims=True)
+
+    if sink_matrix is not None:
+        sink_exp = np.exp(sink_matrix - row_max)
+        sink_exp_high = np.exp(sink_matrix.astype(np.float64) - row_max.astype(np.float64))
+        row_sum = row_sum + sink_exp
+        row_sum_high = row_sum_high + sink_exp_high
+
+    soft_res = sim_sub / row_sum
+    lse = np.squeeze((np.log(row_sum_high) + row_max.astype(np.float64)), axis=-1)
+    # lse = np.squeeze((np.log(row_sum) + row_max), axis=-1)
+
+    return soft_res, lse, row_max
+
+def ref_masked_attention(
+            query,  # (q_seqlen, num_heads, head_size)
+            key,    # (k_seqlen, kv_heads, head_size)
+            value,
+            scale: float,
+            mask,    # (q_seqlen, k_seqlen)
+            sink_matrix,
+):
+    query = query.permute(1, 0, 2)
+    key = key.permute(1, 2, 0)
+    value = value.permute(1, 0, 2)
+    sim_high = group_matmul(query.shape[0], key.shape[0], query, key, 1)  # (head_num, q_seqlen, k_seqlen)
+    sim_high = sim_high * scale
+    if mask is not None:
+        sim_high = sim_high + (
+            mask[:sim_high.shape[-2], :sim_high.shape[-1]]
+            ).to(torch.float32) * (-1e4)
+    p_high, lse_high, gm = softmax_numpy(sim_high, sink_matrix)
+    lse_high = lse_high.astype(np.float64)
+    p = torch.from_numpy(p_high).to(query.dtype)
+    p_high = torch.from_numpy(p_high).to(torch.float32)
+
+    out_high = group_matmul(query.shape[0], key.shape[0], p_high, value, 1)
+    out_high = out_high.permute(1, 0, 2)
+    return out_high, lse_high
+
+"""
+小算子 FlashAttention 反向golden相关实现
+"""
 
 def broadcast_kv_single(num_heads, num_kv_heads, kv_tensor, dtype):
     factor = num_heads // num_kv_heads

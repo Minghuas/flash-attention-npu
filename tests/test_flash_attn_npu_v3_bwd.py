@@ -29,7 +29,7 @@ TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TESTS_DIR not in sys.path:
     sys.path.insert(0, TESTS_DIR)
 
-from fa_small_op_golden import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd
+from tests.common.attention_ref import golden_bsnd_bwd_from_fwd, golden_tnd_bwd_from_fwd
 
 RTOL_GOLDEN = 1e-2
 ATOL_GOLDEN = 1e-2
