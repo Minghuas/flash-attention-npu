@@ -7,6 +7,9 @@ import pytest
 import torch
 import torch_npu
 
+if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""):
+    pytest.skip("flash_attn_npu (v2) not supported on Ascend950", allow_module_level=True)
+
 from flash_attn_npu import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -233,7 +236,7 @@ def metadata_spy(monkeypatch):
 FLASH_ATTN_FUNC_CASES = [
     # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False),
-    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, True),
+    (torch.float16, 2, 4, 4, 1024, 1024, 128, True),
     (torch.float16, 7, 1, 1, 512, 512, 128, False),
 ]
 
@@ -278,6 +281,11 @@ KV_CACHE_BSND_CASES = [
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_FUNC_CASES,
+    ids=[
+        "bfloat16-1-1-1-1024-1024-128-False",
+        "float16-2-4-4-1024-1024-128-True",
+        "float16-7-1-1-512-512-128-False",
+    ],
 )
 def test_flash_attn_func_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
@@ -319,6 +327,11 @@ def test_flash_attn_func_metadata_bsnd(
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
     FLASH_ATTN_VARLEN_CASES,
+    ids=[
+        "bfloat16-1-1-1-512-1024-128-True",
+        "bfloat16-2-4-4-1024-1024-128-False",
+        "float16-7-5-1-512-512-128-True",
+    ],
 )
 def test_flash_attn_varlen_func_metadata_tnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
@@ -374,6 +387,12 @@ def test_flash_attn_varlen_func_metadata_tnd(
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size, softcap",
     FLASH_ATTN_FUNC_SWA_SOFTCAP_CASES,
+    ids=[
+        "bfloat16-2-4-4-1024-1024-128-False-(256,256)-0.0",
+        "bfloat16-2-4-2-1024-1024-128-True-(512,-1)-0.0",
+        "bfloat16-1-1-1-1024-1024-128-True-(512,256)-30.0",
+        "float16-2-2-2-512-512-128-False-(64,128)-30.0",
+    ],
 )
 def test_flash_attn_func_metadata_swa_softcap(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
@@ -418,6 +437,12 @@ def test_flash_attn_func_metadata_swa_softcap(
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size, softcap",
     FLASH_ATTN_VARLEN_SWA_SOFTCAP_CASES,
+    ids=[
+        "bfloat16-3-4-2-512-768-128-False-(200,200)-0.0",
+        "bfloat16-2-4-4-1024-1024-128-True-(511,-1)-0.0",
+        "bfloat16-1-1-1-512-1024-128-True-(512,0)-30.0",
+        "float16-1-2-2-512-512-128-False-(64,128)-30.0",
+    ],
 )
 def test_flash_attn_varlen_func_metadata_swa_softcap(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
@@ -476,6 +501,14 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_BSND_CASES,
+    ids=[
+        "bfloat16-1-1-1-1024-1024-128-128-False-(-1,-1)-0.0",
+        "bfloat16-5-4-4-1024-1024-128-128-True-(-1,-1)-0.0",
+        "bfloat16-2-4-4-512-1024-128-128-False-(256,256)-0.0",
+        "bfloat16-2-4-4-512-1024-128-128-True-(300,-1)-0.0",
+        "bfloat16-2-4-2-128-1024-128-128-True-(-1,-1)-30.0",
+        "float16-1-2-1-256-512-128-128-False-(128,128)-50.0",
+    ],
 )
 def test_flash_attn_kvcache_metadata_bsnd(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
