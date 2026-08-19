@@ -76,6 +76,7 @@ jobs:
       CI_TEST_WORKERS: ${{ github.event.inputs.workers }}
       CI_MODE: full
       CI_REF: ${{ github.event.inputs.ref }}
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
     steps:
       - name: Check arch match
         id: arch
@@ -97,6 +98,7 @@ jobs:
           git config --global --add safe.directory "$PWD"
           REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
           docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             --network host \
             -v "$PWD:/workspace" \
             -w /workspace \
@@ -145,14 +147,7 @@ jobs:
           path: /tmp/ci_test_logs/
           retention-days: 7
 
-      - name: Kill orphaned CI containers
+      - name: Clean up this job's CI containers
         if: always()
         run: |
-          echo "cleaning up orphaned containers from image: $CI_DOCKER_IMAGE"
-          orphans=$(docker ps -q --filter "ancestor=$CI_DOCKER_IMAGE")
-          if [ -n "$orphans" ]; then
-            echo "killing orphaned containers: $orphans"
-            docker kill $orphans 2>/dev/null || true
-          else
-            echo "no orphaned containers found"
-          fi
+          bash ci/cleanup_ci_containers.sh

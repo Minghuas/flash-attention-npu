@@ -16,6 +16,7 @@
 #   CI_DOCKER_PRIVILEGED     (默认 true)   是否带 --privileged
 #   CI_DOCKER_IMAGE          (默认 fa-npu-ci:910b-cann9.1-torch2.9)
 #   CI_SKIP_BUILD            (默认 false)  true=跳过阶段1 (已有 build/ 产物)
+#   CI_CONTAINER_SCOPE       当前 CI job 的唯一容器归属标识
 #   CI_NPU_WAIT_MAX_SEC      (默认 600)    所有卡忙时最长等待秒数
 #   CI_NPU_WAIT_INTERVAL_SEC (默认 30)     所有卡忙时重探间隔秒数
 #   ASCEND_RT_VISIBLE_DEVICES               手动指定宿主机物理卡时跳过自动选卡
@@ -31,6 +32,7 @@ CI_CONTAINER_DEVICE="${CI_CONTAINER_DEVICE:-0}"
 CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fa-npu-ci:910b-cann9.1-torch2.9}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
+CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
 # 宿主机日志目录: 挂载进容器, 容器内写的日志直接落到宿主机, 避免 --rm 删除容器后日志丢失。
 # 同时让 workflow 的 upload-artifact (path: /tmp/ci_test_logs) 能读到日志。
 CI_TEST_LOG_DIR_HOST="${CI_TEST_LOG_DIR_HOST:-/tmp/ci_test_logs}"
@@ -63,26 +65,27 @@ if [ "$CI_DOCKER_PRIVILEGED" = "true" ]; then
 fi
 
 # ---------- 取消信号处理 (self-hosted runner 兜底) ----------
-# GitHub 取消 workflow 时, self-hosted runner 只杀 runner 进程, 不会停 docker 容器,
-# 导致 NPU 被孤儿容器持续占用。用 trap 捕获 SIGTERM/SIGINT, kill 当前 docker client
-# (PID), docker client 向容器主进程转发 SIGTERM, 容器退出后 --rm 自动清理。
-# 配合 workflow 的 cleanup step (if: always()) 双重兜底。
+# GitHub 取消 workflow 时, self-hosted runner 可能只停止 runner 进程, 不会停止容器。
+# 按当前 job 的 scope 清理所有本 job 容器, 配合 workflow cleanup step 双重兜底。
 CURRENT_DOCKER_PID=""
 cleanup_on_signal() {
-  log "received cancel/terminate signal, killing docker container (pid=${CURRENT_DOCKER_PID:-<none>})..."
+  log "received cancel/terminate signal, cleaning containers for scope=$CI_CONTAINER_SCOPE..."
   if [ -n "$CURRENT_DOCKER_PID" ]; then
-    kill -TERM "$CURRENT_DOCKER_PID" 2>/dev/null || true
+    kill -KILL "$CURRENT_DOCKER_PID" 2>/dev/null || true
     wait "$CURRENT_DOCKER_PID" 2>/dev/null || true
     CURRENT_DOCKER_PID=""
   fi
+  CI_CONTAINER_SCOPE="$CI_CONTAINER_SCOPE" bash "$SCRIPT_DIR/cleanup_ci_containers.sh" || true
   exit 130
 }
 trap cleanup_on_signal SIGTERM SIGINT
 
 # ---------- 阶段1: 编译 (不加锁, 不绑卡) ----------
 run_build_phase() {
+  local rc
   log "=== Phase 1: build (no NPU lock) ==="
   docker run --rm \
+    --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
     --network host \
     --ipc host \
@@ -93,7 +96,13 @@ run_build_phase() {
     "$CI_DOCKER_IMAGE" \
     bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && bash ci/run_ci_build.sh' &
   CURRENT_DOCKER_PID=$!
-  wait "$CURRENT_DOCKER_PID"
+  if wait "$CURRENT_DOCKER_PID"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  CURRENT_DOCKER_PID=""
+  return "$rc"
 }
 
 # ---------- 阶段2: 测试 (加锁 + 绑卡) ----------
@@ -105,6 +114,7 @@ get_candidates() {
 
 run_docker_test() {
   local device_id="$1"
+  local rc
   local mount_args=()
   while IFS= read -r m; do
     [ -n "$m" ] && mount_args+=("$m")
@@ -115,6 +125,7 @@ run_docker_test() {
   mkdir -p "$CI_TEST_LOG_DIR_HOST"
   chmod 777 "$CI_TEST_LOG_DIR_HOST" 2>/dev/null || true
   docker run --rm \
+    --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
     "${privileged_args[@]}" \
     --network host \
     --ipc host \
@@ -137,7 +148,13 @@ run_docker_test() {
     "$CI_DOCKER_IMAGE" \
     bash -lc 'git config --global --add safe.directory /workspace/flash-attention-npu && bash ci/run_ci_test.sh' &
   CURRENT_DOCKER_PID=$!
-  wait "$CURRENT_DOCKER_PID"
+  if wait "$CURRENT_DOCKER_PID"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  CURRENT_DOCKER_PID=""
+  return "$rc"
 }
 
 acquire_lock_and_run_test() {

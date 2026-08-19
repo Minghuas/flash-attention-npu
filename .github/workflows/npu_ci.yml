@@ -240,6 +240,7 @@ jobs:
       CI_REQUIRE_HEALTHY_NPU: ${{ matrix.require_healthy }}
       CI_NPU_MAX_TASKS: ${{ matrix.max_tasks }}
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}
+      CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
     outputs:
       run_outcome: ${{ steps.run.outcome }}
     steps:
@@ -271,6 +272,7 @@ jobs:
           # clone 后: fetch base 分支最新, checkout base, merge PR head
           docker_ok=false
           if docker run --rm \
+            --label "com.flash-attention-npu.ci.scope=$CI_CONTAINER_SCOPE" \
             --network host \
             -v "$PWD:/workspace" \
             -w /workspace \
@@ -363,17 +365,10 @@ jobs:
           path: /tmp/ci_test_logs/
           retention-days: 7
 
-      - name: Kill orphaned CI containers
+      - name: Clean up this job's CI containers
         if: always()
         run: |
-          echo "cleaning up orphaned containers from image: $CI_DOCKER_IMAGE"
-          orphans=$(docker ps -q --filter "ancestor=$CI_DOCKER_IMAGE")
-          if [ -n "$orphans" ]; then
-            echo "killing orphaned containers: $orphans"
-            docker kill $orphans 2>/dev/null || true
-          else
-            echo "no orphaned containers found"
-          fi
+          bash ci/cleanup_ci_containers.sh
 
   finalize:
     name: 写最终状态
