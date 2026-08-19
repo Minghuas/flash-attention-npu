@@ -178,7 +178,7 @@ test_cases = [
     (torch.bfloat16, 2, 6, 2, 2, 1024, 128, 1, 128, True, -1, -1, 0.0),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0),  # Mistral-style causal SWA
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, True, 512, 256, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 0.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, 0, 128, True, -128, 864, 0.0),
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, 1, 128, False, 0, 256, 0.0),
     (torch.float16, 2, 2, 2, 512, 512, 128, 0, 128, False, 64, 128, 0.0),
     # SWA + large GQA decode: rowLoopNum>1 must not hang (EVENT_ID0 order in online_softmax)
@@ -428,7 +428,7 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         else:
             output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
         out = output.reshape(q_seqlen, num_heads, head_size)
-        if is_local_golden and atten_mask is not None:
+        if atten_mask is not None:
             # Soft mask (-1e4) still yields finite garbage on fully-masked rows;
             # NPU zeroes them / sets lse=inf. Infinite window (-1) must not go
             # through the numeric pre/nextTokensError heuristics.
@@ -703,3 +703,24 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     rtol = 1e-2
     atol = 1e-2
     torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("data_type", [torch.float16])
+@pytest.mark.parametrize("num_heads", [16])
+@pytest.mark.parametrize("kv_heads", [2])
+@pytest.mark.parametrize("head_size", [151,192,201,256])
+@pytest.mark.parametrize("block_size", [128])
+@pytest.mark.parametrize("window_size_left", [-1])
+@pytest.mark.parametrize("window_size_right", [-1])
+@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("batch_size", [4])
+@pytest.mark.parametrize("q_seqlen, kv_seqlen", [
+    (256, 129),
+    (136, 129),
+    (1024, 128),
+    (256, 192),
+])
+@pytest.mark.parametrize("cache_mode", [0, 1])
+@pytest.mark.parametrize("is_causal", [True, False])
+def test_fa_custom_ops_with_hd_le_256(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap):
+    test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap)
