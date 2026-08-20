@@ -253,10 +253,6 @@ def _flash_attn_backward(
     assert page_table is None, "flash_attn_npu_v4 bwd does not support page_table"
     assert gather_kv_indices is None, "flash_attn_npu_v4 bwd does not support gather_kv_indices"
     assert learnable_sink is None, "flash_attn_npu_v4 bwd does not support learnable_sink"
-    assert softcap is None or float(softcap) == 0.0, (
-        "flash_attn_npu_v4 bwd does not support softcap>0 "
-        "(FAI forward does not wire softcap yet)"
-    )
 
     if dq is None:
         dq = torch.empty_like(q)

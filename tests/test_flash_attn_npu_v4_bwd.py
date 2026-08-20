@@ -147,6 +147,15 @@ test_cases_varlen = [
     (torch.bfloat16, 3, 1, 1, 7777, 8192, 64, True, 0.0),
     (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, 0.0),
     (torch.bfloat16, 3, 16, 16, 562, 562, 96, False, 0.0),
+    (torch.bfloat16, 2, 4, 2, 128, 128, 64, True, 30.0),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 30.0),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, 30.0),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, 30.0),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, 30.0),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, 30.0),
+    (torch.bfloat16, 3, 1, 1, 7777, 8192, 64, True, 30.0),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, 30.0),
+    (torch.bfloat16, 3, 16, 16, 562, 562, 96, False, 30.0),
 ]
 
 
@@ -189,6 +198,12 @@ test_cases_varlen_swa = [
     (torch.float16, 3, 2, 2, 512, 512, 128, False, 64, 128, 0.0),
     (torch.bfloat16, 3, 4, 4, 1024, 1024, 128, True, -128, 864, 0.0),
     (torch.float16, 3, 12, 3, 1024, 1024, 64, False, -1, 1890, 0.0),
+    (torch.bfloat16, 3, 4, 4, 1024, 1024, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 30.0),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, False, 0, 256, 30.0),
+    (torch.float16, 3, 2, 2, 512, 512, 128, False, 64, 128, 30.0),
+    (torch.bfloat16, 3, 4, 4, 1024, 1024, 128, True, -128, 864, 30.0),
+    (torch.float16, 3, 12, 3, 1024, 1024, 64, False, -1, 1890, 30.0),
 ]
 
 

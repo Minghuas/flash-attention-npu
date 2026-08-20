@@ -22,15 +22,16 @@ template <
     class OutputType_,
     class InputType_,
     class MaskType_,
-    LseModeT LSE_MODE_>
+    LseModeT LSE_MODE_,
+    bool HAS_SOFTCAP_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -66,7 +67,7 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float rescaleThreshold_ = 4.0f)
+    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_, float rescaleThreshold_ = 4.0f)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -74,6 +75,7 @@ public:
         constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK_UB_PREMASK_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
 
@@ -86,6 +88,7 @@ public:
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
 
         scaleValue = scaleValue_;
+        softcapValue = softcapValue_;
         rescaleThreshold = rescaleThreshold_;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
@@ -101,6 +104,7 @@ public:
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
         tempMaskTensor = resource.ubBuf.template GetBufferByByte<half>(MASK_UB_PREMASK_TENSOR_OFFSET);
+        softcapUbTensor = resource.ubBuf.template GetBufferByByte<float>(SOFTCAP_UB_TENSOR_OFFSET);
     }
 
     template <typename T>
@@ -499,6 +503,38 @@ public:
             CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE),
             AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline
+    void ApplySoftcap(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
+    {
+        uint32_t repeatTimes = CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE);
+        AscendC::UnaryRepeatParams repeatParams(1, 1, 8, 8);
+
+        // Clip the input to avoid overflow
+        AscendC::Maxs<float, false>(
+            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], -8.8f, (uint64_t)0, repeatTimes, repeatParams);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // (2 * softcap) / (1 + exp(-2x)) - softcap
+        AscendC::Muls<float, false>(
+            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], -2.0f, (uint64_t)0, repeatTimes, repeatParams);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Exp<float, false>(
+            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], (uint64_t)0, repeatTimes, repeatParams);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds<float, false>(
+            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], 1.0f, (uint64_t)0, repeatTimes, repeatParams);
+
+        AscendC::Duplicate<float, false>(softcapUbTensor, 2 * softcapValue, (uint64_t)0, repeatTimes, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Div<float, false>(
+            lsUbTensor[sUbOffset], softcapUbTensor, lsUbTensor[sUbOffset], (uint64_t)0, repeatTimes,
+            AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Adds<float, false>(
+            lsUbTensor[sUbOffset], lsUbTensor[sUbOffset], -softcapValue, (uint64_t)0, repeatTimes, repeatParams);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -949,6 +985,9 @@ public:
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                if constexpr (HAS_SOFTCAP_) {
+                    ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                 SubCoreCompute<false>(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
@@ -1078,6 +1117,9 @@ public:
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                if constexpr (HAS_SOFTCAP_) {
+                    ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                 ApplyMask(
                     (pingpongFlag * MAX_UB_S_ELEM_NUM),
                     rowNumCurLoop, columnNumRound,
@@ -1255,6 +1297,9 @@ public:
                     OperatePreMaskUb(rowNumCurLoop, columnNumRound);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                    if constexpr (HAS_SOFTCAP_) {
+                    ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
                               addMaskUbOffset);
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
@@ -1282,12 +1327,18 @@ public:
                     OperatePreMaskUb(rowNumCurLoop, columnNumRound);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                    if constexpr (HAS_SOFTCAP_) {
+                    ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
                               addMaskUbOffset);
                 } else if (doTriUNextMask) {
                     OperateNextMaskUb(rowNumCurLoop, columnNumRound);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                     ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                    if constexpr (HAS_SOFTCAP_) {
+                    ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
+                }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundNext,
                               addMaskUbOffset);
                 }
@@ -1343,6 +1394,7 @@ public:
 
 private:
     float scaleValue;
+    float softcapValue;
     // FA4 阈值跳过:当某行新旧 rowmax 的增量(自然对数域,已含 scale)不超过该阈值时,
     // 保持旧 rowmax 作为平移基准,从而令 correction dm=exp(0)=1,跳过对 gl/O 的 rescale。
     // <=0 表示关闭该优化,退回逐块更新的原始行为。阈值语义见 op-notes/FAV4.md。
@@ -1361,6 +1413,7 @@ private:
     AscendC::LocalTensor<float> tvUbTensor;
     AscendC::LocalTensor<half> tempMaskTensor;
     AscendC::LocalTensor<float> glUbTensor;
+    AscendC::LocalTensor<float> softcapUbTensor;
 };
 
 }

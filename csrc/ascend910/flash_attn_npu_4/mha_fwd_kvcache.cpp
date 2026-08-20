@@ -9,7 +9,6 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/catlass.hpp"
 #include "catlass/epilogue/block/block_epilogue.hpp"
-#include "online_softmax_low_prec.hpp"
 #include "online_softmax.hpp"
 #include "rescale_o_low_prec.hpp"
 #include "rescale_o.hpp"
@@ -121,6 +120,7 @@ namespace SplitFuse {
             windowSizeLeft = fATilingData->windowSizeLeft;
             windowSizeRight = fATilingData->windowSizeRight;
             scaleValue = fATilingData->scaleValue;
+            softcapValue = fATilingData->softcapValue;
             maxQSeqlen = fATilingData->maxQSeqlen;
             flashDecodeFlag = fATilingData->flashDecodeFlag;
 
@@ -232,7 +232,7 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-            epilogueOnlineSoftmax.init(resource, scaleValue);
+            epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
             epilogueRescaleO.init(resource);
 
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
@@ -998,6 +998,7 @@ namespace SplitFuse {
         int64_t  windowSizeLeft;
         int64_t  windowSizeRight;
         float    scaleValue;
+        float    softcapValue;
         uint32_t totalQTokens;
         uint32_t maxQSeqlen;
         uint32_t flashDecodeFlag;
@@ -1030,7 +1031,7 @@ namespace SplitFuse {
         bool PagedCacheFlag = false,
         FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
-        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE>
+        Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE, bool HAS_SOFTCAP = false>
     __global__ __aicore__ void FAInfer(
         uint64_t fftsAddr,
         GM_ADDR q,
@@ -1078,7 +1079,7 @@ namespace SplitFuse {
         using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
                                                    QType, KType, SType>;
 
-        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec>;
+        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
