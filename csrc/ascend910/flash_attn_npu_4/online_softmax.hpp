@@ -970,7 +970,7 @@ public:
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, uint32_t triUp, uint32_t triDown,
+        uint32_t qNBlockSize, uint32_t curStackTileMod, Arch::CrossCoreFlag qkReady, int64_t triUp, uint32_t triDown,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool isSplitKV = false)
     {
         uint32_t rowNum = actualBlockShape.m();
@@ -999,15 +999,17 @@ public:
         uint32_t gmOffsetMaskColumn;
         uint32_t maskColumn;
         uint32_t addMaskUbOffset;
-        if (triUp >= kvSStartIdx) {
-            uint32_t triUpRoundDown = RoundDown(triUp, BLOCK_SIZE_IN_BYTE);
-            gmOffsetMaskRow = triUp - triUpRoundDown;
+        if (triUp >= static_cast<int64_t>(kvSStartIdx)) {
+            uint32_t triUpRoundDown = RoundDown(
+                static_cast<uint32_t>(triUp), BLOCK_SIZE_IN_BYTE);
+            gmOffsetMaskRow = static_cast<uint32_t>(triUp) - triUpRoundDown;
             gmOffsetMaskColumn = 0;
             maskColumn = kvSEndIdx - triUpRoundDown;
             addMaskUbOffset = triUpRoundDown - kvSStartIdx;
         } else {
             gmOffsetMaskRow = 0;
-            gmOffsetMaskColumn = kvSStartIdx - triUp;
+            gmOffsetMaskColumn = static_cast<uint32_t>(
+                static_cast<int64_t>(kvSStartIdx) - triUp);
             maskColumn = columnNum;
             addMaskUbOffset = 0;
         }
