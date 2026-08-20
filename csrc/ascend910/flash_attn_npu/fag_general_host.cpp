@@ -55,14 +55,41 @@ std::vector<at::Tensor> launch_fag_general(
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
     auto vsizes = v.sizes();
+    auto dout_sizes = dout.sizes();
+    auto out_sizes = out.sizes();
+    const int64_t expected_dim = is_varlen_q ? 3 : 4;
+    TORCH_CHECK(q.dim() == expected_dim && k.dim() == expected_dim && v.dim() == expected_dim &&
+                    dout.dim() == expected_dim && out.dim() == expected_dim,
+                "launch_fag_general: q/k/v/dout/out must be ", expected_dim, "-D (",
+                (is_varlen_q ? "TND" : "BSND"), ")");
+    TORCH_CHECK(dout_sizes == out_sizes, "launch_fag_general: out and dout must have the same shape");
+    TORCH_CHECK(dq.sizes() == qsizes && dk.sizes() == ksizes && dv.sizes() == vsizes,
+                "launch_fag_general: dq/dk/dv must match q/k/v shapes");
+
     uint32_t nheads = is_varlen_q ? qsizes[1] : qsizes[2];
     uint32_t nheads_k = is_varlen_q ? ksizes[1] : ksizes[2];
-    uint32_t qk_headdim = is_varlen_q ? qsizes[2] : qsizes[3];
+    uint32_t q_headdim = is_varlen_q ? qsizes[2] : qsizes[3];
     uint32_t v_headdim = is_varlen_q ? vsizes[2] : vsizes[3];
     uint32_t k_headdim = is_varlen_q ? ksizes[2] : ksizes[3];
-    TORCH_CHECK(qk_headdim == k_headdim, "launch_fag_general: q and k must share the same head dimension.");
-    TORCH_CHECK(qk_headdim > 0 && qk_headdim <= 256, "launch_fag_general: q/k head dimension must be in (0, 256].");
-    uint32_t qk_headdim_kernel = qk_headdim <= 64 ? 64 : (qk_headdim <= 128 ? 128 : (qk_headdim <= 192 ? 192 : 256));
+    uint32_t dout_headdim = static_cast<uint32_t>(dout_sizes[expected_dim - 1]);
+    TORCH_CHECK(nheads > 0 && nheads_k > 0, "launch_fag_general: number of Q/KV heads must be positive");
+    TORCH_CHECK(nheads % nheads_k == 0,
+                "launch_fag_general: number of heads in key/value must divide number of heads in query");
+    // NPU FAG bwd currently requires q/k/v/dout headdim to be equal.
+    TORCH_CHECK(q_headdim == k_headdim && q_headdim == v_headdim && q_headdim == dout_headdim,
+                "launch_fag_general: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
+    TORCH_CHECK(q_headdim > 0 && q_headdim <= 256, "launch_fag_general: headdim must be in (0, 256].");
+    TORCH_CHECK(qsizes == dout_sizes, "launch_fag_general: q and dout must have the same shape");
+    TORCH_CHECK(ksizes == vsizes, "launch_fag_general: k and v must have the same shape");
+    if (is_varlen_q) {
+        TORCH_CHECK(static_cast<uint32_t>(vsizes[1]) == nheads_k,
+                    "launch_fag_general: v nheads_k must match k");
+    } else {
+        TORCH_CHECK(qsizes[0] == ksizes[0], "launch_fag_general: q and k must share the same batch size");
+        TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k,
+                    "launch_fag_general: v nheads_k must match k");
+    }
+    uint32_t qk_headdim_kernel = q_headdim <= 64 ? 64 : (q_headdim <= 128 ? 128 : (q_headdim <= 192 ? 192 : 256));
     int64_t batch_size = is_varlen_q ? (cu_seqlens_q_tensor.size(0) - 1) : qsizes[0];
 
     uint32_t tilingSize = sizeof(FAGTilingData);
@@ -106,7 +133,7 @@ std::vector<at::Tensor> launch_fag_general(
     fagInfo.batch = batch_size;
     fagInfo.qSeqlen = max_seqlen_q;
     fagInfo.qHeadNum = nheads;
-    fagInfo.qkHeadDim = qk_headdim;
+    fagInfo.qkHeadDim = q_headdim;
     fagInfo.kvSeqlen = max_seqlen_k;
     fagInfo.kvHeadNum = nheads_k;
     fagInfo.vHeadDim = v_headdim;

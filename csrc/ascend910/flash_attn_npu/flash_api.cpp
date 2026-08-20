@@ -1078,9 +1078,31 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     // parse shape args
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
+    auto vsizes = v.sizes();
+    auto dout_sizes = dout.sizes();
+    auto out_sizes = out.sizes();
+    TORCH_CHECK(q.dim() == 3 && k.dim() == 3 && v.dim() == 3 && dout.dim() == 3 && out.dim() == 3,
+                "mha_varlen_bwd: q/k/v/dout/out must be 3-D (TND)");
+    TORCH_CHECK(dout_sizes == out_sizes, "mha_varlen_bwd: out and dout must have the same shape");
+    TORCH_CHECK(dq.sizes() == qsizes && dk.sizes() == ksizes && dv.sizes() == vsizes,
+                "mha_varlen_bwd: dq/dk/dv must match q/k/v shapes");
+
     uint32_t nheads = qsizes[1];
     uint32_t nheads_k = ksizes[1];
     uint32_t headdim = qsizes[2];
+    uint32_t v_headdim = vsizes[2];
+    uint32_t dout_headdim = static_cast<uint32_t>(dout_sizes[2]);
+    // FAG kernel specializations top out at Aligned256.
+    TORCH_CHECK(nheads > 0 && nheads_k > 0, "mha_varlen_bwd: number of Q/KV heads must be positive");
+    TORCH_CHECK(nheads % nheads_k == 0,
+                "mha_varlen_bwd: number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(headdim == static_cast<uint32_t>(ksizes[2]) && headdim == v_headdim && headdim == dout_headdim,
+                "mha_varlen_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
+    TORCH_CHECK(headdim > 0 && headdim <= 256, "mha_varlen_bwd: headdim must be in (0, 256].");
+    TORCH_CHECK(qsizes == dout_sizes, "mha_varlen_bwd: q and dout must have the same shape");
+    TORCH_CHECK(ksizes == vsizes, "mha_varlen_bwd: k and v must have the same shape");
+    TORCH_CHECK(static_cast<uint32_t>(vsizes[1]) == nheads_k,
+                "mha_varlen_bwd: v nheads_k must match k");
 
     int local_window_size_left = window_size_left;
     int local_window_size_right = window_size_right;
@@ -1248,8 +1270,32 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
 
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
+    auto vsizes = v.sizes();
+    auto dout_sizes = dout.sizes();
+    auto out_sizes = out.sizes();
+    TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && dout.dim() == 4 && out.dim() == 4,
+                "mha_bwd: q/k/v/dout/out must be 4-D (BSND)");
+    TORCH_CHECK(dout_sizes == out_sizes, "mha_bwd: out and dout must have the same shape");
+    TORCH_CHECK(dq.sizes() == qsizes && dk.sizes() == ksizes && dv.sizes() == vsizes,
+                "mha_bwd: dq/dk/dv must match q/k/v shapes");
+
+    const uint32_t nheads = qsizes[2];
+    const uint32_t nheads_k = ksizes[2];
+    const uint32_t headdim = qsizes[3];
+    const uint32_t v_headdim = vsizes[3];
+    const uint32_t dout_headdim = static_cast<uint32_t>(dout_sizes[3]);
+    TORCH_CHECK(nheads > 0 && nheads_k > 0, "mha_bwd: number of Q/KV heads must be positive");
+    TORCH_CHECK(nheads % nheads_k == 0,
+                "mha_bwd: number of heads in key/value must divide number of heads in query");
+    TORCH_CHECK(headdim == static_cast<uint32_t>(ksizes[3]) && headdim == v_headdim && headdim == dout_headdim,
+                "mha_bwd: q/k/v/dout must share the same headdim (unequal headdim is not supported)");
+    TORCH_CHECK(headdim > 0 && headdim <= 256, "mha_bwd: headdim must be in (0, 256].");
+    TORCH_CHECK(qsizes == dout_sizes, "mha_bwd: q and dout must have the same shape");
+    TORCH_CHECK(ksizes == vsizes, "mha_bwd: k and v must have the same shape");
+    TORCH_CHECK(qsizes[0] == ksizes[0], "mha_bwd: q and k must share the same batch size");
+    TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "mha_bwd: v nheads_k must match k");
     float scale = softmax_scale > 0.f ? softmax_scale
-                                      : (1.0f / sqrt(static_cast<float>(qsizes[3])));
+                                      : (1.0f / sqrt(static_cast<float>(headdim)));
     return launch_fag_general(
         dout, q, k, v, out, softmax_lse, dq, dk, dv,
         std::nullopt, std::nullopt,

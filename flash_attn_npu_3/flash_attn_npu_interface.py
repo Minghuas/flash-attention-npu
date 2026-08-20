@@ -43,15 +43,27 @@ def round_multiple(x, m):
 _HEADDIM_BWD_ALIGN = 64
 
 
-def _pad_bwd_headdim(dout, q, k, v, out):
+def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     """
     Pad headdim to a multiple of 64 for the bwd kernel.
     """
-    head_size_og = dout.size(-1)
-    target = round_multiple(
-        max(t.size(-1) for t in (dout, q, k, v, out)),
-        _HEADDIM_BWD_ALIGN,
-    )
+    if dout.size(-1) != head_size_og:
+        raise ValueError(
+            f"dout headdim ({dout.size(-1)}) must equal original q/k/v "
+            f"headdim ({head_size_og})"
+        )
+    qkv_out_headdims = [t.size(-1) for t in (q, k, v, out)]
+    if len(set(qkv_out_headdims)) != 1:
+        raise ValueError(
+            f"q/k/v/out must share the same headdim, got {qkv_out_headdims} "
+            "(unequal headdim is not supported)"
+        )
+    ctx_headdim = qkv_out_headdims[0]
+    if ctx_headdim <= 0 or ctx_headdim > 256:
+        raise ValueError(
+            f"headdim must be in (0, 256], got {ctx_headdim} "
+        )
+    target = round_multiple(ctx_headdim, _HEADDIM_BWD_ALIGN)
 
     def _pad(t):
         cur = t.size(-1)
@@ -424,6 +436,7 @@ def setup_context(ctx, inputs, output):
     q, k, v = inputs[:3]
     out, softmax_lse, _, _ = output
     ctx.save_for_backward(q, k, v, out, softmax_lse)
+    ctx.head_size_og = q.size(-1)
     ctx.softmax_scale = inputs[-11]
     ctx.causal = inputs[-10]
     ctx.window_size = [inputs[-9], inputs[-8]]
@@ -434,7 +447,9 @@ def setup_context(ctx, inputs, output):
 
 def _backward(ctx, dout, *grads):
     q, k, v, out, softmax_lse = ctx.saved_tensors
-    dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out)
+    dout, q, k, v, out, head_size_og = _pad_bwd_headdim(
+        dout, q, k, v, out, ctx.head_size_og
+    )
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     _flash_attn_backward(
         dout,
@@ -521,13 +536,16 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.ndim = qkv.dim()
         ctx.sm_margin = sm_margin
+        ctx.head_size_og = q.size(-1)
         return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out)
+        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         if ctx.ndim == 5:
             qkv_shape = q.shape[:-2] + (3, *q.shape[-2:])
             dqkv = torch.empty(qkv_shape, dtype=q.dtype, device=q.device)
@@ -639,13 +657,16 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
+        ctx.head_size_og = q.size(-1)
         return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out)
+        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout,
@@ -766,13 +787,16 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.sm_margin = sm_margin
+        ctx.head_size_og = q.size(-1)
         return (out, softmax_lse) if return_softmax else out
 
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert ctx.attention_chunk == 0, "FA3 backward does not support attention_chunk"
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out)
+        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
             dout,

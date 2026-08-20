@@ -175,6 +175,17 @@ def flash_attn_with_kvcache(
             将 (-alibi_slope * |i + seqlen_k - seqlen_q - j|) 的偏置加到
             query i 和 key j 的注意力分数上。
 
+    约束：
+        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 不支持 alibi_slopes / rotary_cos / rotary_sin。
+        - cache_seqlens / block_table 若传入须为 int32。
+        - 不支持反向传播。
+
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
     """
@@ -235,6 +246,17 @@ def flash_attn_func(
             前向传播始终是确定性的。
         return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试，
             返回的概率不保证正确（缩放可能不正确）。
+
+    约束：
+        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - dropout_p == 0（不支持 dropout）。
+        - 不支持 alibi_slopes。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同。
 
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
@@ -309,6 +331,18 @@ def flash_attn_varlen_func(
             前向传播始终是确定性的。
         return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
         block_table [可选]: 分页 KV 缓存的块表。
+
+    约束：
+        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - dropout_p == 0（不支持 dropout）。
+        - 不支持 alibi_slopes。
+        - cu_seqlens_q / cu_seqlens_k / block_table 若传入须为 int32。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同。
 
     返回：
         out: (total_q, nheads, headdim)。
@@ -404,6 +438,17 @@ def flash_attn_with_kvcache(
         sm_margin: int。SM 边际，用于调优。
         return_softmax_lse: bool。是否返回注意力分数的 logsumexp。
 
+    约束：
+        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 不支持 alibi_slopes / rotary / FP8 descales / attention_chunk / pack_gqa。
+        - cache_seqlens / page_table / cu_seqlens_* 若传入须为 int32。
+        - 不支持反向传播。
+
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
         softmax_lse [可选]: (batch_size, nheads, seqlen)。QK^T * scaling 的每行 logsumexp。
@@ -470,6 +515,16 @@ def flash_attn_func(
         deterministic: bool。是否使用反向传播的确定性实现。
         sm_margin: int。SM 边际，用于调优。
         return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+
+    约束：
+        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 不支持 alibi_slopes / FP8 descales / attention_chunk / pack_gqa。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
 
     返回：
         out: (batch_size, seqlen, nheads, headdim)。
@@ -538,6 +593,17 @@ def flash_attn_varlen_func(
         deterministic: bool。是否使用反向传播的确定性实现。
         sm_margin: int。SM 边际，用于调优。
         return_attn_probs: bool。是否返回注意力概率。此选项仅用于测试。
+
+    约束：
+        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 不支持 alibi_slopes / FP8 descales / attention_chunk / pack_gqa。
+        - cu_seqlens_q / cu_seqlens_k 若传入须为 int32。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
 
     返回：
         out: (total_q, nheads, headdim)。
@@ -621,6 +687,18 @@ def flash_attn_varlen_func(
         aux_tensors [可选]: 用于 score_mod 的辅助 tensor。（NPU 暂不支持）
         aux_scalars [可选]: 用于 score_mod/mask_mod 的辅助标量。（NPU 暂不支持）
         return_lse: bool。是否返回 attention scores 的 logsumexp。
+
+    约束：
+        - headdim <= 256（Ascend 950：1 <= headdim <= 256）。
+        - nheads % nheads_k == 0。
+        - dtype 仅支持 float16 / bfloat16；Q、K、V 的 dtype 必须一致。
+        - Q、K、V 的最后一维必须连续（stride(-1) == 1）。
+        - batch_size > 0。
+        - softcap >= 0（0.0 表示关闭；Ascend 950 不支持 softcap）。
+        - 不支持 pack_gqa / learnable_sink / score_mod / mask_mod / min_seqlen_k / gather_kv_indices。
+        - cu_seqlens_* / seqused_* / page_table 若传入须为 int32。
+        - 反向：headdim 须在 (0, 256]；Q 与 K 的 headdim 须相同；反向暂不支持 seqused_*。
+
     返回：
         out: (total_q, nheads, headdim_v) 或稠密 (batch_size, seqlen, nheads, headdim_v)。
         softmax_lse [可选，return_lse=True 时]: 变长为 (nheads, total_q)；稠密为 (batch_size, nheads, seqlen)。

@@ -178,6 +178,17 @@ def flash_attn_with_kvcache(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
             Add bias to the attention scores of query i and key j of (-alibi_slope * |i + seqlen_k - seqlen_q - j|).
 
+    Constraints:
+        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - alibi_slopes / rotary_cos / rotary_sin not supported.
+        - cache_seqlens / block_table must be int32 when provided.
+        - No backward pass.
+
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
     """
@@ -240,6 +251,17 @@ def flash_attn_func(
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for
             testing only. The returned probabilities are not guaranteed to be correct
             (they might not have the right scaling).
+
+    Constraints:
+        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - dropout_p == 0 (not supported).
+        - alibi_slopes not supported.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim.
 
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
@@ -316,6 +338,18 @@ def flash_attn_varlen_func(
             which is slightly slower and uses more memory. The forward pass is always deterministic.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
         block_table [optional]: Block table for paged KV cache.
+
+    Constraints:
+        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - dropout_p == 0 (not supported).
+        - alibi_slopes not supported.
+        - cu_seqlens_q / cu_seqlens_k / block_table must be int32 when provided.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim.
 
     Returns:
         out: (total_q, nheads, headdim).
@@ -412,6 +446,17 @@ def flash_attn_with_kvcache(
         sm_margin: int. SM margin for tuning.
         return_softmax_lse: bool. Whether to return logsumexp of attention scores.
 
+    Constraints:
+        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - alibi_slopes / rotary / FP8 descales / attention_chunk / pack_gqa not supported.
+        - cache_seqlens / page_table / cu_seqlens_* must be int32 when provided.
+        - No backward pass.
+
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional]: (batch_size, nheads, seqlen). The logsumexp of each row of QK^T * scaling.
@@ -481,6 +526,16 @@ def flash_attn_func(
         sm_margin: int. SM margin for tuning.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
 
+    Constraints:
+        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - alibi_slopes / FP8 descales / attention_chunk / pack_gqa not supported.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
+
     Returns:
         out: (batch_size, seqlen, nheads, headdim).
         softmax_lse [optional, if return_attn_probs=True]: (batch_size, nheads, seqlen).
@@ -549,6 +604,17 @@ def flash_attn_varlen_func(
         deterministic: bool. Whether to use the deterministic implementation of the backward pass.
         sm_margin: int. SM margin for tuning.
         return_attn_probs: bool. Whether to return the attention probabilities. This option is for testing only.
+
+    Constraints:
+        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - alibi_slopes / FP8 descales / attention_chunk / pack_gqa not supported.
+        - cu_seqlens_q / cu_seqlens_k must be int32 when provided.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
 
     Returns:
         out: (total_q, nheads, headdim).
@@ -661,6 +727,17 @@ def flash_attn_varlen_func(
         aux_tensors: Optional list of tensors. Auxiliary tensors for score_mod. (Not supported on NPU)
         aux_scalars: Optional tuple. Auxiliary scalars for score_mod/mask_mod. (Not supported on NPU)
         return_lse: bool. Whether to return the logsumexp of the attention scores.
+
+    Constraints:
+        - headdim <= 256 (Ascend 950: 1 <= headdim <= 256).
+        - nheads % nheads_k == 0.
+        - dtype: float16 / bfloat16 only; Q, K, V must share the same dtype.
+        - Q, K, V must have contiguous last dimension (stride(-1) == 1).
+        - batch_size > 0.
+        - softcap >= 0 (0.0 disables; not supported on Ascend 950).
+        - pack_gqa / learnable_sink / score_mod / mask_mod / min_seqlen_k / gather_kv_indices not supported.
+        - cu_seqlens_* / seqused_* / page_table must be int32 when provided.
+        - Backward: headdim in (0, 256]; Q and K must share the same headdim; seqused_* not supported in bwd.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim_v) or (total_q, nheads, headdim_v) if varlen.
