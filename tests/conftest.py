@@ -72,10 +72,9 @@ def _seed_per_case(request):
 
     Default: stable distinct seed per case = crc32(pytest node id), so a failure
     can be reproduced by re-running that exact case. Set env CI_TORCH_SEED to
-    override with one global seed for ALL fwd cases (e.g. CI_TORCH_SEED=0 gives
-    torch.manual_seed(0) everywhere). bwd cases set their own CASE_SEED=42 in a
-    later autouse fixture, so they are unaffected. Rand calls passing an
-    explicit ``generator=`` use that generator and are unaffected.
+    override with one global seed for all cases (e.g. CI_TORCH_SEED=0 gives
+    torch.manual_seed(0) everywhere). Rand calls passing an explicit
+    ``generator=`` use that generator and are unaffected.
     """
     import torch
     import zlib

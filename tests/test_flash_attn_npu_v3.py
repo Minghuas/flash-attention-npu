@@ -4,6 +4,14 @@ import torch
 import torch_npu
 import pytest
 from tests.common.attention_ref import ref_flash_attention
+from tests.common.test_utils import (
+    gather_paged_kv,
+    make_block_table,
+    make_cu_seqlens,
+    make_golden_attention_mask,
+    make_local_attention_mask,
+    make_varlen_seqlens,
+)
 if "Ascend950" in torch_npu.npu.get_device_name():
     from flash_attn_npu_3 import flash_attn_with_kvcache
 else:
@@ -219,17 +227,11 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         query = (q_min_range + (q_max_range - q_min_range) * torch.rand(t_q_sum, num_heads, head_size, generator=gen)).to(data_type).npu()
     key_cache = None
     value_cache = None
-    block_tables = []
+    block_tables = None
     if cache_mode == 1:
         key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size, generator=gen)).to(data_type).npu()
         value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(num_blocks, block_size, kv_heads, head_size, generator=gen)).to(data_type).npu()
-        for i in range(batch_size):
-            block_table = [
-                max_num_blocks_per_seq * i + j
-                for j in range(max_num_blocks_per_seq)
-            ]
-            block_tables.append(block_table)
-        block_tables = torch.tensor(block_tables, dtype=torch.int32).npu()
+        block_tables = make_block_table(batch_size, kv_seqlen, block_size).npu()
     else:
         if layout == "BSND":
             key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size, generator=gen)).to(data_type).npu()
@@ -319,18 +321,6 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         return_softmax_lse=True
     )
 
-    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
-        preToken = kvSeqlen - qSeqlen - preToken
-        nextToken = kvSeqlen - qSeqlen + nextToken
-        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
-        for i in range(qSeqlen):
-            for j in range(kvSeqlen):
-                is_below_pretoken_line = (-i + j) < preToken
-                is_above_nexttoken_line = (-i + j) > nextToken
-                if is_below_pretoken_line or is_above_nexttoken_line:
-                    matrix[i][j] = 1
-        return torch.tensor(matrix, dtype=torch.bool)
-
     golden_out = None
     golden_out = None
     if layout == "BSND":
@@ -339,6 +329,10 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     else:
         golden_out = torch.empty((t_q_sum, num_heads, head_size), dtype=data_type)
         golden_lseL = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
+    query_cpu = query.detach().cpu()
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    block_tables_cpu = block_tables.cpu() if cache_mode == 1 else None
     for i in range(batch_size):
         q_seqlen_per_batch = q_sequences[i]
         kv_seqlen_per_batch = kv_sequences[i]
@@ -352,51 +346,38 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
                 diagonal=(kv_seqlen_per_batch - q_seqlen_per_batch + 1),
             ).bool()
         elif is_local_golden:
-            atten_mask = create_binary_matrix(q_seqlen_per_batch, kv_seqlen_per_batch, window_size_left_golden, window_size_right_golden)
+            atten_mask = make_local_attention_mask(
+                q_seqlen_per_batch,
+                kv_seqlen_per_batch,
+                window_size_left_golden,
+                window_size_right_golden,
+            )
         if layout == "BSND":
-            query_cpu_per_batch = query.detach().cpu()[i]
+            query_cpu_per_batch = query_cpu[i]
             if cache_mode == 1:
-                keys = []
-                values = []
-                block_table = block_tables.cpu()[i]
-                key_cache_cpu = key_cache.detach().cpu()
-                value_cache_cpu = value_cache.detach().cpu()
-                for j in range(kv_seqlen_per_batch):
-                    block_number = int(block_table[j // block_size])
-                    block_offset = j % block_size
-                    k = key_cache_cpu[block_number, block_offset, :, :]
-                    k = k.reshape(kv_heads, head_size)
-                    keys.append(k)
-                    v = value_cache_cpu[block_number, block_offset, :, :]
-                    v = v.reshape(kv_heads, head_size)
-                    values.append(v)
-                key_cache_per_batch = torch.stack(keys, dim=0)
-                value_cache_per_batch = torch.stack(values, dim=0)
+                key_cache_per_batch, value_cache_per_batch = gather_paged_kv(
+                    key_cache_cpu,
+                    value_cache_cpu,
+                    block_tables_cpu[i],
+                    kv_seqlen_per_batch,
+                    block_size,
+                )
             else:
-                key_cache_per_batch = key_cache.detach().cpu()[i]
-                value_cache_per_batch = value_cache.detach().cpu()[i]
+                key_cache_per_batch = key_cache_cpu[i]
+                value_cache_per_batch = value_cache_cpu[i]
         else:
-            query_cpu_per_batch = query.detach().cpu()[new_q_seqlen_list_cpu[i] : new_q_seqlen_list_cpu[i + 1]]
+            query_cpu_per_batch = query_cpu[new_q_seqlen_list_cpu[i] : new_q_seqlen_list_cpu[i + 1]]
             if cache_mode == 0:
-                key_cache_per_batch = key_cache.detach().cpu()[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
-                value_cache_per_batch = value_cache.detach().cpu()[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
+                key_cache_per_batch = key_cache_cpu[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
+                value_cache_per_batch = value_cache_cpu[new_kv_seqlen_list_cpu[i] : new_kv_seqlen_list_cpu[i + 1]]
             else:
-                keys = []
-                values = []
-                block_table = block_tables.cpu()[i]
-                key_cache_cpu = key_cache.detach().cpu()
-                value_cache_cpu = value_cache.detach().cpu()
-                for j in range(kv_seqlen_per_batch):
-                    block_number = int(block_table[j // block_size])
-                    block_offset = j % block_size
-                    k = key_cache_cpu[block_number, block_offset, :, :]
-                    k = k.reshape(kv_heads, head_size)
-                    keys.append(k)
-                    v = value_cache_cpu[block_number, block_offset, :, :]
-                    v = v.reshape(kv_heads, head_size)
-                    values.append(v)
-                key_cache_per_batch = torch.stack(keys, dim=0)
-                value_cache_per_batch = torch.stack(values, dim=0)
+                key_cache_per_batch, value_cache_per_batch = gather_paged_kv(
+                    key_cache_cpu,
+                    value_cache_cpu,
+                    block_tables_cpu[i],
+                    kv_seqlen_per_batch,
+                    block_size,
+                )
         if atten_mask is not None:
             output, golden_lse = ref_flash_attention(query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
         else:
@@ -425,46 +406,70 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     if "Ascend910" in name:
         torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
 
-test_cases = [
-    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap)
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
-    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, 0.0),
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
-    (torch.float16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
-    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 0.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, True, False, 0.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 0.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 0.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 0.0),
-    # Softcap
-    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
-    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, 30.0),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, 30.0),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, 30.0),
-    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, 30.0),
+func_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap)
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 0.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, -1, -1, 0.0),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, False, False, -1, -1, 0.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, False, True, -1, -1, 0.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, -1, -1, 0.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 0.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, True, False, -1, -1, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, -1, -1, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, -1, -1, 0.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, -1, -1, 0.0),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, True, False, -1, -1, 0.0),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 30.0),
+    (torch.float16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 30.0),
+    (torch.float16, 7, 1, 1, 512, 512, 128, False, False, -1, -1, 30.0),
+    (torch.float16, 4, 2, 1, 513, 513, 128, False, False, -1, -1, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, False, False, -1, -1, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, False, True, -1, -1, 30.0),
+    (torch.bfloat16, 7, 1, 1, 512, 512, 128, False, False, -1, -1, 30.0),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, True, False, -1, -1, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 256, 0.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -128, 864, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 0, 256, 0.0),
+    (torch.float16, 2, 2, 2, 512, 512, 128, True, False, 64, 128, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, True, 512, 0, 0.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, True, -1, -1, 0.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, True, 256, 0, 0.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 0, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 256, 30.0),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -128, 864, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, 0, 256, 30.0),
+    (torch.float16, 2, 2, 2, 512, 512, 128, True, False, 64, 128, 30.0),
+    (torch.bfloat16, 1, 1, 1, 1, 1024, 128, True, True, 512, 0, 30.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, True, -1, -1, 30.0),
+    (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, True, 256, 0, 30.0),
 ]
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap", test_cases)
-def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, softcap):
+
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap", func_cases)
+def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if "Ascend910" not in name:
         pytest.skip("flash_attn_func only support Ascend910")
-    q_min_range = -5.0
-    q_max_range = 5.0
-    kv_min_range = -5.0
-    kv_max_range = 5.0
-    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
-    key_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
-    value_cache = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    q_min_range = -1.0
+    q_max_range = 1.0
+    kv_min_range = -1.0
+    kv_max_range = 1.0
+    query = (
+        q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size, q_seqlen, num_heads, head_size)
+    ).to(data_type).npu().requires_grad_(True)
+    key_cache = (
+        kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)
+    ).to(data_type).npu().requires_grad_(True)
+    value_cache = (
+        kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)
+    ).to(data_type).npu().requires_grad_(True)
     scale = 1.0 / (head_size ** 0.5)
-    window_size_left = -1
-    window_size_right = -1
-
     ret = flash_attn_func(
         query,
         key_cache,
@@ -479,30 +484,58 @@ def test_fa_fwd_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen,
     else:
         out_out, softmax_lse = ret
 
-    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    query_ref = query.detach().cpu().requires_grad_(True)
+    key_ref = key_cache.detach().cpu().requires_grad_(True)
+    value_ref = value_cache.detach().cpu().requires_grad_(True)
+    golden_out_list = []
     golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
-    atten_mask = None
-    if is_causal:
-        atten_mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=1).bool()
+    atten_mask, _, _ = make_golden_attention_mask(
+        q_seqlen,
+        kv_seqlen,
+        is_causal,
+        window_size_left,
+        window_size_right,
+    )
     for i in range(batch_size):
-        key_cache_per_batch = key_cache.detach().cpu()[i]
-        value_cache_per_batch = value_cache.detach().cpu()[i]
-        query_cpu = query.detach().cpu()[i]
-        if is_causal:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, softcap)
-        else:
-            output, golden_lse = ref_flash_attention(query_cpu, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, softcap)
+        key_cache_per_batch = key_ref[i]
+        value_cache_per_batch = value_ref[i]
+        query_cpu = query_ref[i]
+        output, golden_lse = ref_flash_attention(
+            query_cpu,
+            key_cache_per_batch,
+            value_cache_per_batch,
+            scale,
+            atten_mask,
+            data_type,
+            softcap,
+        )
         out = output.reshape(q_seqlen, num_heads, head_size)
-        golden_out[i:i+1] = out
+        if atten_mask is not None:
+            fully_masked = atten_mask.all(dim=-1)
+            out[fully_masked, :, :] = 0
+            golden_lse[:, fully_masked] = torch.inf
+        golden_out_list.append(out)
         golden_lseL[i:i+1] = golden_lse.reshape(num_heads, q_seqlen)
+    golden_out = torch.stack(golden_out_list, dim=0)
     rtol = 1e-2
     atol = 1e-2
-    torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(out_out.detach().cpu(), golden_out.detach().cpu(), rtol=rtol, atol=atol)
     if return_attn_probs:
-        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+        torch.testing.assert_close(softmax_lse.detach().cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+    dout = 2.0 * (torch.rand_like(out_out) - 0.5)
+    dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
+    dout_ref = dout.detach().cpu()
+    dq_golden, dk_golden, dv_golden = torch.autograd.grad(
+        golden_out,
+        (query_ref, key_ref, value_ref),
+        dout_ref,
+    )
+    torch.testing.assert_close(dq_ag.detach().cpu(), dq_golden.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(dk_ag.detach().cpu(), dk_golden.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(dv_ag.detach().cpu(), dv_golden.cpu(), rtol=rtol, atol=atol)
 
 
-test_cases = [
+varlen_base_cases = [
     # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap)
     (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, -1, -1, 0.0),
     (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1, 0.0),
@@ -542,40 +575,70 @@ test_cases = [
     (torch.bfloat16, 2, 6, 2, 2, 1024, 128, True, 256, 0, 30.0),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap", test_cases)
-def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap):
+varlen_cases = [(*case, False) for case in varlen_base_cases] + [
+    # 旧 varlen 反向覆盖：每个 batch 使用不同 q/k 长度。
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1, 0.0, True),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1, 0.0, True),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 0.0, True),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 3, 1, 1, 7777, 8192, 64, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 3, 16, 16, 562, 562, 96, False, -1, -1, 0.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, -1, -1, 30.0, True),
+    (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, -1, -1, 30.0, True),
+    (torch.float16, 7, 5, 1, 512, 512, 128, True, -1, -1, 30.0, True),
+    (torch.float16, 7, 5, 1, 777, 888, 192, False, -1, -1, 30.0, True),
+    (torch.float16, 7, 5, 1, 1777, 1888, 256, True, -1, -1, 30.0, True),
+    (torch.bfloat16, 3, 1, 1, 7777, 8192, 64, True, -1, -1, 30.0, True),
+    (torch.bfloat16, 7, 5, 1, 711, 8192, 111, True, -1, -1, 30.0, True),
+    (torch.bfloat16, 3, 16, 16, 562, 562, 96, False, -1, -1, 30.0, True),
+    (torch.bfloat16, 3, 4, 4, 1024, 1024, 128, True, 512, 0, 0.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, False, 0, 256, 0.0, True),
+    (torch.float16, 3, 2, 2, 512, 512, 128, False, 64, 128, 0.0, True),
+    (torch.bfloat16, 3, 4, 4, 1024, 1024, 128, True, -128, 864, 0.0, True),
+    (torch.bfloat16, 3, 4, 4, 1024, 1024, 128, True, 512, 0, 30.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 30.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, False, 0, 256, 30.0, True),
+    (torch.float16, 3, 2, 2, 512, 512, 128, False, 64, 128, 30.0, True),
+    (torch.bfloat16, 3, 4, 4, 1024, 1024, 128, True, -128, 864, 30.0, True),
+]
+
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, is_varied", varlen_cases)
+def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, is_varied):
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if "Ascend910" not in name:
         pytest.skip("flash_attn_varlen_func only support Ascend910")
-    q_min_range = -5.0
-    q_max_range = 5.0
-    kv_min_range = -5.0
-    kv_max_range = 5.0
-    query = (q_min_range + (q_max_range - q_min_range) * torch.rand(batch_size * q_seqlen, num_heads, head_size)).to(data_type).npu()
-    key = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size * kv_seqlen, kv_heads, head_size)).to(data_type).npu()
-    value = (kv_min_range + (kv_max_range - kv_min_range) * torch.rand(batch_size * kv_seqlen, kv_heads, head_size)).to(data_type).npu()
-    actual_seq_len = torch.tensor([q_seqlen * i for i in range(batch_size + 1)], dtype=torch.int32).npu()
-    actual_kv_len = torch.tensor([kv_seqlen * i for i in range(batch_size + 1)], dtype=torch.int32).npu()
+    q_min_range = -1.0
+    q_max_range = 1.0
+    kv_min_range = -1.0
+    kv_max_range = 1.0
+    if is_varied:
+        seqlens_q, seqlens_k = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen)
+    else:
+        seqlens_q = [q_seqlen] * batch_size
+        seqlens_k = [kv_seqlen] * batch_size
+    cu_q = make_cu_seqlens(seqlens_q)
+    cu_k = make_cu_seqlens(seqlens_k)
+    total_q = int(cu_q[-1].item())
+    total_k = int(cu_k[-1].item())
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+    query = (
+        q_min_range + (q_max_range - q_min_range) * torch.rand(total_q, num_heads, head_size)
+    ).to(data_type).npu().requires_grad_(True)
+    key = (
+        kv_min_range + (kv_max_range - kv_min_range) * torch.rand(total_k, kv_heads, head_size)
+    ).to(data_type).npu().requires_grad_(True)
+    value = (
+        kv_min_range + (kv_max_range - kv_min_range) * torch.rand(total_k, kv_heads, head_size)
+    ).to(data_type).npu().requires_grad_(True)
+    actual_seq_len = cu_q.npu()
+    actual_kv_len = cu_k.npu()
 
-    max_seqlen_q = q_seqlen
-    max_seqlen_k = kv_seqlen
     scale = 1.0 / (head_size ** 0.5)
-    window_size_left_golden = window_size_left
-    window_size_right_golden = window_size_right
-    # Match Tri Dao GPU host: both sides vs kv_seqlen.
-    if kv_seqlen > 0 and window_size_left_golden >= kv_seqlen:
-        window_size_left_golden = -1
-    if kv_seqlen > 0 and window_size_right_golden >= kv_seqlen:
-        window_size_right_golden = -1
-    if is_causal:
-        window_size_right_golden = 0
-    is_causal_golden = (window_size_left_golden < 0 and window_size_right_golden == 0)
-    is_local_golden = (window_size_left_golden >= 0 or window_size_right_golden > 0) and not is_causal_golden
-    if is_local_golden:
-        if window_size_left_golden < 0:
-            window_size_left_golden = kv_seqlen
-        if window_size_right_golden < 0:
-            window_size_right_golden = kv_seqlen
 
     output_npu, softmax_lse = flash_attn_varlen_func(
         query,
@@ -591,50 +654,51 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         softcap=softcap,
         return_attn_probs=True,
     )
-    golden_out = torch.empty((batch_size * q_seqlen, num_heads, head_size), dtype=data_type)
-    golden_lseL = torch.empty((num_heads, batch_size * q_seqlen), dtype=torch.float32)
-    atten_mask = None
+    query_ref = query.detach().cpu().requires_grad_(True)
+    key_ref = key.detach().cpu().requires_grad_(True)
+    value_ref = value.detach().cpu().requires_grad_(True)
+    golden_out_list = []
+    golden_lseL = torch.empty((num_heads, total_q), dtype=torch.float32)
 
-    def create_binary_matrix(qSeqlen, kvSeqlen, preToken, nextToken):
-        preToken = kvSeqlen - qSeqlen - preToken
-        nextToken = kvSeqlen - qSeqlen + nextToken
-        matrix = [[0 for _ in range(kvSeqlen)] for _ in range(qSeqlen)]
-        for i in range(qSeqlen):
-            for j in range(kvSeqlen):
-                is_below_pretoken_line = (-i + j) < preToken
-                is_above_nexttoken_line = (-i + j) > nextToken
-                if is_below_pretoken_line or is_above_nexttoken_line:
-                    matrix[i][j] = 1
-        return torch.tensor(matrix, dtype=torch.bool)
-
-    if is_causal_golden:
-        atten_mask = (torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1)).to(torch.bool)
-    elif is_local_golden:
-        atten_mask = create_binary_matrix(q_seqlen, kv_seqlen, window_size_left_golden, window_size_right_golden)
-
-    for i in range(1, batch_size + 1):
-        key_per_batch = key.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
-        value_per_batch = value.detach().cpu()[(i - 1) * kv_seqlen : i * kv_seqlen]
-        query_cpu = query.detach().cpu()[(i - 1) * q_seqlen : i * q_seqlen]
+    for i in range(batch_size):
+        q_len = seqlens_q[i]
+        kv_len = seqlens_k[i]
+        key_per_batch = key_ref[int(cu_k[i].item()) : int(cu_k[i + 1].item())]
+        value_per_batch = value_ref[int(cu_k[i].item()) : int(cu_k[i + 1].item())]
+        query_cpu = query_ref[int(cu_q[i].item()) : int(cu_q[i + 1].item())]
+        atten_mask, is_causal_golden, is_local_golden = make_golden_attention_mask(
+            q_len,
+            kv_len,
+            is_causal,
+            window_size_left,
+            window_size_right,
+        )
         if is_causal_golden or is_local_golden:
             output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, atten_mask, data_type, softcap)
         else:
             output, golden_lse = ref_flash_attention(query_cpu, key_per_batch, value_per_batch, scale, None, data_type, softcap)
-        out = output.reshape(q_seqlen, num_heads, head_size)
-        if is_local_golden and atten_mask is not None:
+        out = output.reshape(q_len, num_heads, head_size)
+        if (is_causal_golden or is_local_golden) and atten_mask is not None:
             fully_masked = atten_mask.all(dim=-1)
             out[fully_masked, :, :] = 0
             golden_lse[:, fully_masked] = torch.inf
-        if is_causal_golden and atten_mask is not None:
-            fully_masked = atten_mask.all(dim=-1)
-            out[fully_masked, :, :] = 0
-            golden_lse[:, fully_masked] = torch.inf
-        golden_out[(i - 1) * q_seqlen : i * q_seqlen] = out
-        golden_lseL[:, (i - 1) * q_seqlen : i * q_seqlen] = golden_lse.reshape(num_heads, q_seqlen)
+        golden_out_list.append(out)
+        golden_lseL[:, int(cu_q[i].item()) : int(cu_q[i + 1].item())] = golden_lse.reshape(num_heads, q_len)
+    golden_out = torch.cat(golden_out_list, dim=0)
     rtol = 1e-2
     atol = 1e-2
-    torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
-    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(output_npu.detach().cpu(), golden_out.detach().cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.detach().cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+    dout = torch.rand_like(output_npu) - 0.5
+    dq_ag, dk_ag, dv_ag = torch.autograd.grad(output_npu, (query, key, value), dout)
+    dq_golden, dk_golden, dv_golden = torch.autograd.grad(
+        golden_out,
+        (query_ref, key_ref, value_ref),
+        dout.detach().cpu(),
+    )
+    torch.testing.assert_close(dq_ag.detach().cpu(), dq_golden.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(dk_ag.detach().cpu(), dk_golden.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(dv_ag.detach().cpu(), dv_golden.cpu(), rtol=rtol, atol=atol)
 
 @pytest.mark.parametrize("data_type", [torch.float16])
 @pytest.mark.parametrize("num_heads", [16])
