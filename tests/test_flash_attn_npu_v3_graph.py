@@ -10,6 +10,7 @@ if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count
 from flash_attn_npu_3 import flash_attn_with_kvcache, get_scheduler_metadata
 from tests.common.attention_ref import ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
+from tests.common.test_utils import make_random_tensor
 
 
 DATA_TYPE = torch.bfloat16
@@ -22,10 +23,6 @@ HEAD_SIZE = 128
 BLOCK_SIZE = 128
 SCALE = 1.0 / (HEAD_SIZE ** 0.5)
 WINDOW_SIZE = (-1, -1)
-
-
-def _rand_npu(shape):
-    return (-5.0 + 10.0 * torch.rand(shape)).to(DATA_TYPE).npu()
 
 
 def _run_flash_attn(
@@ -56,9 +53,9 @@ def _run_flash_attn(
 
 @pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_attn_kvcache_graph(is_causal):
-    query = _rand_npu((Q_SEQLEN, NUM_HEADS, HEAD_SIZE))
-    key_cache = _rand_npu((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE))
-    value_cache = _rand_npu((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE))
+    query = make_random_tensor((Q_SEQLEN, NUM_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    key_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
+    value_cache = make_random_tensor((BATCH_SIZE, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE), DATA_TYPE, device="npu")
     cache_seqlens = torch.tensor([KV_SEQLEN], dtype=torch.int32).npu()
     page_table = torch.tensor([[0]], dtype=torch.int32).npu()
     cu_seqlens_q = torch.tensor([0, Q_SEQLEN], dtype=torch.int32).npu()
@@ -85,14 +82,16 @@ def test_flash_attn_kvcache_graph(is_causal):
             diagonal=KV_SEQLEN - Q_SEQLEN + 1,
         ).bool()
     golden_out_ref, _, golden_out_pt, _ = ref_flash_attention_pair(
-        query.cpu(),
-        key_cache[0].cpu(),
-        value_cache[0].cpu(),
+        query.cpu().unsqueeze(0),
+        key_cache.cpu(),
+        value_cache.cpu(),
         SCALE,
         causal_mask,
         DATA_TYPE,
         0.0,
     )
+    golden_out_ref = golden_out_ref.squeeze(0)
+    golden_out_pt = golden_out_pt.squeeze(0)
 
     _run_flash_attn(
         query,
