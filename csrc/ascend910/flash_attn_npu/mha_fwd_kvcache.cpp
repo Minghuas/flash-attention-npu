@@ -93,6 +93,8 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementP>& gP;
             AscendC::GlobalTensor<ElementOTmp>& gOTmp;
             AscendC::GlobalTensor<ElementOTmp>& gOUpdate;
+            AscendC::GlobalTensor<ElementP>& gPret;
+            AscendC::GlobalTensor<ElementMask>& gDrop;
         };
 
         __aicore__ inline
@@ -120,7 +122,9 @@ namespace SplitFuse {
             windowSizeRight = fATilingData->windowSizeRight;
             scaleValue = fATilingData->scaleValue;
             softcapValue = fATilingData->softcapValue;
+            dropoutValue = fATilingData->dropoutValue;
             maxQSeqlen = fATilingData->maxQSeqlen;
+            maxKvSeqlen = fATilingData->maxKvSeqlen;
             flashDecodeFlag = fATilingData->flashDecodeFlag;
 
             // FD workspace sizing: reserve head of workspace for gLseFD/gOFD.
@@ -167,13 +171,25 @@ namespace SplitFuse {
             AscendC::GlobalTensor<ElementOTmp> gOUpdate;
             gOUpdate.SetGlobalBuffer((__gm__ ElementOTmp *)(params.workSpace + Lsesize + Losize +
                 mm1OutSize + smOnlineOutSize + mm2OutSize));
+            
+            AscendC::GlobalTensor<ElementP> gPret;
+            gPret.SetGlobalBuffer((__gm__ ElementP *)(fATilingData->pDevice));
+            AscendC::GlobalTensor<ElementMask> gDrop;
+            gDrop.SetGlobalBuffer((__gm__ ElementMask *)(fATilingData->dropMaskDevice));
 
             GlobalTensorBundle globalTensors{
                 gQ, gK, gV, gMask, gBlockTable,
                 gActualQseqlen, gActualKvseqlen,
                 gO, gLse, gLseFD, gOFD,
-                gS, gP, gOTmp, gOUpdate
+                gS, gP, gOTmp, gOUpdate, gPret, gDrop
             };
+
+            strideQ = static_cast<uint64_t>(qHeads * embed);
+            strideO = static_cast<uint64_t>(qHeads * embedV);
+            strideK = static_cast<uint64_t>(kvHeads * embed);
+            strideV = static_cast<uint64_t>(kvHeads * embedV);
+            stridePret = static_cast<uint64_t>(maxQSeqlen * maxKvSeqlen);
+            strideDrop = static_cast<uint64_t>(maxQSeqlen * CeilDiv(maxKvSeqlen, 8));
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
             uint32_t coreNum = AscendC::GetBlockNum();
@@ -231,15 +247,13 @@ namespace SplitFuse {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-            epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
-            epilogueRescaleO.init(resource);
+            epilogueOnlineSoftmax.init(
+                resource, scaleValue, softcapValue, gPret, stridePret, gDrop, strideDrop, maxKvSeqlen);
+            epilogueRescaleO.init(resource, dropoutValue);
 
             coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
 #endif
-            strideQ = static_cast<uint64_t>(qHeads * embed);
-            strideO = static_cast<uint64_t>(qHeads * embedV);
-            strideK = static_cast<uint64_t>(kvHeads * embed);
-            strideV = static_cast<uint64_t>(kvHeads * embedV);
+
             embedRound = RoundUp(embed, FaiKenel::BLOCK_SIZE);
             embedRoundV = RoundUp(embedV, FaiKenel::BLOCK_SIZE);
             groupSize = qHeads / kvHeads;
@@ -467,6 +481,8 @@ namespace SplitFuse {
             auto& gP = globalTensors.gP;
             auto& gOTmp = globalTensors.gOTmp;
             auto& gOUpdate = globalTensors.gOUpdate;
+            auto& gPret = globalTensors.gPret;
+            auto& gDrop = globalTensors.gDrop;
 
             uint32_t qSeqlen = maxQSeqlen;
             uint32_t kvSeqlen = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
@@ -540,6 +556,11 @@ namespace SplitFuse {
             uint64_t gmOffsetLse = lseBOffset +
                 static_cast<uint64_t>(qNStartIdx) * lseHeadStride +
                 static_cast<uint64_t>(lseTokenOffset);
+
+            uint64_t gmOffsetPret = static_cast<uint64_t>(BIdx * qHeads + qNStartIdx) * stridePret +
+                                    static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * maxKvSeqlen;
+            uint64_t gmOffsetDrop = static_cast<uint64_t>(BIdx * qHeads + qNStartIdx) * strideDrop +
+                                    static_cast<uint64_t>(qSBlockIdx * curQSBlockTile) * CeilDiv(maxKvSeqlen, 8);
 
             uint32_t qSBlockSize = (qSBlockIdx == (curQSBlockNum - 1U)) ?
                 (qSeqlen - qSBlockIdx * curQSBlockTile) : curQSBlockTile;
@@ -696,6 +717,8 @@ namespace SplitFuse {
                     uint64_t gmOffsetP = gmOffsetS;
                     uint32_t kvSStartIdx = kvSIdx * MAX_KV_STACK_LEN;
                     uint32_t kvSEndIdx = kvSStartIdx + stackSeqTile;
+                    epilogueOnlineSoftmax.set_gmOffsetPret(gmOffsetPret + kvSStartIdx);
+                    epilogueOnlineSoftmax.set_gmOffsetDrop(gmOffsetDrop + kvSStartIdx / 8);
                     if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
                         int64_t triUp =
                             static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
@@ -1006,14 +1029,18 @@ namespace SplitFuse {
         int64_t  windowSizeRight;
         float    scaleValue;
         float    softcapValue;
+        float    dropoutValue;
         uint32_t totalQTokens;
         uint32_t maxQSeqlen;
+        uint32_t maxKvSeqlen;
         uint32_t flashDecodeFlag;
 
         uint64_t strideQ;
         uint64_t strideO;
         uint64_t strideK;
         uint64_t strideV;
+        uint64_t stridePret;
+        uint64_t strideDrop;
         uint32_t embedRound;
         uint32_t embedRoundV;
         uint32_t groupSize;
@@ -1039,7 +1066,9 @@ namespace SplitFuse {
         FaiKenel::MaskType maskCategory = FaiKenel::MaskType::NO_MASK,
         FaiKenel::inputLayout inLayout = FaiKenel::inputLayout::TND,
         Epilogue::LseModeT lseMode = Epilogue::LseModeT::NONE,
-        bool HAS_SOFTCAP = false>
+        bool HAS_SOFTCAP = false,
+        bool RETURN_SOFTMAX = false,
+        bool HAS_DROPOUT = false>
     __global__ __aicore__ void FAInfer(
         uint64_t fftsAddr,
         GM_ADDR q,
@@ -1087,7 +1116,8 @@ namespace SplitFuse {
         using BlockMmadQK = Gemm::Block::BlockMmad<DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK,
                                                    QType, KType, SType>;
 
-        using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP>;
+        using DispatchPolicyOnlineSoftmax =
+            Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP, RETURN_SOFTMAX, HAS_DROPOUT>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
@@ -1101,7 +1131,7 @@ namespace SplitFuse {
         using BlockMmadPV = Gemm::Block::BlockMmad<DispatchPolicyPV, L1TileShapePV, L0TileShapePV,
                                                    PType, VType, OTmpType>;
 
-        using DispatchPolicyRescaleO = Epilogue::EpilogueAtlasA2RescaleOT<lseMode, IntermCalcPrec>;
+        using DispatchPolicyRescaleO = Epilogue::EpilogueAtlasA2RescaleOT<lseMode, IntermCalcPrec, HAS_DROPOUT>;
         using OType = Gemm::GemmType<ElementO, LayoutO>;
         using OUpdateType = Gemm::GemmType<ElementUpdate, LayoutUpdate>;
         using LseType = Gemm::GemmType<ElementLse, LayoutLse>;

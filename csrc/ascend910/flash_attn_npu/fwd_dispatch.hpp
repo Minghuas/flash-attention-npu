@@ -35,6 +35,8 @@ struct FwdLaunchArgs {
     bool is_local;              // sliding-window attention (MASK_SWA)
     bool flashDecodeFlag;       // only meaningful for the BSND (kvcache) path
     bool has_softcap;
+    bool return_softmax = false;
+    bool has_dropout = false;
     uint8_t *qDevice;
     uint8_t *kDevice;
     uint8_t *vDevice;

@@ -34,7 +34,9 @@ std::vector<at::Tensor> launch_fag_general(
     bool is_causal,
     int64_t window_size_left,
     int64_t window_size_right,
-    bool deterministic)
+    bool deterministic,
+    float p_dropout,
+    const std::optional<at::Tensor> &rng_state)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -77,7 +79,8 @@ std::vector<at::Tensor> launch_fag_general(
     }
     fagInfo.softcapValue = softcap;
 
-    fagInfo.keepProb = 1.0f;
+    bool has_dropout = (p_dropout > 0.0f);
+    fagInfo.keepProb = 1.0f - p_dropout;
     if (window_size_left >= max_seqlen_k - 1) {
         window_size_left = -1;
     }
@@ -194,6 +197,26 @@ std::vector<at::Tensor> launch_fag_general(
         cuSeqKvlenDevice = static_cast<uint8_t *>(const_cast<void *>(seqlenk_gpu_tensor.data_ptr()));
     }
 
+    // Regenerate the dropout bit-mask from the forward's rng_state (seed,
+    // offset). Same aclnnDropoutGenMask call and the same bit layout as the
+    // forward (batch x heads x max_seqlen_q rows x ceil(max_seqlen_k/8) bytes
+    // per row, bit 1 = keep), so the backward applies the exact same mask
+    // element-wise as the forward.
+    at::Tensor drop_mask_npu_tensor;
+    if (has_dropout) {
+        TORCH_CHECK(rng_state.has_value(),
+                    "launch_fag_general: rng_state must be provided when p_dropout > 0.");
+        const at::Tensor &rng_state_tensor = rng_state.value();
+        TORCH_CHECK(rng_state_tensor.is_cpu() && rng_state_tensor.numel() == 2,
+                    "launch_fag_general: rng_state must be a CPU tensor of 2 int64 (seed, offset).");
+        const uint64_t *rng_state_ptr = reinterpret_cast<const uint64_t *>(rng_state_tensor.data_ptr());
+        int64_t drop_mask_bit_num =
+            static_cast<int64_t>(batch_size) * nheads * max_seqlen_q * ((max_seqlen_k + 7) / 8 * 8);
+        drop_mask_npu_tensor = at_npu::native::npu_dropout_gen_mask(
+            torch::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat)), {drop_mask_bit_num}, p_dropout,
+            rng_state_ptr[0], rng_state_ptr[1], false, false);
+    }
+
     // FAGGeneral backward kernel launches live in
     // fag_general_dispatch_<dtype>_<layout>.cpp. gen_args.is_causal carries
     // main's has_attn_mask flag (causal OR local), which selects the kernel's
@@ -205,6 +228,9 @@ std::vector<at::Tensor> launch_fag_general(
     gen_args.fftsAddr = fftsAddr;
     gen_args.is_causal = has_attn_mask;
     gen_args.is_softcap = has_softcap;
+    gen_args.has_dropout = has_dropout;
+    gen_args.dropMaskDevice =
+        has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr;
     gen_args.deterministic = deterministic;
     gen_args.qk_headdim_kernel = qk_headdim_kernel;
     gen_args.dOutDevice = dOutDevice;

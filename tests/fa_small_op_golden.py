@@ -221,6 +221,7 @@ def golden_bsnd_bwd_from_fwd(
     window_size_right,
     *,
     gtype=torch.float64,
+    drop_mask=None,
 ):
     """BSND 反传标杆。softmax_lse layout: FA (B, N, S_q)。"""
     del out
@@ -252,7 +253,8 @@ def golden_bsnd_bwd_from_fwd(
         compute_dtype,
         gtype=gtype,
     )
-    drop_mask = torch.tensor(1)
+    if drop_mask is None:
+        drop_mask = torch.tensor(1)
     dq_bn, dk_bn, dv_bn = tbackward_bsnd(
         dx_bn, q_bn, k_new, v_new, softmax_res, drop_mask, scale, softcap, dropout_p
     )
@@ -284,6 +286,7 @@ def golden_tnd_bwd_from_fwd(
     window_size_right,
     *,
     gtype=torch.float64,
+    drop_mask=None,
 ):
     """TND 反传标杆。softmax_lse layout: FA varlen (N, total_q) NT。"""
     del out
@@ -303,7 +306,8 @@ def golden_tnd_bwd_from_fwd(
     dq_golden = torch.empty_like(q, dtype=compute_dtype)
     dk_golden = torch.empty_like(k, dtype=compute_dtype)
     dv_golden = torch.empty_like(v, dtype=compute_dtype)
-    drop_mask = torch.tensor(1)
+    if drop_mask is None:
+        drop_mask = torch.tensor(1)
 
     for i, sq in enumerate(seqlens_q):
         sk = seqlens_k[i]
@@ -334,8 +338,11 @@ def golden_tnd_bwd_from_fwd(
             compute_dtype,
             gtype=gtype,
         )
+        drop_mask_i = (
+            drop_mask if drop_mask.dim() == 0 else drop_mask[i][:, :sq, :sk]
+        )
         dqi, dki, dvi = tbackward_tnd(
-            dxi, qi, ki_new, vi_new, softmax_res_i, drop_mask, scale, softcap, dropout_p
+            dxi, qi, ki_new, vi_new, softmax_res_i, drop_mask_i, scale, softcap, dropout_p
         )
         dki = sum_gqa_grad(dki, nheads, nheads_k, 1, sk, headdim)
         dvi = sum_gqa_grad(dvi, nheads, nheads_k, 1, sk, headdim)

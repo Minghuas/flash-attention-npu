@@ -31,10 +31,10 @@
 #include "mha_fwd_kvcache.cpp"
 
 // 8-param FAInfer (no IS_FD template arg — flash-decode moved to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK, LAYOUT_ENUM, SOFTCAP)                       \
+#define FWD_LAUNCH(DTYPE, PAGED, MASK, LAYOUT_ENUM, SOFTCAP, RETURN_SOFTMAX, DROPOUT)                       \
     SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED,                                 \
                        FaiKenel::MaskType::MASK, LAYOUT_ENUM,                      \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP>             \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP, RETURN_SOFTMAX, DROPOUT>             \
         <<<blockDim, nullptr, aclStream>>>(                                        \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,     \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                    \
@@ -52,6 +52,8 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     const bool is_local = a.is_local;
     const bool flashDecodeFlag = a.flashDecodeFlag;
     const bool has_softcap = a.has_softcap;
+    const bool return_softmax = a.return_softmax;
+    const bool has_dropout = a.has_dropout;
     uint8_t *qDevice = a.qDevice;
     uint8_t *kDevice = a.kDevice;
     uint8_t *vDevice = a.vDevice;
@@ -68,41 +70,186 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     if (paged_KV) {
         if (is_local) {
             if (has_softcap) {
-                FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, true, false, false);
+                    }
+                }
             } else {
-                FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_SWA, LAYOUT, false, false, false);
+                    }
+                }
             }
         } else if (is_causal) {
             if (has_softcap) {
-                FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, true, false, false);
+                    }
+                }
             } else {
-                FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, MASK_CAUSAL, LAYOUT, false, false, false);
+                    }
+                }
             }
         } else {
+            // NO_MASK
             if (has_softcap) {
-                FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, true, false, false);
+                    }
+                }
             } else {
-                FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, true, NO_MASK, LAYOUT, false, false, false);
+                    }
+                }
             }
         }
     } else {
         if (is_local) {
             if (has_softcap) {
-                FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, true, false, false);
+                    }
+                }
             } else {
-                FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_SWA, LAYOUT, false, false, false);
+                    }
+                }
             }
         } else if (is_causal) {
             if (has_softcap) {
-                FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, true, false, false);
+                    }
+                }
             } else {
-                FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, MASK_CAUSAL, LAYOUT, false, false, false);
+                    }
+                }
             }
         } else {
             if (has_softcap) {
-                FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, true, false, false);
+                    }
+                }
             } else {
-                FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false);
+                if (return_softmax) {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, true, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, true, false);
+                    }
+                } else {
+                    if (has_dropout) {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, false, true);
+                    } else {
+                        FWD_LAUNCH(DType, false, NO_MASK, LAYOUT, false, false, false);
+                    }
+                }
             }
         }
     }

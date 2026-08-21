@@ -22,16 +22,17 @@ template <
     class InputType_,
     class UpdateType_,
     class LseType_,
-    LseModeT LSE_MODE_>
+    LseModeT LSE_MODE_,
+    bool HAS_DROPOUT_>
 class BlockEpilogue<
-    EpilogueAtlasA2RescaleOT<LSE_MODE_, float>,
+    EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>,
     OutputType_,
     InputType_,
     UpdateType_,
     LseType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2RescaleOT<LSE_MODE_, float>;
+    using DispatchPolicy = EpilogueAtlasA2RescaleOT<LSE_MODE_, float, HAS_DROPOUT_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
     using ElementOutput = typename OutputType_::Element;
@@ -81,7 +82,7 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource)
+    void init(Arch::Resource<ArchTag> &resource, float dropoutValue_)
     {
         // Allocate UB space
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
@@ -93,6 +94,8 @@ public:
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t LSE_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
+
+        dropoutValue = dropoutValue_;
 
         loUbTensor = resource.ubBuf.template GetBufferByByte<float>(LO_UB_TENSOR_OFFSET);
         dmUbTensor = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
@@ -392,6 +395,14 @@ public:
                 AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             }
             AscendC::PipeBarrier<PIPE_V>();
+
+            if constexpr (HAS_DROPOUT_) {
+                // go = go * (1 / (1 - p))
+                AscendC::Muls<float, false>(
+                    goUbTensor32, goUbTensor32, dropoutValue, (uint64_t)0,
+                    CeilDiv(curRowNum * embedRound, FLOAT_VECTOR_SIZE), AscendC::UnaryRepeatParams());
+                AscendC::PipeBarrier<PIPE_V>();
+            }
 
             // *** go = castfp32to16(go)
             // FD: skip the fp32->fp16 cast when writing to splitParams.gCombineo
@@ -799,6 +810,7 @@ public:
     }
 
 private:
+    float dropoutValue;
     AscendC::LocalTensor<float> loUbTensor;
     AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<float> hmUbTensor;

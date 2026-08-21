@@ -20,6 +20,8 @@
 #include "fag_tiling.cpp"
 #include "fag_general_host.hpp"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/aten/NPUGeneratorImpl.h"
+#include "third_party/op-plugin/op_plugin/include/ops.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "runtime/rt_ffts.h"
@@ -136,6 +138,48 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
         c10_npu::NPUCachingAllocator::recordStream(cuSeqlensQ->storage().data_ptr(), aicpuStream);
     }
     return meta;
+}
+
+// async copy dropout tiling data
+static void PatchTilingDropoutFields(const at::Tensor &schedMd, uint64_t tilingOffset,
+                                     float dropoutValue, uint8_t *pDevice,
+                                     uint8_t *dropMaskDevice)
+{
+    if (dropMaskDevice == nullptr) {
+        return;
+    }
+    struct DropFields {
+        float dropoutValue;
+        uint64_t pDevice;
+        uint64_t dropMaskDevice;
+    };
+    // The Host2Device staging copy is async and reads the source after this function
+    // returns; static + same-stream serialization keeps it alive and safe.
+    static at::Tensor patchDev;
+    static DropFields fields;
+    if (!patchDev.defined()) {
+        patchDev = torch::empty({static_cast<int64_t>(sizeof(DropFields))},
+                                at::device(at::kPrivateUse1).dtype(at::kByte));
+    }
+    fields.dropoutValue = dropoutValue;
+    fields.pDevice = reinterpret_cast<uint64_t>(pDevice);
+    fields.dropMaskDevice = reinterpret_cast<uint64_t>(dropMaskDevice);
+
+    at::Tensor patchCpu = torch::from_blob(&fields, {static_cast<int64_t>(sizeof(DropFields))},
+                                           at::TensorOptions().dtype(torch::kUInt8));
+    patchDev.copy_(patchCpu);  // H2D staging, current stream
+
+    auto tilingView = schedMd.narrow(0, static_cast<int64_t>(tilingOffset),
+                                     static_cast<int64_t>(sizeof(FAInferTilingData)));
+    tilingView.narrow(0, offsetof(FAInferTilingData, dropoutValue), 4)
+        .view(torch::kFloat32)
+        .copy_(patchDev.narrow(0, offsetof(DropFields, dropoutValue), 4).view(torch::kFloat32));
+    tilingView.narrow(0, offsetof(FAInferTilingData, pDevice), 8)
+        .view(torch::kInt64)
+        .copy_(patchDev.narrow(0, offsetof(DropFields, pDevice), 8).view(torch::kInt64));
+    tilingView.narrow(0, offsetof(FAInferTilingData, dropMaskDevice), 8)
+        .view(torch::kInt64)
+        .copy_(patchDev.narrow(0, offsetof(DropFields, dropMaskDevice), 8).view(torch::kInt64));
 }
 
 std::vector<at::Tensor>
@@ -508,6 +552,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         std::optional<at::Tensor> scheduler_metadata_)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
+    auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     auto q_dtype = q.dtype();
     bool is_bf16 = q.dtype() == torch::kBFloat16;
     // parameters checking
@@ -515,12 +560,11 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 "FlashAttention only support fp16 and bf16 data type");
     TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
+    TORCH_CHECK(p_dropout >= 0.0f && p_dropout < 1.0f, "p_dropout must be in [0.0, 1.0)");
 
     // block unsupported params
     TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
-    TORCH_CHECK(p_dropout == 0.0, "NPU FlashAttention does not support dropout.");
-    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
-    TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -564,9 +608,10 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     auto opts = q.options().device(at::kPrivateUse1);
     auto p = torch::empty({0}, opts);
     if (return_softmax) {
-        p = torch::empty({batch_size, num_heads, seqlen_q, seqlen_k}, opts);
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        p = torch::zeros({batch_size, num_heads, seqlen_q, seqlen_k}, opts);
     }
-    auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+    auto rng_state = torch::empty({2}, at::device(c10::kCPU).dtype(torch::kInt64));
 
     // init mask / tiling: host computes them unless the AICPU already did
     // (scheduler-metadata path).
@@ -577,6 +622,23 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     at::Tensor workspace_tensor;
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     bool has_softcap = (softcap > 0.0f);
+
+    // init dropout
+    bool has_dropout = p_dropout > 0.0f;
+    at::Tensor drop_mask_npu_tensor;
+    if (has_dropout) {
+        uint64_t num_elems = static_cast<uint64_t>(batch_size) * num_heads * seqlen_q * seqlen_k;
+        at::Generator gen = gen_.has_value() ? gen_.value() : at_npu::detail::getDefaultNPUGenerator();
+        std::lock_guard<std::mutex> lock(gen.mutex());
+        auto [seed, offset] = gen.get<at_npu::NPUGeneratorImpl>()->philox_engine_inputs(num_elems);
+        int64_t drop_mask_bit_num = static_cast<int64_t>(batch_size) * num_heads * seqlen_q * ((seqlen_k + 7) / 8 * 8);
+        drop_mask_npu_tensor = at_npu::native::npu_dropout_gen_mask(
+            torch::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat)), {drop_mask_bit_num}, p_dropout, seed,
+            offset, false, false);
+        uint64_t* rng_state_ptr = reinterpret_cast<uint64_t*>(const_cast<void*>(rng_state.data_ptr()));
+        rng_state_ptr[0] = seed;
+        rng_state_ptr[1] = offset;
+    }
 
     // init softmax lse — head-major BNS: {batch, num_heads, seqlen_q} (matches v3).
     at::Tensor softmaxlse = at::empty({batch_size, num_heads, seqlen_q},
@@ -607,6 +669,12 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         maskDevice = hasMask ? metaBase : nullptr;
         workspace_tensor = at::empty({static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim))},
                                      at::device(at::kPrivateUse1).dtype(at::kByte));
+        // The AICPU tiling does not carry the dropout fields; patch them in
+        // with stream-ordered copies (after the AICPU metadataDone event).
+        PatchTilingDropoutFields(schedMd, fa_metadata::TilingOffset(hasMask),
+                                 1.0f / (1.0f - p_dropout),
+                                 return_softmax ? static_cast<uint8_t *>(const_cast<void *>(p.data_ptr())) : nullptr,
+                                 has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr);
     } else {
     if (is_causal || is_local) {
         at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
@@ -655,12 +723,17 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         tiling_cpu_ptr->set_scaleValue(softmax_scale);
     }
     tiling_cpu_ptr->set_softcapValue(softcap);
+    tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
+    tiling_cpu_ptr->set_maxKvSeqlen(seqlen_k);
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
     tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
     tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
     tiling_cpu_ptr->set_UpdateSize(UpdateSize);
     tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
+    tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
+    tiling_cpu_ptr->set_dropMaskDevice(
+        has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
 
     uint32_t totalTaskNum = 0;
     uint32_t groupSize = num_heads / num_heads_k;
@@ -698,7 +771,6 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     uint8_t * blockTableDevice = nullptr; // will not be used in non-kvcahce fwd api
 
     // run kernel
-    auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     // BSND, non-paged forward (IS_TND=false, paged_KV=false, no flash-decode).
     FwdLaunchArgs fwd_args;
     fwd_args.blockDim = blockDim;
@@ -710,6 +782,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
     fwd_args.has_softcap = has_softcap;
+    fwd_args.return_softmax = return_softmax;
+    fwd_args.has_dropout = has_dropout;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -772,22 +846,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(!seqused_k_.has_value(), "NPU FlashAttention does not support seqused_k.");
     TORCH_CHECK(!leftpad_k_.has_value(), "NPU FlashAttention does not support leftpad_k.");
     TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
-    TORCH_CHECK(p_dropout == 0.0, "NPU FlashAttention does not support dropout.");
+    TORCH_CHECK(p_dropout >= 0.0f && p_dropout < 1.0f, "p_dropout must be in [0.0, 1.0)");
     TORCH_CHECK(!zero_tensors, "NPU FlashAttention does not support zero_tensors.");
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
-    TORCH_CHECK(!return_softmax, "NPU FlashAttention does not support return_softmax.");
     TORCH_CHECK(k.dtype() == q.dtype(), "query and key must have the same dtype");
     TORCH_CHECK(v.dtype() == q.dtype(), "query and value must have the same dtype");
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-
-    at::Tensor out;
-    if (out_.has_value()) {
-        out = out_.value();
-    }  else {
-        out = torch::empty_like(q);
-    }
 
     // 可选输入，当前均不支持
     at::Tensor seqlens_k, leftpad_k, alibi_slopes, block_table;
@@ -859,6 +925,32 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         }
     }
 
+    at::Tensor out = (out_.has_value()) ? out_.value() : torch::empty_like(q);
+    auto opts = q.options().device(at::kPrivateUse1);
+    auto p = torch::empty({0}, opts);
+    if (return_softmax) {
+        TORCH_CHECK(p_dropout > 0.0f, "return_softmax is only supported when p_dropout > 0.0");
+        p = torch::zeros({batch_size, num_heads, max_seqlen_q, max_seqlen_k}, opts);
+    }
+    auto rng_state = torch::empty({2}, at::device(c10::kCPU).dtype(torch::kInt64));
+
+    bool has_dropout = p_dropout > 0.0f;
+    at::Tensor drop_mask_npu_tensor;
+    if (has_dropout) {
+        uint64_t num_elems = static_cast<uint64_t>(batch_size) * num_heads * max_seqlen_q * max_seqlen_k;
+        at::Generator gen = gen_.has_value() ? gen_.value() : at_npu::detail::getDefaultNPUGenerator();
+        std::lock_guard<std::mutex> lock(gen.mutex());
+        auto [seed, offset] = gen.get<at_npu::NPUGeneratorImpl>()->philox_engine_inputs(num_elems);
+        int64_t drop_mask_bit_num =
+            static_cast<int64_t>(batch_size) * num_heads * max_seqlen_q * ((max_seqlen_k + 7) / 8 * 8);
+        drop_mask_npu_tensor = at_npu::native::npu_dropout_gen_mask(
+            torch::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat)), {drop_mask_bit_num}, p_dropout, seed,
+            offset, false, false);
+        uint64_t* rng_state_ptr = reinterpret_cast<uint64_t*>(const_cast<void*>(rng_state.data_ptr()));
+        rng_state_ptr[0] = seed;
+        rng_state_ptr[1] = offset;
+    }
+
     bool has_softcap = (softcap > 0.0f);
     // LSE output is head-major NT: {num_heads, T} (matches v3).
     at::Tensor softmaxlse = at::empty({num_heads, T}, at::device(at::kPrivateUse1).dtype(at::kFloat)); // lse
@@ -882,6 +974,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         maskDevice = hasMask ? metaBase : nullptr;
         workspace_tensor = at::empty({static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim))},
                                      at::device(at::kPrivateUse1).dtype(at::kByte));
+        // Same dropout patch as mha_fwd: stream-ordered copies fill the
+        // AICPU tiling's missing dropout fields.
+        PatchTilingDropoutFields(schedMd, fa_metadata::TilingOffset(hasMask),
+                                 1.0f / (1.0f - p_dropout),
+                                 return_softmax ? static_cast<uint8_t *>(const_cast<void *>(p.data_ptr())) : nullptr,
+                                 has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr);
     } else {
     at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
                                              at::device(c10::kCPU).dtype(at::kByte));
@@ -908,7 +1006,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         tiling_cpu_ptr->set_scaleValue(softmax_scale);
     }
     tiling_cpu_ptr->set_softcapValue(softcap);
+    tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
     tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
+    tiling_cpu_ptr->set_maxKvSeqlen(max_seqlen_k);
+    tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
+    tiling_cpu_ptr->set_dropMaskDevice(
+        has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
 
     uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
     uint64_t PRELANCH_NUM = 3;
@@ -995,6 +1098,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.is_local = is_local;
     fwd_args.flashDecodeFlag = false;
     fwd_args.has_softcap = has_softcap;
+    fwd_args.return_softmax = return_softmax;
+    fwd_args.has_dropout = has_dropout;
     fwd_args.qDevice = qDevice;
     fwd_args.kDevice = kDevice;
     fwd_args.vDevice = vDevice;
@@ -1012,9 +1117,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
 
-    auto options = torch::TensorOptions().dtype(torch::kFloat32).device(at::Device(at::kPrivateUse1));
-    at::Tensor rng_state =  torch::empty({2}, options.dtype(torch::kInt64));
-    at::Tensor p = torch::empty({ 0 }, options.dtype(torch::kInt64));
     return {out, softmaxlse, p, rng_state};
 }
 
@@ -1096,13 +1198,13 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     const bool local_is_causal = local_window_size_left < 0 && local_window_size_right == 0;
     const bool is_local = (local_window_size_left >= 0 || local_window_size_right >= 0) && !local_is_causal;
 
-    if (!seqlens_q.equal(seqlens_k) || is_local || headdim != 128) { // varlen optimized kernel only supports headdim equal to 128
+    // varlen optimized kernel only supports headdim equal to 128
+    if (!seqlens_q.equal(seqlens_k) || is_local || p_dropout > 0.0f || headdim != 128) {
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(
-            dout, q, k, v, out, softmax_lse, dq, dk, dv,
-            seqlens_q, seqlens_k,
-            max_seqlen_q, max_seqlen_k,
-            scale, softcap, local_is_causal, local_window_size_left, local_window_size_right, deterministic);
+            dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k, max_seqlen_q, max_seqlen_k, scale,
+            softcap, local_is_causal, local_window_size_left, local_window_size_right, deterministic, p_dropout,
+            rng_state);
     }
 
     // tiling args set
@@ -1251,10 +1353,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     float scale = softmax_scale > 0.f ? softmax_scale
                                       : (1.0f / sqrt(static_cast<float>(qsizes[3])));
     return launch_fag_general(
-        dout, q, k, v, out, softmax_lse, dq, dk, dv,
-        std::nullopt, std::nullopt,
-        qsizes[1], ksizes[1],
-        scale, softcap, is_causal, window_size_left, window_size_right, deterministic);
+        dout, q, k, v, out, softmax_lse, dq, dk, dv, std::nullopt, std::nullopt, qsizes[1], ksizes[1], scale, softcap,
+        is_causal, window_size_left, window_size_right, deterministic, p_dropout, rng_state);
 }
 
 at::Tensor get_scheduler_metadata(

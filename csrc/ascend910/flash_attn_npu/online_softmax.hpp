@@ -23,15 +23,17 @@ template <
     class InputType_,
     class MaskType_,
     LseModeT LSE_MODE_,
-    bool HAS_SOFTCAP_>
+    bool HAS_SOFTCAP_,
+    bool RETURN_SOFTMAX_,
+    bool HAS_DROPOUT_>
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_, HAS_DROPOUT_>,
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_, RETURN_SOFTMAX_, HAS_DROPOUT_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
     using ElementInput = typename InputType_::Element;
@@ -67,7 +69,9 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_)
+    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_, 
+        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, 
+        AscendC::GlobalTensor<ElementMask> gDrop_, uint64_t strideDrop_, uint32_t maxKvSeqlen_)
     {
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
@@ -84,9 +88,16 @@ public:
         constexpr uint32_t LL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 11 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t DROP_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
+        gPret = gPret_;
+        stridePret = stridePret_;
+        gDrop = gDrop_;
+        strideDrop = strideDrop_;
+        maxKvSeqlen = maxKvSeqlen_;
+
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
@@ -100,12 +111,19 @@ public:
         llUbTensor = resource.ubBuf.template GetBufferByByte<float>(LL_UB_TENSOR_OFFSET);
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
+        dropUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(DROP_UB_TENSOR_OFFSET);
+    }
+    
+    __aicore__ inline
+    void set_gmOffsetPret(uint64_t gmOffsetPret_)
+    {
+        gmOffsetPret = gmOffsetPret_;
     }
 
-    template <typename T>
-    __aicore__ inline T Min(T a, T b)
+    __aicore__ inline
+    void set_gmOffsetDrop(uint64_t gmOffsetDrop_)
     {
-        return (a > b) ? b : a;
+        gmOffsetDrop = gmOffsetDrop_;
     }
 
     __aicore__ inline
@@ -813,6 +831,93 @@ public:
                 rowNumCurLoop, columnNumRound / BLOCK_SIZE, 0, (columnNumPad - columnNumRound) / BLOCK_SIZE));
     }
 
+    __aicore__ inline
+    void CopyDropMaskToUb(
+        uint32_t qNOffset, uint32_t qSIdxCurBlock, uint32_t qSOffset, uint32_t rowNum, uint32_t columnNum,
+        uint32_t qSBlockSize)
+    {
+        uint32_t rowsDone = 0;
+        while (rowsDone < rowNum) {
+            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSIdxCurBlock);
+            AscendC::DataCopyPad(
+                dropUbTensor[rowsDone * ((columnNum > 256) ? 64 : 32)],
+                gDrop[gmOffsetDrop + qNOffset + qSOffset],
+                AscendC::DataCopyExtParams(
+                    rowsCurHead, CeilDiv(columnNum, 8) * sizeof(ElementMask),
+                    (CeilDiv(maxKvSeqlen, 8) - CeilDiv(columnNum, 8)) * sizeof(ElementMask), 0, 0),
+                AscendC::DataCopyPadExtParams<ElementMask>());
+            rowsDone += rowsCurHead;
+            qNOffset += strideDrop;
+            qSIdxCurBlock = 0;
+            qSOffset = 0;
+        }
+    }
+
+    __aicore__ inline
+    void ApplyDropoutNegate(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
+    {
+        auto t0 = lmUbTensor.template ReinterpretCast<half>();
+        auto t1 = hmUbTensor.template ReinterpretCast<half>();
+        auto u0 = t0.template ReinterpretCast<uint16_t>();
+        auto u1 = t1.template ReinterpretCast<uint16_t>();
+        for (uint32_t r = 0; r < rowNum; r++) {
+            AscendC::Duplicate(t0, static_cast<half>(0.0f), columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Select(
+                t0, dropUbTensor[r * ((columnNum > 256) ? 64 : 32)], t0, static_cast<half>(-0.0f),
+                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            auto up = lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<uint16_t>();
+            AscendC::Or(u1, up, u0, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(up, up, u0, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Not(up, up, columnNumRound);
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::And(up, up, u1, columnNumRound);
+        }
+    }
+
+    __aicore__ inline
+    void ApplyDropoutStd(uint32_t sUbOffset, uint32_t rowNum, uint32_t columnNum, uint32_t columnNumRound)
+    {
+        if (columnNum == 512 || columnNum == 256) {
+            AscendC::Select(
+                lpUbTensor[sUbOffset].template ReinterpretCast<half>(), dropUbTensor,
+                lpUbTensor[sUbOffset].template ReinterpretCast<half>(), static_cast<half>(0.0f),
+                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, rowNum * columnNumRound);
+        } else {
+            for (uint32_t r = 0; r < rowNum; r++) {
+                AscendC::Select(
+                    lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<half>(),
+                    dropUbTensor[r * ((columnNum > 256) ? 64 : 32)],
+                    lpUbTensor[sUbOffset][r * columnNumRound].template ReinterpretCast<half>(),
+                    static_cast<half>(0.0f), AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, columnNumRound);
+            }
+        }
+    }
+
+    __aicore__ inline
+    void CopyPretUbToGm(
+        uint32_t sUbOffset, uint64_t qNOffset, uint32_t qSIdxCurBlock, uint32_t qSOffset, uint32_t rowNum,
+        uint32_t columnNum, uint32_t columnNumRound, uint32_t qSBlockSize)
+    {
+        uint32_t rowsDone = 0;
+        while (rowsDone < rowNum) {
+            uint32_t rowsCurHead = Min(rowNum - rowsDone, qSBlockSize - qSIdxCurBlock);
+            AscendC::DataCopyPad(
+                gPret[gmOffsetPret + qNOffset + qSOffset], lpUbTensor[sUbOffset][rowsDone * columnNumRound],
+                AscendC::DataCopyExtParams(
+                    rowsCurHead, columnNum * sizeof(ElementOutput),
+                    (columnNumRound - columnNum) * sizeof(ElementOutput) / 32,
+                    (maxKvSeqlen - columnNum) * sizeof(ElementOutput), 0));
+            rowsDone += rowsCurHead;
+            qNOffset += stridePret;
+            qSIdxCurBlock = 0;
+            qSOffset = 0;
+        }
+    }
+
     template <bool doTriUMask>
     __aicore__ inline
     void SubCoreCompute(
@@ -820,7 +925,8 @@ public:
         uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t isFirstRowLoop, uint32_t isLastRowLoop,
         uint32_t columnNumRound, uint32_t pingpongFlag,
-        uint32_t curStackTileMod, bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
+        uint32_t curStackTileMod, uint32_t rowOffsetIoGm, uint32_t qSBlockSize,
+        bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);
@@ -838,6 +944,16 @@ public:
                 AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             }
         }
+
+        if constexpr (HAS_DROPOUT_) {
+            uint32_t qNOffset = (rowOffsetIoGm / qSBlockSize) * strideDrop;
+            uint32_t qSIdxCurBlock = rowOffsetIoGm % qSBlockSize;
+            uint32_t qSOffset = qSIdxCurBlock * CeilDiv(maxKvSeqlen, 8);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
+            CopyDropMaskToUb(qNOffset, qSIdxCurBlock, qSOffset, rowNumCurLoop, columnNum, qSBlockSize);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+        }
+
         CalcLocalRowMax(sUbOffset, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
         UpdateGlobalRowMax(
             rowNumCurLoop, rowNumCurLoopRound,
@@ -852,6 +968,25 @@ public:
         }
 
         DownCastP(sUbOffset, rowNumCurLoop, columnNumRound);
+        if constexpr (HAS_DROPOUT_) {
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID3);
+            if constexpr (RETURN_SOFTMAX_) {
+                ApplyDropoutNegate(sUbOffset, rowNumCurLoop, columnNum, columnNumRound);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
+                uint64_t qNOffset = static_cast<uint64_t>(rowOffsetIoGm / qSBlockSize) * stridePret;
+                uint32_t qSIdxCurBlock = rowOffsetIoGm % qSBlockSize;
+                uint32_t qSOffset = qSIdxCurBlock * maxKvSeqlen;
+                CopyPretUbToGm(
+                    sUbOffset, qNOffset, qSIdxCurBlock, qSOffset, rowNumCurLoop, columnNum, columnNumRound,
+                    qSBlockSize);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
+            }
+            ApplyDropoutStd(sUbOffset, rowNumCurLoop, columnNum, columnNumRound);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
+        }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
 
         CalcLocalRowSum(sUbOffset, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
@@ -859,6 +994,7 @@ public:
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
+
         if constexpr (!doTriUMask) {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
             if (isLastNoMaskStackTile && isLastRowLoop) {
@@ -948,6 +1084,8 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV,
                     startsWithMaskThenNomaskFlag);
             }
@@ -1090,6 +1228,8 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
                 if (rowLoopIdx < rowLoopNum) {
@@ -1308,6 +1448,8 @@ public:
                     columnNumRound,
                     pingpongFlag,
                     curStackTileMod,
+                    rowOffsetIoGm,
+                    qSBlockSize,
                     isSplitKV,
                     false);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
@@ -1344,6 +1486,14 @@ public:
 private:
     float scaleValue;
     float softcapValue;
+    uint64_t gmOffsetPret;
+    uint64_t stridePret;
+    uint64_t gmOffsetDrop;
+    uint64_t strideDrop;
+    uint32_t maxKvSeqlen;
+    AscendC::GlobalTensor<ElementOutput> gPret;
+    AscendC::GlobalTensor<ElementMask> gDrop;
+
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<ElementMask> maskUbTensor;
@@ -1357,6 +1507,7 @@ private:
     AscendC::LocalTensor<float> tvUbTensor;
     AscendC::LocalTensor<float> glUbTensor;
     AscendC::LocalTensor<float> softcapUbTensor;
+    AscendC::LocalTensor<ElementMask> dropUbTensor;
 };
 
 }
