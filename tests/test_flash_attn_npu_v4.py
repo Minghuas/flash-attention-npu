@@ -3,8 +3,8 @@
 import torch
 import torch_npu
 import pytest
-from npu_precision_utils import compare_rule
-from tests.common.attention_ref import ref_flash_attention, ref_masked_attention
+from tests.common.attention_ref import ref_flash_attention_pair, ref_masked_attention
+from tests.common.compare import assert_fa_close
 from tests.common.test_utils import gather_paged_kv, make_block_table, make_local_attention_mask
 if "Ascend950" in torch_npu.npu.get_device_name():
     from flash_attn_npu_4 import flash_attn_varlen_func
@@ -216,7 +216,6 @@ test_cases = [
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right", test_cases)
 def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits):
     # num_splits>1 (active KV split) is currently only wired for paged KV + varlen-q (TND).
-
     name = torch_npu.npu.get_device_name() if torch_npu.npu.device_count() > 0 else ""
     if num_splits > 1 and not (cache_mode == 1 and layout == "TND"):
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
@@ -229,10 +228,10 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         pytest.skip("Ascend950 does not support SWA")
     if is_varied and layout != "TND":
         pytest.skip("is_varied requires TND (varlen-q) layout")
-    q_min_range = -1.0
-    q_max_range = 1.0
-    kv_min_range = -1.0
-    kv_max_range = 1.0
+    q_min_range = -5.0
+    q_max_range = 5.0
+    kv_min_range = -5.0
+    kv_max_range = 5.0
     block_size = 128
     max_num_blocks_per_seq = (kv_seqlen + block_size - 1) // block_size
     num_blocks = max(64, max_num_blocks_per_seq * batch_size)
@@ -355,13 +354,16 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     value_ref = value_cache.detach().cpu().requires_grad_(True)
     block_tables_cpu = block_tables.cpu() if cache_mode == 1 else None
 
-    golden_out_gpu_list = []
+    golden_out_gpu_ref_list = []
+    golden_out_gpu_pt_list = []
     golden_out_plain_list = []
     if layout == "BSND":
-        golden_lseL_gpu = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+        golden_lseL_gpu_ref = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+        golden_lseL_gpu_pt = torch.empty_like(golden_lseL_gpu_ref)
         golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
     else:
-        golden_lseL_gpu = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
+        golden_lseL_gpu_ref = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
+        golden_lseL_gpu_pt = torch.empty_like(golden_lseL_gpu_ref)
         golden_lseL = torch.empty((num_heads, t_q_sum), dtype=torch.float32)
     for i in range(batch_size):
         q_seqlen_per_batch = q_sequences[i]
@@ -412,12 +414,19 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         key_plain_per_batch = key_cache_per_batch.detach()
         value_plain_per_batch = value_cache_per_batch.detach()
         if atten_mask is not None:
-            output_gpu, golden_lse_gpu = ref_flash_attention(query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch, scale, atten_mask, data_type, rescale_threshold=4.0)
+            output_gpu_ref, golden_lse_gpu_ref, output_gpu_pt, golden_lse_gpu_pt = ref_flash_attention_pair(
+                query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch,
+                scale, atten_mask, data_type, rescale_threshold=4.0,
+            )
             output, golden_lse = ref_masked_attention(query_plain_per_batch, key_plain_per_batch, value_plain_per_batch, scale, atten_mask, None)
         else:
-            output_gpu, golden_lse_gpu = ref_flash_attention(query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch, scale, None, data_type, rescale_threshold=4.0)
+            output_gpu_ref, golden_lse_gpu_ref, output_gpu_pt, golden_lse_gpu_pt = ref_flash_attention_pair(
+                query_cpu_per_batch, key_cache_per_batch, value_cache_per_batch,
+                scale, None, data_type, rescale_threshold=4.0,
+            )
             output, golden_lse = ref_masked_attention(query_plain_per_batch, key_plain_per_batch, value_plain_per_batch, scale, None, None)
-        out_gpu = output_gpu.reshape(q_seqlen_per_batch, num_heads, head_size)
+        out_gpu_ref = output_gpu_ref.reshape(q_seqlen_per_batch, num_heads, head_size)
+        out_gpu_pt = output_gpu_pt.reshape(q_seqlen_per_batch, num_heads, head_size)
         out_plain = output.reshape(q_seqlen_per_batch, num_heads, head_size)
         lse_plain = torch.from_numpy(golden_lse)
         if is_local_golden and atten_mask is not None:
@@ -425,52 +434,62 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
             # NPU zeroes them / sets lse=inf. Infinite window (-1) must not go
             # through the numeric pre/nextTokensError heuristics.
             fully_masked = atten_mask.all(dim=-1)
-            out_gpu = out_gpu.masked_fill(fully_masked[:, None, None], 0)
-            golden_lse_gpu[:, fully_masked] = torch.inf
+            out_gpu_ref = out_gpu_ref.masked_fill(fully_masked[:, None, None], 0)
+            out_gpu_pt = out_gpu_pt.masked_fill(fully_masked[:, None, None], 0)
+            golden_lse_gpu_ref[:, fully_masked] = torch.inf
+            golden_lse_gpu_pt[:, fully_masked] = torch.inf
             out_plain[fully_masked, :, :] = 0
             lse_plain[:, fully_masked] = torch.inf
         if is_causal_golden and atten_mask is not None:
             fully_masked = atten_mask.all(dim=-1)
-            out_gpu = out_gpu.masked_fill(fully_masked[:, None, None], 0)
-            golden_lse_gpu[:, fully_masked] = torch.inf
+            out_gpu_ref = out_gpu_ref.masked_fill(fully_masked[:, None, None], 0)
+            out_gpu_pt = out_gpu_pt.masked_fill(fully_masked[:, None, None], 0)
+            golden_lse_gpu_ref[:, fully_masked] = torch.inf
+            golden_lse_gpu_pt[:, fully_masked] = torch.inf
             out_plain[fully_masked, :, :] = 0
             lse_plain[:, fully_masked] = torch.inf
         if layout == "BSND":
-            golden_out_gpu_list.append(out_gpu)
-            golden_lseL_gpu[i:i+1] = golden_lse_gpu.reshape(1, num_heads, q_seqlen_per_batch)
+            golden_out_gpu_ref_list.append(out_gpu_ref)
+            golden_out_gpu_pt_list.append(out_gpu_pt)
+            golden_lseL_gpu_ref[i:i+1] = golden_lse_gpu_ref.reshape(1, num_heads, q_seqlen_per_batch)
+            golden_lseL_gpu_pt[i:i+1] = golden_lse_gpu_pt.reshape(1, num_heads, q_seqlen_per_batch)
             golden_out_plain_list.append(out_plain)
             golden_lseL[i:i+1] = lse_plain.reshape(1, num_heads, q_seqlen_per_batch)
         else:
-            golden_out_gpu_list.append(out_gpu)
-            golden_lseL_gpu[:, new_q_seqlen_list[i] : new_q_seqlen_list[i + 1]] = golden_lse_gpu.reshape(num_heads, q_seqlen_per_batch)
+            golden_out_gpu_ref_list.append(out_gpu_ref)
+            golden_out_gpu_pt_list.append(out_gpu_pt)
+            golden_lseL_gpu_ref[:, new_q_seqlen_list[i] : new_q_seqlen_list[i + 1]] = golden_lse_gpu_ref.reshape(num_heads, q_seqlen_per_batch)
+            golden_lseL_gpu_pt[:, new_q_seqlen_list[i] : new_q_seqlen_list[i + 1]] = golden_lse_gpu_pt.reshape(num_heads, q_seqlen_per_batch)
             golden_out_plain_list.append(out_plain)
             golden_lseL[:, new_q_seqlen_list[i] : new_q_seqlen_list[i + 1]] = lse_plain.reshape(num_heads, q_seqlen_per_batch)
     if layout == "BSND":
-        golden_out_gpu = torch.stack(golden_out_gpu_list, dim=0)
+        golden_out_gpu_ref = torch.stack(golden_out_gpu_ref_list, dim=0)
+        golden_out_gpu_pt = torch.stack(golden_out_gpu_pt_list, dim=0)
         golden_out = torch.stack(golden_out_plain_list, dim=0)
     else:
-        golden_out_gpu = torch.cat(golden_out_gpu_list, dim=0)
+        golden_out_gpu_ref = torch.cat(golden_out_gpu_ref_list, dim=0)
+        golden_out_gpu_pt = torch.cat(golden_out_gpu_pt_list, dim=0)
         golden_out = torch.cat(golden_out_plain_list, dim=0)
-    rtol = 1e-2
-    atol = 1e-2
-    torch.testing.assert_close(out_out.detach().cpu(), golden_out_gpu.detach().cpu(), rtol=rtol, atol=atol)
+    assert_fa_close(out_out, golden_out_gpu_ref, golden_out_gpu_pt, name="out")
     if "Ascend910" in name:
-        torch.testing.assert_close(softmax_lse.detach().cpu(), golden_lseL_gpu.cpu(), rtol=rtol, atol=atol)
-    _, r_golden_fa = compare_rule(golden_out_gpu.detach().cpu().float(), out_out.detach().cpu().float())
-    assert r_golden_fa, "Golden-GPU vs CANN check FAILED"
-    _, r_plain_cann = compare_rule(golden_out.detach().cpu().float(), out_out.detach().cpu().float())
-    assert r_plain_cann, "Golden vs CANN check FAILED"
+        assert_fa_close(softmax_lse, golden_lseL_gpu_ref, golden_lseL_gpu_pt, name="softmax_lse")
     if bwd_supported:
         dout = torch.rand_like(out_out) - 0.5
         dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
-        dq_golden, dk_golden, dv_golden = torch.autograd.grad(
-            golden_out_gpu,
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
+            golden_out_gpu_ref,
+            (query_ref, key_ref, value_ref),
+            dout.detach().cpu(),
+            retain_graph=True,
+        )
+        dq_pt, dk_pt, dv_pt = torch.autograd.grad(
+            golden_out_gpu_pt,
             (query_ref, key_ref, value_ref),
             dout.detach().cpu(),
         )
-        torch.testing.assert_close(dq_ag.detach().cpu(), dq_golden.cpu(), rtol=rtol, atol=atol)
-        torch.testing.assert_close(dk_ag.detach().cpu(), dk_golden.cpu(), rtol=rtol, atol=atol)
-        torch.testing.assert_close(dv_ag.detach().cpu(), dv_golden.cpu(), rtol=rtol, atol=atol)
+        assert_fa_close(dq_ag, dq_ref, dq_pt, name="dQ")
+        assert_fa_close(dk_ag, dk_ref, dk_pt, name="dK")
+        assert_fa_close(dv_ag, dv_ref, dv_pt, name="dV")
 
 @pytest.mark.parametrize("data_type", [torch.bfloat16])
 @pytest.mark.parametrize("num_heads", [32])

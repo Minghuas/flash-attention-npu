@@ -138,6 +138,50 @@ def ref_flash_attention(
     return go.to(dtype_og), lse
 
 
+def ref_flash_attention_pair(
+    query,
+    key,
+    value,
+    scale,
+    mask,
+    data_type,
+    softcap=0.0,
+    rescale_threshold=None,
+):
+    """调用两种 reference，返回 Tri Dao 双基准所需的四个结果。
+
+    ``ref`` 使用 float32 中间计算和原始运算顺序，``pt`` 使用输入 dtype
+    中间计算并调整运算顺序。``rescale_threshold`` 为 ``None`` 时使用普通
+    reference；需要分块 rescale 的版本可以传入对应阈值。
+    """
+    kwargs = {} if rescale_threshold is None else {"rescale_threshold": rescale_threshold}
+    out_ref, lse_ref = ref_flash_attention(
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        data_type,
+        softcap,
+        upcast=True,
+        reorder_ops=False,
+        **kwargs,
+    )
+    out_pt, lse_pt = ref_flash_attention(
+        query,
+        key,
+        value,
+        scale,
+        mask,
+        data_type,
+        softcap,
+        upcast=False,
+        reorder_ops=True,
+        **kwargs,
+    )
+    return out_ref, lse_ref, out_pt, lse_pt
+
+
 def masked_attention_sink(sim_high, sink_matrix, value_dtype):
     """计算带 sink token 分母的 attention 概率和 lse。"""
     sink_matrix = torch.as_tensor(sink_matrix, device=sim_high.device)

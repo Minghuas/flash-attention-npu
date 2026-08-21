@@ -13,13 +13,14 @@ from flash_attn_npu_3 import (
     flash_attn_with_kvcache,
     get_scheduler_metadata,
 )
-from tests.common.attention_ref import ref_flash_attention
+from tests.common.attention_ref import ref_flash_attention_pair
+from tests.common.compare import assert_fa_close
+from tests.common.test_utils import gather_paged_kv
 
-RTOL = 1e-2
-ATOL = 1e-2
+
 WINDOW_SIZE = (-1, -1)
 
-SMALL_RANGE = (-1.0, 1.0)
+SMALL_RANGE = (-5.0, 5.0)
 WIDE_RANGE = (-5.0, 5.0)
 
 
@@ -123,20 +124,17 @@ def _make_paged_cache(batch_size, kv_seqlen, kv_heads, head_size, block_size, da
 
 
 def _paged_kv_for_batch(key_cache_cpu, value_cache_cpu, page_table_cpu, batch_idx, kv_seqlen, block_size):
-    key_blocks = []
-    value_blocks = []
-    page_row = page_table_cpu[batch_idx]
-    for pos in range(kv_seqlen):
-        block_number = int(page_row[pos // block_size])
-        block_offset = pos % block_size
-        key_blocks.append(key_cache_cpu[block_number, block_offset])
-        value_blocks.append(value_cache_cpu[block_number, block_offset])
-    return torch.stack(key_blocks, dim=0), torch.stack(value_blocks, dim=0)
+    return gather_paged_kv(
+        key_cache_cpu,
+        value_cache_cpu,
+        page_table_cpu[batch_idx],
+        kv_seqlen,
+        block_size,
+    )
 
 
-def _ref_out_lse(query_cpu, key_cpu, value_cpu, scale, data_type, is_causal,
-                 window_size=WINDOW_SIZE, softcap=0.0):
-    output, lse = ref_flash_attention(
+def _ref_out_lse_pair(query_cpu, key_cpu, value_cpu, scale, data_type, is_causal):
+    output_ref, lse_ref, output_pt, lse_pt = ref_flash_attention_pair(
         query_cpu,
         key_cpu,
         value_cpu,
@@ -145,7 +143,12 @@ def _ref_out_lse(query_cpu, key_cpu, value_cpu, scale, data_type, is_causal,
         data_type,
         softcap=softcap,
     )
-    return output, lse.reshape(query_cpu.shape[1], query_cpu.shape[0])
+    return (
+        output_ref,
+        lse_ref.reshape(query_cpu.shape[1], query_cpu.shape[0]),
+        output_pt,
+        lse_pt.reshape(query_cpu.shape[1], query_cpu.shape[0]),
+    )
 
 
 def _assert_bsnd_matches_ref(
@@ -165,18 +168,23 @@ def _assert_bsnd_matches_ref(
     softcap=0.0,
 ):
     query_cpu = query.detach().cpu()
-    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
-    golden_lse = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    golden_out_ref = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_out_pt = torch.empty_like(golden_out_ref)
+    golden_lse_ref = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    golden_lse_pt = torch.empty_like(golden_lse_ref)
 
     for batch_idx in range(batch_size):
         key_cpu, value_cpu = kv_for_batch(batch_idx)
-        out, lse = _ref_out_lse(query_cpu[batch_idx], key_cpu, value_cpu, scale, data_type,
-                                is_causal, window_size, softcap)
-        golden_out[batch_idx] = out.reshape(q_seqlen, num_heads, head_size)
-        golden_lse[batch_idx] = lse
+        out_ref, lse_ref, out_pt, lse_pt = _ref_out_lse_pair(
+            query_cpu[batch_idx], key_cpu, value_cpu, scale, data_type, is_causal
+        )
+        golden_out_ref[batch_idx] = out_ref.reshape(q_seqlen, num_heads, head_size)
+        golden_out_pt[batch_idx] = out_pt.reshape(q_seqlen, num_heads, head_size)
+        golden_lse_ref[batch_idx] = lse_ref
+        golden_lse_pt[batch_idx] = lse_pt
 
-    torch.testing.assert_close(output_npu.cpu(), golden_out, rtol=RTOL, atol=ATOL)
-    torch.testing.assert_close(softmax_lse_npu.cpu(), golden_lse, rtol=RTOL, atol=ATOL)
+    assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="out")
+    assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, name="softmax_lse")
 
 
 def _assert_tnd_matches_ref(
@@ -196,23 +204,29 @@ def _assert_tnd_matches_ref(
     softcap=0.0,
 ):
     query_cpu = query.detach().cpu()
-    golden_out = torch.empty((q_offsets[-1], num_heads, head_size), dtype=data_type)
-    golden_lse = None
+    golden_out_ref = torch.empty((q_offsets[-1], num_heads, head_size), dtype=data_type)
+    golden_out_pt = torch.empty_like(golden_out_ref)
+    golden_lse_ref = None
+    golden_lse_pt = None
     if softmax_lse_npu is not None:
-        golden_lse = torch.empty((num_heads, q_offsets[-1]), dtype=torch.float32)
+        golden_lse_ref = torch.empty((num_heads, q_offsets[-1]), dtype=torch.float32)
+        golden_lse_pt = torch.empty_like(golden_lse_ref)
 
     for batch_idx in range(batch_size):
         q_start, q_end = q_offsets[batch_idx], q_offsets[batch_idx + 1]
         key_cpu, value_cpu = kv_for_batch(batch_idx)
-        out, lse = _ref_out_lse(query_cpu[q_start:q_end], key_cpu, value_cpu, scale, data_type,
-                                is_causal, window_size, softcap)
-        golden_out[q_start:q_end] = out.reshape(q_end - q_start, num_heads, head_size)
-        if golden_lse is not None:
-            golden_lse[:, q_start:q_end] = lse
+        out_ref, lse_ref, out_pt, lse_pt = _ref_out_lse_pair(
+            query_cpu[q_start:q_end], key_cpu, value_cpu, scale, data_type, is_causal
+        )
+        golden_out_ref[q_start:q_end] = out_ref.reshape(q_end - q_start, num_heads, head_size)
+        golden_out_pt[q_start:q_end] = out_pt.reshape(q_end - q_start, num_heads, head_size)
+        if golden_lse_ref is not None:
+            golden_lse_ref[:, q_start:q_end] = lse_ref
+            golden_lse_pt[:, q_start:q_end] = lse_pt
 
-    torch.testing.assert_close(output_npu.cpu(), golden_out, rtol=RTOL, atol=ATOL)
+    assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="out")
     if softmax_lse_npu is not None:
-        torch.testing.assert_close(softmax_lse_npu.cpu(), golden_lse, rtol=RTOL, atol=ATOL)
+        assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, name="softmax_lse")
 
 
 FLASH_ATTN_FUNC_CASES = [

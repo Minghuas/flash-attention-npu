@@ -8,10 +8,10 @@ if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count
     pytest.skip("get_scheduler_metadata not on Ascend950", allow_module_level=True)
 
 from flash_attn_npu_3 import flash_attn_with_kvcache, get_scheduler_metadata
-from tests.common.attention_ref import ref_flash_attention
+from tests.common.attention_ref import ref_flash_attention_pair
+from tests.common.compare import assert_fa_close
 
-RTOL = 1e-2
-ATOL = 1e-2
+
 DATA_TYPE = torch.bfloat16
 BATCH_SIZE = 1
 NUM_HEADS = 4
@@ -25,7 +25,7 @@ WINDOW_SIZE = (-1, -1)
 
 
 def _rand_npu(shape):
-    return (2 * torch.rand(shape) - 1).to(DATA_TYPE).npu()
+    return (-5.0 + 10.0 * torch.rand(shape)).to(DATA_TYPE).npu()
 
 
 def _run_flash_attn(
@@ -84,7 +84,7 @@ def test_flash_attn_kvcache_graph(is_causal):
             torch.ones(Q_SEQLEN, KV_SEQLEN),
             diagonal=KV_SEQLEN - Q_SEQLEN + 1,
         ).bool()
-    golden_out, _ = ref_flash_attention(
+    golden_out_ref, _, golden_out_pt, _ = ref_flash_attention_pair(
         query.cpu(),
         key_cache[0].cpu(),
         value_cache[0].cpu(),
@@ -122,4 +122,4 @@ def test_flash_attn_kvcache_graph(is_causal):
     graph.replay()
     torch.npu.synchronize()
 
-    torch.testing.assert_close(output_npu.cpu(), golden_out, rtol=RTOL, atol=ATOL)
+    assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="graph out")
