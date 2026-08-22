@@ -215,22 +215,59 @@ public:
 
     template <class TensorA>
     __aicore__ inline
-    void loadQGM(TensorA &gATensor, GemmCoord actualOriShape)
+    void loadQGM(TensorA &gATensor, GemmCoord actualOriShape,
+                 uint32_t qSBlockSize, uint32_t qNBlockSize,
+                 uint32_t physicalRowsPerAiv)
     {
         using CopyGmToL1A = typename TileCopy_::template CopyGmToL1A<TensorA>;
         CopyGmToL1A copyGmToL1A;
-        uint32_t rowNum = actualOriShape[0];
         uint32_t embed = actualOriShape[1];
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
-        auto l1ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(rowNum, embedPhysical);
+        uint32_t firstAivHeadCount = qNBlockSize == 1U ? 1U : qNBlockSize / 2U;
+        uint32_t secondAivHeadCount = qNBlockSize - firstAivHeadCount;
+        uint32_t l1Rows = qNBlockSize == 1U ? qSBlockSize : 2U * physicalRowsPerAiv;
+
+        // CopyGmToL1A derives dstNzNStride and dstNzC0Stride from the
+        // destination layout.  Keep the physical zN fractal strides while
+        // making adjacent N entries in one ND matrix qSBlockSize rows apart.
+        auto l1ALayoutTla = tla::MakeLayout(
+            tla::MakeShape(
+                tla::MakeShape(tla::Int<C0_ELEMS>{}, CeilDiv(l1Rows, tla::Int<C0_ELEMS>{})),
+                tla::MakeShape(tla::Int<C0_ELEMS>{}, CeilDiv(embedPhysical, tla::Int<C0_ELEMS>{}))),
+            tla::MakeStride(
+                tla::MakeStride(qSBlockSize * C0_ELEMS, tla::Int<C0_ELEMS * C0_ELEMS>{}),
+                tla::MakeStride(tla::Int<1>{},
+                    RoundUp(static_cast<int64_t>(l1Rows), tla::Int<C0_ELEMS>{}) * C0_ELEMS)),
+            tla::MakeShape(l1Rows, embedPhysical));
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
-        auto l1ATensorTlaTile = GetTile(l1ATensorTla,
-                tla::MakeCoord(0, 0), tla::MakeShape(rowNum, embed));
-        auto gATensorTlaTile = GetTile(gATensor,
-            tla::MakeCoord(0, 0), tla::MakeShape(rowNum, embed));
+
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-        copyGmToL1A(l1ATensorTlaTile, gATensorTlaTile);
-        
+        // Reinterpret each S slice as a [head, D] matrix. The source's
+        // inner (head) stride is D, while ndNum advances between S slices
+        // with the original BSND stride below.
+        auto gmFirstAivLayoutTla = tla::MakeLayout(
+            tla::MakeShape(firstAivHeadCount, embed),
+            tla::MakeStride(embed, tla::Int<1>{}));
+        auto gmFirstAivTensorTla = tla::MakeTensor(
+            gATensor.data(), gmFirstAivLayoutTla, Arch::PositionGM{});
+        auto l1FirstAivTile = GetTile(l1ATensorTla,
+            tla::MakeCoord(0, 0), tla::MakeShape(firstAivHeadCount, embed));
+        copyGmToL1A(l1FirstAivTile, gmFirstAivTensorTla,
+            qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
+
+        if (secondAivHeadCount > 0U) {
+            auto gmSecondAivLayoutTla = tla::MakeLayout(
+                tla::MakeShape(secondAivHeadCount, embed),
+                tla::MakeStride(embed, tla::Int<1>{}));
+            auto gmSecondAivTensorTla = tla::MakeTensor(
+                gATensor.data()[firstAivHeadCount * embed],
+                gmSecondAivLayoutTla, Arch::PositionGM{});
+            auto l1SecondAivTile = GetTile(l1ATensorTla,
+                tla::MakeCoord(physicalRowsPerAiv, 0), tla::MakeShape(secondAivHeadCount, embed));
+            copyGmToL1A(l1SecondAivTile, gmSecondAivTensorTla,
+                qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
+        }
+
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
     }
@@ -295,6 +332,7 @@ public:
                     uint32_t kvSTileIdx, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
                     uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink, 
                     uint32_t globalWindowSize, uint32_t localWindowSize,
+                    uint32_t qSBlockSize, uint32_t qNBlockSize,
                     Arch::CrossCoreFlag qkReadyFlag,
                     uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages)
     {

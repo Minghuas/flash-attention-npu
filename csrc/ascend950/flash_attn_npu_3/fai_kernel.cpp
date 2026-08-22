@@ -30,6 +30,7 @@
 #include "tla/tensor.hpp"
 #include "tla/layout.hpp"
 
+#include "kernel_common.hpp"
 #include "rescale_o.hpp"
 #include "online_softmax.hpp"
 #include "init_outputs.hpp"
@@ -183,11 +184,11 @@ public:
         Gemm::Block::BlockMmadPVTileHelper pvL1TileHelper(pvL1TileM_, pvL1TileN_, pvL1TileKLeft_, pvL1TileKRight_,
             pL1BufNum_, vL1BufNum_);
 
-        qkL0ATotalStages_ = CeilDiv(qBaseTile_, BlockMmadQK::L0_TILE_M) *
+        qkL0ATotalStages_ = CeilDiv(Q_M_TILE_MAX, BlockMmadQK::L0_TILE_M) *
             CeilDiv(embed_, BlockMmadQK::L0_TILE_K);
         qkL0BTotalStages_ = CeilDiv(kvBaseTile_, BlockMmadQK::L0_TILE_N) *
             CeilDiv(embed_, BlockMmadQK::L0_TILE_K);
-        pvL0ATotalStages_ = CeilDiv(qBaseTile_, BlockMmadPV::L0_TILE_M) *
+        pvL0ATotalStages_ = CeilDiv(Q_M_TILE_MAX, BlockMmadPV::L0_TILE_M) *
             CeilDiv(kvBaseTile_, BlockMmadPV::L0_TILE_K);
         pvL0BTotalStages_ = CeilDiv(kvBaseTile_, BlockMmadPV::L0_TILE_K) *
             CeilDiv(embedV_, BlockMmadPV::L0_TILE_N);
@@ -270,19 +271,31 @@ public:
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
                 }
-                curTotalTaskNum += (qSeqlen + qBaseTile_ - 1) / qBaseTile_ * qHeads_;
+                uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize,
+                    embedV_ > 128U);
+                uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
+                uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
+                curTotalTaskNum += (qSeqlen + qBaseTile_ - 1) / qBaseTile_ * qNTaskNum;
             }
             uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNum;
-            uint32_t qSTileIdx = taskIdxCurBatch / qHeads_;
-            uint32_t qHeadIdx = taskIdxCurBatch - qSTileIdx * qHeads_;
-            uint32_t kvHeadIdx = qHeadIdx / groupSize;
+            uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize,
+                embedV_ > 128U);
+            uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
+            uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
+            uint32_t qSTileIdx = taskIdxCurBatch / qNTaskNum;
+            uint32_t qNBlockIdx = taskIdxCurBatch - qSTileIdx * qNTaskNum;
+            uint32_t qNBlockIdxInGroup = qNBlockIdx % qNBlockNumPerGroup;
+            uint32_t kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
+            uint32_t qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
+            uint32_t qNBlockSize = AscendC::Std::min(
+                curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
             int64_t gmOffsetQ = 0;
             int64_t gmOffsetK = 0;
             int64_t gmOffsetV = 0;
             int64_t gmOffsetO = 0;
             int64_t qSOffset = qSTileIdx * qBaseTile_;
-            gmOffsetQ = qBOffset + qSOffset * strideQ + qHeadIdx * embed_;
-            gmOffsetO = oBOffset + qSOffset * strideO + qHeadIdx * embedV_;
+            gmOffsetQ = qBOffset + qSOffset * strideQ + qNStartIdx * embed_;
+            gmOffsetO = oBOffset + qSOffset * strideO + qNStartIdx * embedV_;
             int64_t kvSOffset = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache && kvcacheShape == PageShape::BnNBsD) {
                 strideK = embed_;
@@ -297,13 +310,34 @@ public:
                 gmOffsetV = vBOffset + static_cast<uint64_t>(kvHeadIdx * embedV_) * kvNumTokens;
             }
             uint32_t qsBlockNum =  (qSeqlen + qBaseTile_ - 1) / qBaseTile_;
-            uint32_t rowNum = qSTileIdx == qsBlockNum - 1 ? qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
+            uint32_t qSBlockSize = qSTileIdx == qsBlockNum - 1 ?
+                qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
+            uint32_t rowNum = qSBlockSize * qNBlockSize;
+            // QK is split to two AIVs.  Materialise each AIV's group at a
+            // pad-aligned L0C boundary so FixPipe can read the second group
+            // without crossing a fractal-M tile.  non-DN pads to 16; DN to 32.
+            uint32_t qkRowNum = rowNum;
+            uint32_t qkRowsPerAiv = 0U;
+            if (qNBlockSize > 1U) {
+                uint32_t firstAivRows = qSBlockSize * (qNBlockSize / 2U);
+                uint32_t secondAivRows = rowNum - firstAivRows;
+                uint32_t padUnit = 16U;
+                if constexpr (enableDN) {
+                    padUnit = 32U;
+                }
+                uint32_t firstAivRowsAligned = RoundUp(firstAivRows, padUnit);
+                uint32_t secondAivRowsAligned = RoundUp(secondAivRows, padUnit);
+                qkRowsPerAiv = firstAivRowsAligned > secondAivRowsAligned ?
+                    firstAivRowsAligned : secondAivRowsAligned;
+                qkRowNum = 2U * qkRowsPerAiv;
+            }
             uint32_t rowNumRound = 0;
             if constexpr (enableDN) {
-                rowNumRound = RoundUp(rowNum, 32);
+                rowNumRound = RoundUp(qkRowNum, 32U);
             } else {
-                rowNumRound = RoundUp(rowNum, 16);
+                rowNumRound = RoundUp(qkRowNum, 16U);
             }
+            uint32_t qkRowNumRound = rowNumRound;
             uint32_t kvSTileSizeAct = kvBaseTile_;
 
             uint32_t noSkipKvS = static_cast<uint32_t>(kvSeqlen);
@@ -317,15 +351,16 @@ public:
             }
 
             uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
-            uint32_t fullyMaskedRows = noSkipKvS < rowNum ? rowNum - noSkipKvS : 0;
+            uint32_t fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
             if (kvSLoopNum == 0) {
                 uint64_t qTokenOffset = static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
-                uint64_t lseOffset = qTokenOffset * qHeads_ + qHeadIdx;
+                uint64_t lseOffset = qTokenOffset * qHeads_ + qNStartIdx;
 #ifdef __DAV_VEC__
                 initOutputs(
                     gO[gmOffsetO],
                     gLse[lseOffset],
-                    rowNum,
+                    qSBlockSize,
+                    qNBlockSize,
                     qHeads_,
                     embedV_,
                     static_cast<uint32_t>(strideO));
@@ -343,9 +378,11 @@ public:
             
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
             if constexpr (enableDN) {
-                blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ);
+                blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ,
+                    qSBlockSize, qNBlockSize, qkRowsPerAiv);
             } else {
-                blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ);
+                blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ,
+                    qSBlockSize, qNBlockSize, qkRowsPerAiv);
             }
             uint32_t kShapeRow = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache) {
@@ -372,10 +409,10 @@ public:
                     } else {
                         kvSTileSizeAct = kvBaseTile_;
                     }
-                    GemmCoord actualBlockShapeQK{rowNum, kvSTileSizeAct, embed_};
+                    GemmCoord actualBlockShapeQK{qkRowNum, kvSTileSizeAct, embed_};
                     uint32_t ubSBufId = kvSTileIdx % UB_S_OTMP_BUF_STAGES;
                     int64_t stride = 64;
-                    auto ubSLayoutTla = tla::MakeLayout<ElementS, LayoutS>(rowNumRound, RoundUp(kvSTileSizeAct, ubSRoundTile));
+                    auto ubSLayoutTla = tla::MakeLayout<ElementS, LayoutS>(qkRowNumRound, RoundUp(kvSTileSizeAct, ubSRoundTile));
                     auto ubSLayoutTlaDN = tla::MakeLayout<ElementS, LayoutS>(RoundUp(kvSTileSizeAct, 16), 64);
                     auto ubSTensorTla = tla::MakeTensor(ubSTensor[ubSBufId], ubSLayoutTla, Arch::PositionUB{});
                     auto ubSTensorTlaDN = tla::MakeTensor(ubSTensor[ubSBufId], ubSLayoutTlaDN, Arch::PositionUB{});
@@ -395,6 +432,8 @@ public:
                             kvSTileIdx, 0, kvHeads_,
                             kvNumTokens,
                             kvBaseTile_, 0, 0, 0,
+                            qSBlockSize, 
+                            qNBlockSize,
                             qkReadyFlag,
                             prefixSumL0AStages, 
                             prefixSumL0BStages);
@@ -407,6 +446,8 @@ public:
                             kvSTileIdx, 0, kvHeads_,
                             kvNumTokens,
                             kvBaseTile_, 0, 0, 0,
+                            qSBlockSize, 
+                            qNBlockSize,
                             qkReadyFlag,
                             prefixSumL0AStages, 
                             prefixSumL0BStages);
@@ -418,14 +459,14 @@ public:
                     uint32_t l1PBufId = kvSTileIdx % pL1BufNum_;
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
-                    auto l1PLayoutTla = tla::MakeLayout<ElementP, Catlass::layout::zN>(rowNum, kvSTileSizeAct);
+                    auto l1PLayoutTla = tla::MakeLayout<ElementP, Catlass::layout::zN>(qkRowNum, kvSTileSizeAct);
                     auto l1PTensorTla = tla::MakeTensor(l1PTensor[l1PBufId],
                     l1PLayoutTla, Arch::PositionL1{});
 #ifdef __DAV_VEC__
                     if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                         auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
                         auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
-                        int64_t triUp = static_cast<int64_t>(noSkipKvS) - rowNum;
+                        int64_t triUp = static_cast<int64_t>(noSkipKvS) - qSBlockSize;
                         uint32_t triDown = noSkipKvS;
                         uint32_t kvSStartIdx = kvSTileIdx * kvBaseTile_;
                         uint32_t kvSEndIdx = kvSStartIdx + kvSTileSizeAct;
@@ -445,7 +486,9 @@ public:
                                 0, 0,
                                 kvSStartIdx,
                                 kvSEndIdx,
-                                1);
+                                1,
+                                qSBlockSize,
+                                qNBlockSize);
                         } else {
                             epilogueOnlineSoftmax(
                                 l1PTensorTla,
@@ -454,7 +497,9 @@ public:
                                 ubSBufId,
                                 l1PBufId,
                                 qkReadyFlag,
-                                softmaxReadyFlag);
+                                softmaxReadyFlag,
+                                qSBlockSize,
+                                qNBlockSize);
                         }
                     } else {
                         if constexpr (enableDN) {
@@ -465,7 +510,10 @@ public:
                                 ubSBufId,
                                 l1PBufId,
                                 qkReadyFlag,
-                                softmaxReadyFlag, 1);
+                                softmaxReadyFlag,
+                                1,
+                                qSBlockSize,
+                                qNBlockSize);
                         } else {
                             epilogueOnlineSoftmax(
                                 l1PTensorTla,
@@ -474,7 +522,9 @@ public:
                                 ubSBufId,
                                 l1PBufId,
                                 qkReadyFlag,
-                                softmaxReadyFlag);
+                                softmaxReadyFlag,
+                                qSBlockSize,
+                                qNBlockSize);
                         }
                     }
 #endif
@@ -486,12 +536,13 @@ public:
                     } else {
                         kvSTileSizeAct = kvBaseTile_;
                     }
-                    GemmCoord actualBlockShapePV{rowNum, embedV_, kvSTileSizeAct};
+                    GemmCoord actualBlockShapePV{qkRowNum, embedV_, kvSTileSizeAct};
                     uint32_t ubOTmpBufId = kvSTileIdxNow % UB_S_OTMP_BUF_STAGES;
                     uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__
                     uint32_t l1PBufId = kvSTileIdxNow % pL1BufNum_;
-                    auto ubOTmpLayoutTla = tla::MakeLayout<ElementOTmp, LayoutOTmp>(rowNumRound, embedVRound);
+                    uint32_t pvRowNumRound = rowNumRound;
+                    auto ubOTmpLayoutTla = tla::MakeLayout<ElementOTmp, LayoutOTmp>(pvRowNumRound, embedVRound);
                     auto ubOTmpTensorTla = tla::MakeTensor(ubOTmpTensor[ubOTmpBufId],
                         ubOTmpLayoutTla, Arch::PositionUB{});
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
@@ -515,22 +566,28 @@ public:
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint32_t curTileMod = kvSTileIdxNow % (PRE_LAUNCH + 1);
+                    uint64_t qTokenOffset = static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
+                    uint64_t lseOffset = qTokenOffset * qHeads_ + qNStartIdx;
                     if constexpr (enableDN) {
                         epilogueRescaleO(
-                            gmOTensorTla, actualBlockShapePV,
+                            gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
                             pvReadyFlag, 1,
-                            fullyMaskedRows);
+                            fullyMaskedRowsPerHead,
+                            qSBlockSize, qNBlockSize,
+                            static_cast<uint32_t>(strideO));
                     } else {
                         epilogueRescaleO(
-                            gmOTensorTla, actualBlockShapePV,
+                            gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
                             (kvSTileIdxNow == kvSLoopNum - 1),
                             pvReadyFlag, 0,
-                            fullyMaskedRows);
+                            fullyMaskedRowsPerHead,
+                            qSBlockSize, qNBlockSize,
+                            static_cast<uint32_t>(strideO));
                     }
 #endif
                 }
@@ -736,6 +793,7 @@ CATLASS_GLOBAL void FAInfer(
     using ElementK = InDtype;
     using ElementV = InDtype;
     using ElementS = SMDtype;
+    static_assert(std::is_same_v<SMDtype, float>);
     using ElementP = InDtype;
     using ElementO = InDtype;
     using ElementOTmp = float;
@@ -758,16 +816,11 @@ CATLASS_GLOBAL void FAInfer(
     using L1TileShapeQK = Shape<Int<Q_BLK>, Int<128>, Int<128>>;
     using L0TileShapeQK = Shape<Int<128>, Int<128>, Int<128>>;
     using DispatchPolicyQK = Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, false>;
-    using TileCopyQK = std::conditional_t<std::is_same_v<ElementS, half>, 
-                        Gemm::Tile::PackedTileCopyTlaToUB<
-                                    ArchTag, ElementQ, LayoutQ, ElementK, LayoutK, ElementS, LayoutS,
-                                    void, Gemm::Tile::CopyL0CToUBMode::NO_SPLIT>,
-                        Gemm::Tile::PackedTileCopyTlaToUB<
-                                    ArchTag, ElementQ, LayoutQ, ElementK, LayoutK, ElementS, LayoutS,
-                                    void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>>;
+    using TileCopyQK = Gemm::Tile::PackedTileCopyTlaToUB<
+        ArchTag, ElementQ, LayoutQ, ElementK, LayoutK, ElementS, LayoutS,
+        void, Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using BlockMmadQK = Gemm::Block::BlockMmadTla<
         DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementQ, ElementK, ElementS, void, TileCopyQK>;
-
    // Epilogue Block模块，实现Flash Attention Infer中当前S基块的softmax
     using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmax;
     using TileCopySoftmax = Epilogue::Tile::TileCopySoftmax<
@@ -815,38 +868,27 @@ CATLASS_GLOBAL void FAInferDn(
     using ElementK = InDtype;
     using ElementV = InDtype;
     using ElementS = SMDtype;
+    static_assert(std::is_same_v<SMDtype, float>);
     using ElementP = InDtype;
     using ElementO = InDtype;
     using ElementOTmp = float;
     using ElementMask = uint8_t;
-    // layout tags
     using LayoutK = layout::RowMajor;
     using LayoutQ = layout::ColumnMajor;
-    // S is rowMajor on UB(dst)
     using LayoutS = layout::RowMajor;
-    // P is actually zN on UB(src), since there is no nd2nz in MTE1
-    // To cater to the existing TileCopy class, a dummy rowMajor is used
     using LayoutPDummy = layout::zN;
     using LayoutV = layout::RowMajor;
     using LayoutO = layout::RowMajor;
-    // OTmp is rowMajor on UB(dst)
     using LayoutOTmp = layout::RowMajor;
-    // mask
     using LayoutMask = layout::RowMajor;
-    // 处理单个tile内Q和K的matmul
     using L1TileShapeQK = Shape<Int<128>, Int<Q_BLK>, Int<128>>;
     using L0TileShapeQK = Shape<Int<128>, Int<128>, Int<128>>;
     using DispatchPolicyQK = Gemm::MmadFlashAttentionQK<ArchTag, (bool)kvcacheType, (bool)cacheLayout, (bool)kvcacheShape, true>;
-    using TileCopyQK = std::conditional_t<std::is_same_v<ElementS, half>, 
-                        Gemm::Tile::PackedTileCopyTlaToUB<
-                                    ArchTag, ElementK, LayoutK, ElementQ, LayoutQ, ElementS, LayoutS,
-                                    void, Gemm::Tile::CopyL0CToUBMode::NO_SPLIT>,
-                        Gemm::Tile::PackedTileCopyTlaToUB<
-                                    ArchTag, ElementK, LayoutK, ElementQ, LayoutQ, ElementS, LayoutS,
-                                    void, Gemm::Tile::CopyL0CToUBMode::SPLIT_N>>;
+    using TileCopyQK = Gemm::Tile::PackedTileCopyTlaToUB<
+        ArchTag, ElementK, LayoutK, ElementQ, LayoutQ, ElementS, LayoutS,
+        void, Gemm::Tile::CopyL0CToUBMode::SPLIT_N>;
     using BlockMmadQK = Gemm::Block::BlockMmadTla<
         DispatchPolicyQK, L1TileShapeQK, L0TileShapeQK, ElementK, ElementQ, ElementS, void, TileCopyQK>;
-
    // Epilogue Block模块，实现Flash Attention Infer中当前S基块的softmax
     using DispatchPolicyOnlineSoftmax = Epilogue::EpilogueFAOnlineSoftmax;
     using TileCopySoftmax = Epilogue::Tile::TileCopySoftmax<

@@ -26,8 +26,7 @@ namespace fai_host
         key |= (dataType == "half" ? 0u : 1u) << 1;
         key |= (maskType == 1u ? 1u : 0u) << 2;
         key |= (maskType == 4u ? 1u : 0u) << 3;
-        const uint32_t ipBit = (dataType == "half") ? ((innerPrec == 1u) ? 1u : 0u) : 0u;
-        key |= ipBit << 4;
+        (void)innerPrec; // v3 supports FP32 QK scores only; kernel-key bit 4 stays clear.
         key |= (layout == Format::TND ? 0u : 1u) << 5;
         key |= (cacheMode == CacheMode::pagedCache ? 1u : 0u) << 6;
         const uint32_t psBit = (cacheMode == CacheMode::pagedCache)

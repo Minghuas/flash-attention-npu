@@ -24,6 +24,8 @@ constexpr int32_t Q_BLK = 256;
 constexpr int32_t MAX_STACK_LEN = 512;
 
 constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
+constexpr uint32_t Q_M_TILE_MAX = 128;
+constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
 
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
@@ -81,5 +83,69 @@ enum class CacheLayout : uint8_t
     nd = 0,
     nz = 1,
 };
+
+// The grouped-Q path keeps the logical M order as [head][S].  FixPipe owns a
+// private UB view per AIV, so its physical extent must be rounded *after*
+// logical ownership has been decided.  Do not replace this with
+// RoundUp(rowNum, align) / subBlockNum: that loses the head boundary for odd
+// groups and small S tiles.
+struct FAIGroupedRowPartition {
+    uint32_t logicalRowStart;
+    uint32_t storageRowStart;
+    uint32_t validRows;
+    uint32_t physicalRows;
+};
+
+__aicore__ inline FAIGroupedRowPartition GetFAIGroupedRowPartition(
+    uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t align)
+{
+    uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+    uint32_t subBlockNum = AscendC::GetSubBlockNum();
+    uint32_t rowNum = qSBlockSize * qNBlockSize;
+    uint32_t split = 0;
+    if (qNBlockSize == 1U) {
+        // Preserve the original single-head FixPipe partition: the M extent
+        // is aligned before splitting, so a 20-row tail is handled as 12+8,
+        // not 10+10.
+        split = (rowNum + align - 1U) / align * align / subBlockNum;
+        split = rowNum < split ? rowNum : split;
+    } else {
+        split = qSBlockSize * (qNBlockSize / subBlockNum);
+    }
+    uint32_t logicalRowStart = subBlockIdx == 0U ? 0U : split;
+    // QK/PV FixPipe splits grouped work into two equal physical M regions.
+    // non-DN pads each AIV half to 16 rows; DN pads each half to 32 rows.
+    // For an odd number of heads, AIV1 owns one more logical head; reserve
+    // both regions to the larger pad-aligned extent.
+    uint32_t storageRowStart = logicalRowStart;
+    if (qNBlockSize > 1U && subBlockIdx != 0U) {
+        uint32_t padUnit = align >= 32U ? 32U : 16U;
+        uint32_t firstPhysicalRows = ((split + padUnit - 1U) / padUnit) * padUnit;
+        uint32_t secondLogicalRows = rowNum - split;
+        uint32_t secondPhysicalRows =
+            ((secondLogicalRows + padUnit - 1U) / padUnit) * padUnit;
+        storageRowStart = firstPhysicalRows > secondPhysicalRows ?
+            firstPhysicalRows : secondPhysicalRows;
+    }
+    uint32_t validRows = subBlockIdx == 0U ? split : rowNum - split;
+    uint32_t physicalRows = (validRows + align - 1U) / align * align;
+    return {logicalRowStart, storageRowStart, validRows, physicalRows};
+}
+
+__aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
+                                          bool restrictMergedRowsForLargeD = false)
+{
+    uint32_t tile = qSeqlen == 0U ? Q_M_TILE_MAX :
+        (Q_M_TILE_MAX / qSeqlen) / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    if (restrictMergedRowsForLargeD && qSeqlen != 0U) {
+        constexpr uint32_t MAX_M_FOR_LARGE_D = Q_M_TILE_MAX / 2U;
+        uint32_t maxTile = MAX_M_FOR_LARGE_D / qSeqlen;
+        maxTile = maxTile > 0U ? maxTile : 1U;
+        tile = tile < maxTile ? tile : maxTile;
+    }
+    tile = tile < groupSize ? tile : groupSize;
+    return tile < 1U ? 1U : tile;
+}
+
 
 #endif

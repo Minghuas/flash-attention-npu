@@ -10,6 +10,9 @@
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
+#include <limits>
+#include <type_traits>
+#include "kernel_common.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "tla/tensor.hpp"
@@ -48,6 +51,8 @@ public:
     static constexpr uint32_t DM_UB_GLOBAL_ELEM_NUM = 64;
     static constexpr uint32_t RESCALE_ROW_MAX_ELEM_NUM = 64;
     static constexpr uint32_t RESCALE_COL_MAX_ELEM_NUM = 128;
+    static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
+    static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
 
     __aicore__ inline
     BlockEpilogue(Arch::Resource<ArchTag> &resource)
@@ -67,6 +72,8 @@ public:
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<ElementOTmp>(GO_UB_TENSOR_OFFSET);
         goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementO>(GO_UB_TENSOR_OFFSET);
         glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
+        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
+        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
     }
 
@@ -100,7 +107,8 @@ public:
                         bool isLastKvSTile,
                         Arch::CrossCoreFlag pvReadyFlag,
                         uint32_t zeroRowCount,
-                        uint32_t tailCols)
+                        uint32_t tailCols,
+                        bool skipOutput = false)
     {
         uint32_t rowNumCurSubCore = tla::get<0>(gOTensorTlaTile.shape());
         uint32_t colNumCurSubCore = tla::get<1>(gOTensorTlaTile.shape());
@@ -160,7 +168,101 @@ public:
                 tla::MakeStride(colStride, tla::Int<1>{})
             );
             auto ubOTensorTla = tla::MakeTensor(goUbTensor16, ubOLayoutTla, Arch::PositionUB{});
-            copyUbToGmO(gOTensorTlaTile, ubOTensorTla);
+            if (!skipOutput) {
+                copyUbToGmO(gOTensorTlaTile, ubOTensorTla);
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+    }
+
+    template <class TensorDst>
+    __aicore__ inline
+    void ScatterGroupedOutput(TensorDst &gOTensor, uint32_t qSBlockSize,
+                              uint32_t logicalRowStart, uint32_t rowCount,
+                              uint32_t embedV, uint32_t outputStride,
+                              uint32_t colStride, uint32_t fullyMaskedRowsPerHead)
+    {
+        uint32_t firstHead = logicalRowStart / qSBlockSize;
+        uint32_t headCount = rowCount / qSBlockSize;
+        auto gO = gOTensor.data();
+        for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
+            if (fullyMaskedRowsPerHead != 0U) {
+                AscendC::Duplicate(goUbTensor16[headLocal * qSBlockSize * colStride],
+                    static_cast<ElementO>(0), fullyMaskedRowsPerHead * colStride);
+            }
+            AscendC::DataCopyPad(
+                gO[(firstHead + headLocal) * embedV],
+                goUbTensor16[headLocal * qSBlockSize * colStride],
+                AscendC::DataCopyExtParams(qSBlockSize, embedV * sizeof(ElementO), 0,
+                    (outputStride - embedV) * sizeof(ElementO), 0));
+        }
+    }
+
+    // Keep LSE behind the final O GM write.  goUbTensor32 is free after the
+    // EVENT_ID4 wait, so it is a dedicated LSE expansion scratch and never
+    // aliases OnlineSoftmax's maskUb on the following task.
+    __aicore__ inline
+    void WriteGroupedLse(AscendC::GlobalTensor<float> gLse,
+                         uint32_t qSBlockSize, uint32_t qNBlockSize,
+                         uint32_t qHeads, uint32_t fullyMaskedRowsPerHead)
+    {
+        auto partition = GetFAIGroupedRowPartition(qSBlockSize, qNBlockSize, 8U);
+        uint32_t rowCount = partition.validRows;
+        if (rowCount == 0U) {
+            return;
+        }
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Ln<float, false>(lmUbTensor32, glUbTensor32, (uint64_t)0,
+            CeilDiv(rowCount, FLOAT_VECTOR_SIZE), AscendC::UnaryRepeatParams(1, 1, 8, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Add<float, false>(lmUbTensor32, lmUbTensor32, gmUbTensor32, (uint64_t)0,
+            CeilDiv(rowCount, FLOAT_VECTOR_SIZE), AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Brcb(goUbTensor32.template ReinterpretCast<uint32_t>(),
+            lmUbTensor32.template ReinterpretCast<uint32_t>(),
+            CeilDiv(rowCount, FLOAT_BLOCK_SIZE), AscendC::BrcbRepeatParams(1, 8));
+        AscendC::PipeBarrier<PIPE_V>();
+        // Follow Ascend910's InvalidLineLSEProcess convention: Brcb expands
+        // every scalar LSE to one 32-byte block.  Mark invalid rows in that
+        // block-expanded view so every vector destination is naturally aligned.
+        if (fullyMaskedRowsPerHead != 0U) {
+            if (qNBlockSize == 1U) {
+                uint32_t firstLocalS = partition.logicalRowStart % qSBlockSize;
+                if (firstLocalS < fullyMaskedRowsPerHead) {
+                    uint32_t maskedRows = fullyMaskedRowsPerHead - firstLocalS;
+                    maskedRows = maskedRows < rowCount ? maskedRows : rowCount;
+                    AscendC::Duplicate(goUbTensor32, std::numeric_limits<float>::infinity(),
+                        maskedRows * FLOAT_BLOCK_SIZE);
+                }
+            } else {
+                uint32_t headCount = rowCount / qSBlockSize;
+                uint32_t maskedRows = fullyMaskedRowsPerHead < qSBlockSize ?
+                    fullyMaskedRowsPerHead : qSBlockSize;
+                for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
+                    AscendC::Duplicate(goUbTensor32[headLocal * qSBlockSize * FLOAT_BLOCK_SIZE],
+                        std::numeric_limits<float>::infinity(), maskedRows * FLOAT_BLOCK_SIZE);
+                }
+            }
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+        constexpr uint32_t LSE_EXPANDED_SRC_GAP =
+            (FLOAT_BLOCK_SIZE - 1U) * sizeof(float);
+        if (qNBlockSize == 1U) {
+            AscendC::DataCopyPad(gLse[partition.logicalRowStart * qHeads], goUbTensor32,
+                AscendC::DataCopyExtParams(rowCount, sizeof(float), LSE_EXPANDED_SRC_GAP,
+                    (qHeads - 1U) * sizeof(float), 0));
+        } else {
+            uint32_t firstHead = partition.logicalRowStart / qSBlockSize;
+            uint32_t headCount = rowCount / qSBlockSize;
+            for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
+                AscendC::DataCopyPad(gLse[firstHead + headLocal],
+                    goUbTensor32[headLocal * qSBlockSize * FLOAT_BLOCK_SIZE],
+                    AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), LSE_EXPANDED_SRC_GAP,
+                        (qHeads - 1U) * sizeof(float), 0));
+            }
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
     }
@@ -438,6 +540,7 @@ public:
     template <class TensorDst>
     __aicore__ inline
     void operator()(TensorDst &gOTensor,
+                    AscendC::GlobalTensor<float> gLse,
                     GemmCoord actualOriShape,
                     uint32_t curTileMod,
                     uint32_t gatheredKvSTileIdx,
@@ -445,62 +548,79 @@ public:
                     bool isLastKvSTile,
                     Arch::CrossCoreFlag pvReadyFlag,
                     bool isDN,
-                    uint32_t fullyMaskedRows)
+                    uint32_t fullyMaskedRowsPerHead,
+                    uint32_t qSBlockSize,
+                    uint32_t qNBlockSize,
+                    uint32_t outputStride)
     {
         uint32_t rowNumOri = actualOriShape[0];
         uint32_t colNumOri = actualOriShape[1];
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
 
-        uint32_t rowNumOriAligned = isDN ? RoundUp(rowNumOri, 32) : RoundUp(rowNumOri, 8);
         uint32_t colNumOriAligned16 = RoundUp(colNumOri, 16);
-
-        uint32_t rowNumSplit = rowNumOriAligned / subBlockNum;
-        rowNumSplit = (rowNumOri < rowNumSplit) ? rowNumOri : rowNumSplit;
-        uint32_t rowNumCurSubCore = (subBlockIdx == 0) ? rowNumSplit : (rowNumOri - rowNumSplit);
-        uint32_t rowOffsetCurSubCore = rowNumSplit * subBlockIdx;
+        auto partition = GetFAIGroupedRowPartition(qSBlockSize, qNBlockSize, isDN ? 32U : 8U);
+        uint32_t rowNumCurSubCore = partition.validRows;
+        uint32_t rowOffsetCurSubCore = partition.logicalRowStart;
         uint32_t colNumCurSubCore = colNumOri;
         uint32_t colStrideCurSubCore = colNumOriAligned16;
         uint32_t zeroRowCount = 0;
-        if (rowOffsetCurSubCore < fullyMaskedRows) {
-            uint32_t remainingRows = fullyMaskedRows - rowOffsetCurSubCore;
+        if (qNBlockSize == 1U && rowOffsetCurSubCore < fullyMaskedRowsPerHead) {
+            uint32_t remainingRows = fullyMaskedRowsPerHead - rowOffsetCurSubCore;
             zeroRowCount = remainingRows < rowNumCurSubCore ? remainingRows : rowNumCurSubCore;
         }
 
+        // For qN>1 the final GM addresses are not affine in logical M.  The
+        // tile below supplies only shape to SubCoreCompute; final output uses
+        // ScatterGroupedOutput after the per-AIV computation finishes.
         auto gOTensorTlaTile = GetTile(gOTensor,
-            tla::MakeCoord(rowOffsetCurSubCore, 0), tla::MakeShape(rowNumCurSubCore, colNumCurSubCore));
+            tla::MakeCoord(qNBlockSize == 1U ? rowOffsetCurSubCore : 0U, 0),
+            tla::MakeShape(rowNumCurSubCore, colNumCurSubCore));
         uint32_t ubOTmpBufId = gatheredKvSTileIdx % UB_OTMP_BUF_STAGES;
         uint32_t vlElemNum = AscendC::GetVecLen() / sizeof(ElementOTmp);
         bool headdimAligned64 = (colNumOri % 64 == 0);
         if (rowNumCurSubCore > 0) {
             if (colNumCurSubCore <= vlElemNum) {
                 if (headdimAligned64) {
-                    SubCoreCompute<64, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore);
+                    SubCoreCompute<64, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore, qNBlockSize > 1U);
                 } else {
-                    SubCoreCompute<64, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore);
+                    SubCoreCompute<64, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore, qNBlockSize > 1U);
                 }
             } else if (colNumCurSubCore <= 2 * vlElemNum) {
                 if (headdimAligned64) {
-                    SubCoreCompute<128, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum);
+                    SubCoreCompute<128, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum, qNBlockSize > 1U);
                 } else {
-                    SubCoreCompute<128, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum);
+                    SubCoreCompute<128, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum, qNBlockSize > 1U);
                 }
             } else if (colNumCurSubCore <= 3 * vlElemNum) {
                 if (headdimAligned64) {
-                    SubCoreCompute<192, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum);
+                    SubCoreCompute<192, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum, qNBlockSize > 1U);
                 } else {
-                    SubCoreCompute<192, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum);
+                    SubCoreCompute<192, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum, qNBlockSize > 1U);
                 }
             } else {
                 if (headdimAligned64) {
-                    SubCoreCompute<256, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum);
+                    SubCoreCompute<256, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum, qNBlockSize > 1U);
                 } else {
-                    SubCoreCompute<256, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum);
+                    SubCoreCompute<256, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum, qNBlockSize > 1U);
                 }
             }
         } else {
             Arch::CrossCoreWaitFlag<4, PIPE_V>(pvReadyFlag);
             Arch::CrossCoreSetFlag<4, PIPE_V>(pvReadyFlag);
+        }
+        if (qNBlockSize > 1U && rowNumCurSubCore > 0U && isLastKvSTile) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+            ScatterGroupedOutput(gOTensor, qSBlockSize, rowOffsetCurSubCore,
+                rowNumCurSubCore, colNumOri, outputStride, colStrideCurSubCore,
+                fullyMaskedRowsPerHead);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
+        }
+        if constexpr (std::is_same_v<SMDtype, float>) {
+            if (rowNumCurSubCore > 0U && isLastKvSTile) {
+                WriteGroupedLse(gLse, qSBlockSize, qNBlockSize, outputStride / colNumOri,
+                    fullyMaskedRowsPerHead);
+            }
         }
     }
 private:
@@ -509,6 +629,8 @@ private:
     AscendC::LocalTensor<SMDtype> glUbTensor16;
     AscendC::LocalTensor<float> dmUbTensor32;
     AscendC::LocalTensor<float> glUbTensor32;
+    AscendC::LocalTensor<float> lmUbTensor32;
+    AscendC::LocalTensor<float> gmUbTensor32;
     AscendC::LocalTensor<ElementO> goUbTensor16;
     AscendC::LocalTensor<ElementOTmp> goUbTensor32;
 
