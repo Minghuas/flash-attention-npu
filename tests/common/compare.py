@@ -1,15 +1,16 @@
 # Copyright (c) 2026, Minghua Shen.
 
-"""Attention 测试共用的数值比较规则。"""
+"""Numerical comparison rules shared by the attention tests."""
 
 import torch
 
 
 def assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
-    """按照 Tri Dao 的双基准规则比较实现结果。
+    """Compare implementation results using Tri Dao's dual-reference rule.
 
-    ``ref`` 是高精度 reference，``pt`` 是 PyTorch 基准；两者之间的最大差异
-    用于估计数值误差范围：``max|actual - ref| <= rtol * max|pt - ref| + 2 * ULP(ref)``。
+    ``ref`` is the high-precision reference and ``pt`` is the PyTorch baseline.
+    Their maximum difference estimates the numerical error range:
+    ``max|actual - ref| <= rtol * max|pt - ref| + 2 * ULP(ref)``.
     """
     actual = actual.detach().cpu()
     ref = ref.detach().cpu()
@@ -22,7 +23,8 @@ def assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
         assert ref.numel() == 0 and pt.numel() == 0, f"{name}: empty shape mismatch"
         return
 
-    # NaN 一律视为错误；共同的 inf 则先做精确的语义比较，不能参与减法。
+    # Always reject NaNs. Compare matching infinities semantically before any
+    # subtraction because infinities cannot participate in the error metric.
     assert not torch.isnan(actual).any(), f"{name}: actual contains NaN"
     assert not torch.isnan(ref).any(), f"{name}: ref contains NaN"
     assert not torch.isnan(pt).any(), f"{name}: pt contains NaN"
@@ -38,7 +40,8 @@ def assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
         )
         assert torch.equal(pt[ref_inf], ref[ref_inf]), f"{name}: pt/ref inf value mismatch"
 
-    # 混合 finite / inf 的 tensor 只在有限元素上做数值误差比较。
+    # For tensors mixing finite values and infinities, compare numerical error
+    # only over the finite elements.
     finite = torch.isfinite(ref)
     if not finite.any():
         return
@@ -47,13 +50,32 @@ def assert_fa_close(actual, ref, pt, *, softcap=0.0, name="out"):
     pt = pt[finite]
 
     rtol = 3.0 if softcap != 0.0 else 2.0
-    # 必须在 ref 原始 dtype 上计算 ULP，先转 float32 会丢失 fp16/bf16
-    # 实际需要测量的 ULP。
+    # Compute ULP in ref's original dtype. Converting to float32 first would
+    # lose the fp16/bf16 ULP that this check must measure.
     ulp = (ref + 0.3 - 0.3 - ref).abs().max().item()
     diff = (actual - ref).abs()
     max_diff = diff.max().item()
     pt_diff = (pt - ref).abs().max().item()
-    tolerance = rtol * pt_diff + 2.0 * ulp
+    # When both references match exactly (pt_diff=0) and ref is near zero, the
+    # tolerance above collapses to ~0 and cannot cover the implementation's own
+    # ULP noise (for example, dQ around 1e-6). Add an absolute lower bound.
+    tolerance = max(rtol * pt_diff + 2.0 * ulp, 1e-5)
+    # Temporary diagnostics: report the number of failures (isolated element
+    # versus a full row), their locations, and the surrounding window.
+    if max_diff > tolerance:
+        idx = (diff == max_diff).nonzero()
+        fi = idx[0].item()
+        num_bad = int((diff > tolerance).sum())
+        num_loose = int((diff > max(0.5, tolerance)).sum())
+        total = actual.numel()
+        lo = max(0, fi - 3)
+        hi = min(total, fi + 4)
+        print(f"  [DEBUG] {name}: shape={tuple(actual.shape)} "
+              f"num_bad(>{tolerance:.3g})={num_bad} num_loose(>0.5)={num_loose}")
+        print(f"    max_diff={max_diff} flat={fi}/{total} ({100.0*fi/total:.1f}%) "
+              f"actual={actual[fi].item()} ref={ref[fi].item()} pt={pt[fi].item()}")
+        print(f"    actual[{lo}:{hi}]={actual[lo:hi].tolist()}")
+        print(f"    ref   [{lo}:{hi}]={ref[lo:hi].tolist()}")
     assert max_diff <= tolerance, (
         f"{name}: max|actual-ref|={max_diff} exceeds "
         f"{rtol} * max|pt-ref|={pt_diff} + 2*ULP(ref)={2.0 * ulp} "

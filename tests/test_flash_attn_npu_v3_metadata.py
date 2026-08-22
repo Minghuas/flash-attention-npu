@@ -137,13 +137,13 @@ def _assert_bsnd_matches_ref(
         key_cpu,
         value_cpu,
         scale,
-        _causal_mask(q_seqlen, key_cpu.shape[1], is_causal),
+        _attn_mask(q_seqlen, key_cpu.shape[1], is_causal, window_size),
         data_type,
-        softcap=0.0,
+        softcap=softcap,
     )
 
-    assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="out")
-    assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, name="softmax_lse")
+    assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
+    assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse")
 
 
 def _assert_tnd_matches_ref(
@@ -166,18 +166,18 @@ def _assert_tnd_matches_ref(
     key_cpu, value_cpu = kv_batched
     key_cpu = key_cpu.reshape(batch_size, key_cpu.shape[1], key_cpu.shape[2], key_cpu.shape[3])
     value_cpu = value_cpu.reshape_as(key_cpu)
-    mask = _causal_mask(q_offsets[1], key_cpu.shape[1], is_causal)
+    mask = _attn_mask(q_offsets[1], key_cpu.shape[1], is_causal, window_size)
     golden_out_ref, golden_lse_batched_ref, golden_out_pt, golden_lse_batched_pt = ref_flash_attention_pair(
-        query_cpu, key_cpu, value_cpu, scale, mask, data_type, softcap=0.0
+        query_cpu, key_cpu, value_cpu, scale, mask, data_type, softcap=softcap
     )
     golden_out_ref = golden_out_ref.reshape(q_offsets[-1], num_heads, head_size)
     golden_out_pt = golden_out_pt.reshape(q_offsets[-1], num_heads, head_size)
     golden_lse_ref = golden_lse_batched_ref.permute(1, 0, 2).reshape(num_heads, q_offsets[-1])
     golden_lse_pt = golden_lse_batched_pt.permute(1, 0, 2).reshape(num_heads, q_offsets[-1])
 
-    assert_fa_close(output_npu, golden_out_ref, golden_out_pt, name="out")
+    assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
     if softmax_lse_npu is not None:
-        assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, name="softmax_lse")
+        assert_fa_close(softmax_lse_npu, golden_lse_ref, golden_lse_pt, softcap=softcap, name="softmax_lse")
 
 
 FLASH_ATTN_FUNC_CASES = [
@@ -464,7 +464,7 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
     q_seqlen, kv_seqlen, head_size, block_size = 1, 1024, 128, 128
     data_type = torch.bfloat16
 
-    query = _rand_npu((q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    query = make_random_tensor((q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -502,16 +502,24 @@ def test_flash_attn_kvcache_metadata_flash_decode(is_causal):
         return_softmax_lse=True,
     )
 
-    key_cpu, value_cpu = _paged_kv_for_batch(
-        key_cache.cpu(), value_cache.cpu(), page_table.cpu(), 0, kv_seqlen, block_size
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    page_table_cpu = page_table.cpu()
+    _assert_bsnd_matches_ref(
+        output_npu.reshape(batch_size, q_seqlen, num_heads, head_size),
+        softmax_lse_npu.reshape(batch_size, num_heads, q_seqlen),
+        query.reshape(batch_size, q_seqlen, num_heads, head_size),
+        gather_paged_kv_batch(
+            key_cache_cpu, value_cache_cpu, page_table_cpu, kv_seqlen, block_size
+        ),
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        data_type=data_type,
+        is_causal=is_causal,
     )
-    golden_out, golden_lse = _ref_out_lse(
-        query.cpu(), key_cpu, value_cpu, scale, data_type, is_causal
-    )
-    torch.testing.assert_close(
-        output_npu.cpu().reshape(q_seqlen, num_heads, head_size), golden_out, rtol=RTOL, atol=ATOL
-    )
-    torch.testing.assert_close(softmax_lse_npu.cpu(), golden_lse, rtol=RTOL, atol=ATOL)
 
 
 
@@ -556,9 +564,9 @@ def test_flash_attn_func_metadata_swa(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size,
     metadata_spy,
 ):
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, WIDE_RANGE)
-    key = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
-    value = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, device="npu")
+    key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
+    value = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
     scale = 1.0 / (head_size ** 0.5)
 
     output_npu, softmax_lse_npu = flash_attn_func(
@@ -579,7 +587,7 @@ def test_flash_attn_func_metadata_swa(
         output_npu,
         softmax_lse_npu,
         query,
-        lambda batch_idx: (key_cpu[batch_idx], value_cpu[batch_idx]),
+        (key_cpu, value_cpu),
         batch_size=batch_size,
         q_seqlen=q_seqlen,
         num_heads=num_heads,
@@ -599,9 +607,9 @@ def test_flash_attn_func_metadata_softcap_scale(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     is_causal, softcap, softmax_scale, metadata_spy,
 ):
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, WIDE_RANGE)
-    key = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
-    value = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, device="npu")
+    key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
+    value = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
     scale = softmax_scale if softmax_scale is not None else 1.0 / (head_size ** 0.5)
 
     output_npu, softmax_lse_npu = flash_attn_func(
@@ -623,7 +631,7 @@ def test_flash_attn_func_metadata_softcap_scale(
         output_npu,
         softmax_lse_npu,
         query,
-        lambda batch_idx: (key_cpu[batch_idx], value_cpu[batch_idx]),
+        (key_cpu, value_cpu),
         batch_size=batch_size,
         q_seqlen=q_seqlen,
         num_heads=num_heads,
@@ -650,9 +658,9 @@ def test_flash_attn_varlen_func_metadata_swa(
     cu_seqlens_q = _int32_npu(q_offsets)
     cu_seqlens_k = _int32_npu(kv_offsets)
 
-    query = _rand_npu((q_offsets[-1], num_heads, head_size), data_type, WIDE_RANGE)
-    key = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
-    value = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
+    query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
+    key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
+    value = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
     scale = 1.0 / (head_size ** 0.5)
 
     output_npu = flash_attn_varlen_func(
@@ -676,10 +684,8 @@ def test_flash_attn_varlen_func_metadata_swa(
         output_npu,
         None,
         query,
-        lambda batch_idx: (
-            key_cpu[kv_offsets[batch_idx]:kv_offsets[batch_idx + 1]],
-            value_cpu[kv_offsets[batch_idx]:kv_offsets[batch_idx + 1]],
-        ),
+        (key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+         value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size)),
         q_offsets=q_offsets,
         batch_size=batch_size,
         num_heads=num_heads,
@@ -699,7 +705,7 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
     data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size,
     block_size, is_causal, window_size, softcap
 ):
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -744,8 +750,8 @@ def test_flash_attn_kvcache_metadata_swa_softcap(
         output_npu,
         softmax_lse_npu,
         query,
-        lambda batch_idx: _paged_kv_for_batch(
-            key_cache_cpu, value_cache_cpu, page_table_cpu, batch_idx, kv_seqlen, block_size
+        gather_paged_kv_batch(
+            key_cache_cpu, value_cache_cpu, page_table_cpu, kv_seqlen, block_size
         ),
         batch_size=batch_size,
         q_seqlen=q_seqlen,
@@ -775,7 +781,7 @@ def test_flash_attn_kvcache_metadata_mask_mismatch_rejected(
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -814,7 +820,7 @@ def test_flash_attn_kvcache_metadata_paged_mismatch_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -861,7 +867,7 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -897,7 +903,7 @@ def test_flash_attn_kvcache_metadata_unfingerprinted_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )
@@ -933,7 +939,7 @@ def test_flash_attn_kvcache_metadata_size_mismatch_rejected():
     batch_size, num_heads, kv_heads = 1, 2, 2
     q_seqlen, kv_seqlen, head_size, block_size = 512, 512, 128, 128
 
-    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, SMALL_RANGE)
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
     key_cache, value_cache, page_table = _make_paged_cache(
         batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
     )

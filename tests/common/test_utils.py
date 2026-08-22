@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Minghua Shen.
 
-"""Attention 测试共用的数据、分页 KV 与 mask 构造工具。"""
+"""Shared data, paged-KV, and mask construction utilities for attention tests."""
 
 import torch
 
@@ -17,10 +17,10 @@ def make_random_tensor(
     device=None,
     requires_grad=False,
 ):
-    """生成测试用随机 tensor，统一 dtype、范围、设备和 grad 设置。
+    """Create a random test tensor with consistent dtype, range, device, and grad settings.
 
-    随机数先在 CPU 上生成，再移动到目标设备，以保持现有测试的随机数
-    顺序和可复现性。
+    Random values are generated on CPU before moving to the target device to
+    preserve the existing random-number order and reproducibility.
     """
     tensor = low + (high - low) * torch.rand(shape, generator=generator)
     tensor = tensor.to(data_type)
@@ -43,11 +43,11 @@ def make_attention_inputs(
     device=None,
     requires_grad=(True, True, True),
 ):
-    """统一生成 Attention 的 Q、K、V 和反向输入 dout。
+    """Create attention Q, K, V, and backward dout inputs consistently.
 
-    Q/K/V 默认使用 ``[-5, 5]``，dout 默认使用 ``[-1, 1]``。三个输入的
-    shape 由调用方提供，因此 BSND、TND packed 和 paged KV 都可以复用；
-    paged KV 的 block table 仍由对应测试单独构造。
+    Q/K/V use ``[-5, 5]`` by default, while dout uses ``[-1, 1]``. The caller
+    supplies all input shapes, allowing reuse for BSND, packed TND, and paged
+    KV. Each paged-KV test still constructs its own block table.
     """
     query = make_random_tensor(
         query_shape,
@@ -82,10 +82,11 @@ def make_attention_inputs(
 
 
 def make_cu_seqlens(seqlens):
-    """把每个 batch 的序列长度转换为 int32 累积偏移。
+    """Convert per-batch sequence lengths to cumulative int32 offsets.
 
-    返回长度为 ``len(seqlens) + 1`` 的 CPU tensor，首元素为 0，末元素为
-    所有序列长度之和，可直接作为变长 Attention 的 ``cu_seqlens``。
+    Returns a CPU tensor of length ``len(seqlens) + 1`` whose first element is
+    zero and whose last element is the sum of all sequence lengths. It can be
+    passed directly as ``cu_seqlens`` for variable-length attention.
     """
     cu = torch.zeros(len(seqlens) + 1, dtype=torch.int32)
     for i, seqlen in enumerate(seqlens, start=1):
@@ -94,11 +95,12 @@ def make_cu_seqlens(seqlens):
 
 
 def make_varlen_seqlens(batch_size, max_seqlen_q, max_seqlen_k, seed=CASE_SEED):
-    """生成可复现的变长 Q/KV 序列长度。
+    """Generate reproducible variable Q/KV sequence lengths.
 
-    按 Tri Dao 测试方式生成接近最大长度的随机有效长度，范围为
-    ``[max_seqlen - 20, max_seqlen]``。返回两个 Python list，分别保存 Q 与 KV 长度。
-    独立 generator 保证长度不受测试中其他随机 tensor 的生成顺序影响。
+    Following Tri Dao's tests, valid lengths are sampled near the maximum from
+    ``[max_seqlen - 20, max_seqlen]``. Returns separate Python lists for Q and
+    KV lengths. A dedicated generator keeps these lengths independent of the
+    order in which other random tensors are created.
     """
     generator = torch.Generator().manual_seed(seed)
     min_q = max(1, max_seqlen_q - 20)
@@ -126,7 +128,7 @@ def make_packed_random_tensor(
     device=None,
     requires_grad=False,
 ):
-    """按 Tri Dao 的 padded -> unpad 流程生成 TND 随机输入。"""
+    """Generate random TND inputs using Tri Dao's padded-to-unpadded flow."""
     padded = make_random_tensor(
         (len(seqlens), max_seqlen, num_heads, head_size),
         data_type,
@@ -140,7 +142,7 @@ def make_packed_random_tensor(
 
 
 def pad_packed_tensor(packed, seqlens, max_seqlen):
-    """按 ``seqlens`` 将 TND packed tensor 恢复为 padded 四维 tensor。"""
+    """Restore a packed TND tensor to a padded 4D tensor using ``seqlens``."""
     valid = torch.arange(max_seqlen, device=packed.device) < torch.as_tensor(
         seqlens, device=packed.device
     )[:, None]
@@ -154,10 +156,11 @@ def pad_packed_tensor(packed, seqlens, max_seqlen):
 
 
 def make_block_table(batch_size, kv_seqlen, block_size):
-    """生成每个 batch 使用连续物理块的分页 KV 索引表。
+    """Create a paged-KV index table with contiguous physical blocks per batch.
 
-    返回形状为 ``[batch_size, ceil(kv_seqlen / block_size)]`` 的 int32 CPU
-    tensor。每行对应一个 batch，物理块编号连续且不同 batch 之间不重叠。
+    Returns an int32 CPU tensor shaped
+    ``[batch_size, ceil(kv_seqlen / block_size)]``. Each row represents one
+    batch, with contiguous physical block indices that do not overlap batches.
     """
     blocks_per_sequence = (kv_seqlen + block_size - 1) // block_size
     return torch.arange(
@@ -166,12 +169,33 @@ def make_block_table(batch_size, kv_seqlen, block_size):
     ).reshape(batch_size, blocks_per_sequence)
 
 
-def gather_paged_kv(key_cache, value_cache, block_table_row, kv_seqlen, block_size):
-    """按单个 batch 的分页索引还原有效长度内的 K/V。
+def make_paged_kv_cache(batch_size, kv_seqlen, block_size, kv_heads, head_size, data_type,
+                        *, device="npu", requires_grad=False, generator=None):
+    """Allocate paged K/V caches matching ``make_block_table``'s block count.
 
-    ``key_cache`` 和 ``value_cache`` 的前两维为物理块与块内偏移；
-    ``block_table_row`` 给出逻辑块对应的物理块编号。返回的 K/V 第一维均为
-    ``kv_seqlen``，向量化索引会保留输入 cache 所需的 autograd 链路。
+    ``make_block_table`` assigns ``ceil(kv_seqlen/block_size)`` physical blocks
+    to each batch, so the cache must contain
+    ``batch_size * ceil(kv_seqlen/block_size)`` blocks. Otherwise, long-KV
+    cases such as Tri Dao's ``(1, 131072)`` can make the block table reference
+    nonexistent blocks, causing a kernel-side DDR overrun (AICore exception
+    0x800000) and cascading failures in later cases.
+    """
+    num_blocks = batch_size * ((kv_seqlen + block_size - 1) // block_size)
+    key_cache = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type,
+                                   generator=generator, device=device, requires_grad=requires_grad)
+    value_cache = make_random_tensor((num_blocks, block_size, kv_heads, head_size), data_type,
+                                     generator=generator, device=device, requires_grad=requires_grad)
+    return key_cache, value_cache
+
+
+def gather_paged_kv(key_cache, value_cache, block_table_row, kv_seqlen, block_size):
+    """Gather valid-length K/V values from paged indices for one batch.
+
+    The first two dimensions of ``key_cache`` and ``value_cache`` are the
+    physical block and in-block offset. ``block_table_row`` maps logical blocks
+    to physical block indices. The returned K/V tensors both have
+    ``kv_seqlen`` as their first dimension, and vectorized indexing preserves
+    the input cache's autograd path.
     """
     block_table_row = block_table_row.to(device=key_cache.device, dtype=torch.long)
     positions = torch.arange(kv_seqlen, device=key_cache.device)
@@ -184,7 +208,7 @@ def gather_paged_kv(key_cache, value_cache, block_table_row, kv_seqlen, block_si
 
 
 def gather_paged_kv_batch(key_cache, value_cache, block_tables, kv_seqlen, block_size):
-    """Batch 版本的分页 KV gather，返回 ``[B, kv_seqlen, H, D]``。"""
+    """Batched paged-KV gather returning ``[B, kv_seqlen, H, D]``."""
     block_tables = block_tables.to(device=key_cache.device, dtype=torch.long)
     positions = torch.arange(kv_seqlen, device=key_cache.device)
     block_indices = block_tables[:, positions // block_size]
@@ -196,10 +220,10 @@ def gather_paged_kv_batch(key_cache, value_cache, block_tables, kv_seqlen, block
 
 
 def make_local_attention_mask(q_seqlen, kv_seqlen, window_size_left, window_size_right):
-    """构造与序列右端对齐的局部 Attention bool mask。
+    """Build a right-aligned boolean mask for local attention.
 
-    返回形状为 ``[q_seqlen, kv_seqlen]`` 的 CPU tensor；``True`` 表示该
-    Q/KV 位置位于左右窗口之外，需要在 reference 计算中屏蔽。
+    Returns a CPU tensor shaped ``[q_seqlen, kv_seqlen]``. ``True`` marks Q/KV
+    positions outside the left/right window that the reference must mask.
     """
     left_boundary = kv_seqlen - q_seqlen - window_size_left
     right_boundary = kv_seqlen - q_seqlen + window_size_right
@@ -209,11 +233,13 @@ def make_local_attention_mask(q_seqlen, kv_seqlen, window_size_left, window_size
 
 
 def make_golden_attention_mask(q_seqlen, kv_seqlen, is_causal, window_size_left, window_size_right):
-    """规范化窗口参数并构造 reference Attention mask。
+    """Normalize window parameters and build the reference attention mask.
 
-    ``-1`` 表示对应方向无限；超出 KV 长度的窗口也按无限处理。causal 模式
-    会把右窗口规范为 0。返回 ``(mask, is_causal_golden, is_local_golden)``；
-    无需 mask 时 ``mask`` 为 ``None``，否则其中 ``True`` 表示被屏蔽位置。
+    ``-1`` means unlimited context in that direction; windows extending beyond
+    the KV length are also treated as unlimited. Causal mode normalizes the
+    right window to zero. Returns
+    ``(mask, is_causal_golden, is_local_golden)``. ``mask`` is ``None`` when no
+    mask is needed; otherwise ``True`` marks masked positions.
     """
     wl = window_size_left
     wr = window_size_right
@@ -231,7 +257,8 @@ def make_golden_attention_mask(q_seqlen, kv_seqlen, is_causal, window_size_left,
         if wr < 0:
             wr = kv_seqlen
     if is_causal_golden:
-        mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=kv_seqlen - q_seqlen + 1).to(torch.bool)
+        diagonal = kv_seqlen - q_seqlen + 1
+        mask = torch.triu(torch.ones(q_seqlen, kv_seqlen), diagonal=diagonal).to(torch.bool)
     elif is_local_golden:
         mask = make_local_attention_mask(q_seqlen, kv_seqlen, wl, wr)
     else:
@@ -248,7 +275,7 @@ def make_padded_varlen_mask(
     window_size_left,
     window_size_right,
 ):
-    """构造 padded TND golden 使用的 batch 级有效位置与 Attention mask。"""
+    """Build batch-level valid positions and the attention mask for padded TND golden data."""
     q_seqlens = torch.as_tensor(q_seqlens)
     kv_seqlens = torch.as_tensor(kv_seqlens)
     q_valid = torch.arange(max_q_seqlen) < q_seqlens[:, None]

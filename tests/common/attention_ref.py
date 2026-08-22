@@ -1,15 +1,15 @@
 # Copyright (c) 2026, Minghua Shen.
 import torch
 """
-  FlashAttention NPU 公共 reference / golden 实现。
+  Shared FlashAttention NPU reference / golden implementation.
 
-  - 正向golden：
-    ref_flash_attention，用于 v2/v3/v4 forward
-    测试计算 golden out/lse。
+  - Forward golden:
+    ref_flash_attention computes golden out/lse values for
+    the v2/v3/v4 forward tests.
 """
 
 """
-小算子 FlashAttention 正向golden相关实现
+Small-op FlashAttention forward golden implementation.
 """
 
 
@@ -66,6 +66,22 @@ def pv_out(prob, value):
     return out.reshape(batch, num_heads, q_len, value.shape[-1])
 
 
+def apply_attention_dropout(prob, drop_mask, dropout_p):
+    """Apply an FA-provided dropout mask without changing the softmax LSE."""
+    if drop_mask is None or dropout_p <= 0.0:
+        return prob
+    if dropout_p >= 1.0:
+        raise ValueError(f"dropout_p must be less than 1, got {dropout_p}")
+    drop_mask = torch.as_tensor(drop_mask, device=prob.device, dtype=prob.dtype)
+    if drop_mask.dim() == 3:
+        drop_mask = drop_mask.unsqueeze(0)
+    if drop_mask.dim() != 4:
+        raise ValueError(
+            f"drop_mask must be (B,H,Q,K) or (H,Q,K), got {tuple(drop_mask.shape)}"
+        )
+    return prob * drop_mask / (1.0 - dropout_p)
+
+
 def softmax_with_sink(scores, sink_matrix, value_dtype):
     """Compute attention probabilities and LSE with an extra sink term."""
     sink_matrix = torch.as_tensor(sink_matrix, device=scores.device)
@@ -99,6 +115,8 @@ def ref_flash_attention(
     upcast=True,
     reorder_ops=False,
     sink_matrix=None,
+    drop_mask=None,
+    dropout_p=0.0,
 ):
     """BSND reference implementation that computes all batches together."""
     dtype_og = query.dtype
@@ -133,14 +151,26 @@ def ref_flash_attention(
                 interm_dtype,
                 rescale_threshold,
             )
-            lo = pv_out(p_chunk.to(value.dtype), value[:, kv_start:kv_start + context_size])
+            p_chunk = apply_attention_dropout(
+                p_chunk,
+                None if drop_mask is None else drop_mask[..., kv_start:kv_start + context_size],
+                dropout_p,
+            )
+            # Match the NPU kernel's rescale-O path by accumulating go/lo/gl in fp32.
+            # With long KV and windowing, the unnormalized exp-weighted sum of
+            # valid keys can exceed the fp16 limit (65504). fp16 accumulation
+            # would overflow to NaN, whereas fp32 accumulation remains safe.
+            lo = pv_out(
+                p_chunk.to(torch.float32),
+                value[:, kv_start:kv_start + context_size].to(torch.float32),
+            )
             if kv_start == 0:
-                gl = row_sum
-                go = lo.to(interm_dtype)
+                gl = row_sum.to(torch.float32)
+                go = lo
             else:
                 dm = torch.exp(dm)
-                gl = gl * dm + row_sum
-                go = go * dm + lo.to(interm_dtype)
+                gl = gl * dm + row_sum.to(torch.float32)
+                go = go * dm + lo
         out = (go / gl).permute(0, 2, 1, 3)
         lse = torch.squeeze(torch.log(gl) + gm, dim=-1).to(torch.float32)
     else:
@@ -149,6 +179,7 @@ def ref_flash_attention(
             prob = torch.softmax(qk_result, dim=-1).to(value.dtype)
         else:
             prob, lse = softmax_with_sink(qk_result, sink_matrix, value.dtype)
+        prob = apply_attention_dropout(prob, drop_mask, dropout_p)
         out = pv_out(prob, value).permute(0, 2, 1, 3)
     return out.to(dtype_og), lse
 
@@ -162,15 +193,19 @@ def ref_flash_attention_pair(
     softcap=0.0,
     rescale_threshold=None,
     sink_matrix=None,
+    drop_mask=None,
+    dropout_p=0.0,
 ):
     """Return the two BSND golden references used by the comparator."""
     kwargs = {} if rescale_threshold is None else {"rescale_threshold": rescale_threshold}
     out_ref, lse_ref = ref_flash_attention(
         query, key, value, scale, mask, data_type, softcap,
-        upcast=True, reorder_ops=False, sink_matrix=sink_matrix, **kwargs,
+        upcast=True, reorder_ops=False, sink_matrix=sink_matrix,
+        drop_mask=drop_mask, dropout_p=dropout_p, **kwargs,
     )
     out_pt, lse_pt = ref_flash_attention(
         query, key, value, scale, mask, data_type, softcap,
-        upcast=False, reorder_ops=True, sink_matrix=sink_matrix, **kwargs,
+        upcast=False, reorder_ops=True, sink_matrix=sink_matrix,
+        drop_mask=drop_mask, dropout_p=dropout_p, **kwargs,
     )
     return out_ref, lse_ref, out_pt, lse_pt

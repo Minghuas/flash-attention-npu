@@ -1,13 +1,15 @@
 # Copyright (c) 2026, Minghua Shen.
-# 本文件用于测试公共 attention reference 的基本功能。
-# 测试在 CPU 上运行，覆盖 batch 计算、GQA、mask、sink 和反向传播。
-# 测试中的基准计算使用独立的 PyTorch 算子，避免和被测实现共享计算逻辑。
+# Basic tests for the shared attention reference implementation.
+# These CPU tests cover batched computation, GQA, masks, sinks, and backward.
+# The baseline uses independent PyTorch operators so it does not share the
+# implementation logic under test.
 
 import math
 
 import torch
 
 from tests.common.attention_ref import ref_flash_attention, ref_flash_attention_pair
+from tests.common.compare import assert_fa_close
 
 
 def make_inputs(batch, q_len, kv_len, num_heads, kv_heads, head_size, *, seed):
@@ -25,7 +27,7 @@ def make_inputs(batch, q_len, kv_len, num_heads, kv_heads, head_size, *, seed):
 
 
 def independent_attention(query, key, value, scale, mask=None, softcap=0.0, sink=None):
-    """使用简单 PyTorch 算子计算独立的 attention 基准结果。"""
+    """Compute an independent attention baseline with simple PyTorch operators."""
     batch, q_len, num_heads, head_size = query.shape
     kv_heads = key.shape[2]
     assert num_heads % kv_heads == 0
@@ -82,7 +84,7 @@ def apply_fully_masked_contract(output, lse, mask):
 
 
 def test_ref_flash_attention_forward_and_batch_equivalence():
-    """验证一次 batch 计算与逐个 batch 计算的结果一致。"""
+    """Verify that batched and per-batch computations produce identical results."""
     query, key, value = make_inputs(3, 5, 7, 4, 2, 8, seed=1234)
     scale = 1.0 / math.sqrt(query.shape[-1])
 
@@ -106,7 +108,7 @@ def test_ref_flash_attention_forward_and_batch_equivalence():
 
 
 def test_ref_flash_attention_gqa_masks_and_fully_masked_rows():
-    """验证 GQA、因果 mask 以及完全屏蔽行的输出约定。"""
+    """Verify GQA, causal masks, and the output contract for fully masked rows."""
     query, key, value = make_inputs(2, 4, 6, 4, 2, 8, seed=2345)
     scale = 1.0 / math.sqrt(query.shape[-1])
     mask = causal_mask(query.shape[0], query.shape[1], key.shape[1])
@@ -125,7 +127,7 @@ def test_ref_flash_attention_gqa_masks_and_fully_masked_rows():
 
 
 def test_ref_flash_attention_sink_and_pair():
-    """验证 sink 归一化以及双基准封装接口。"""
+    """Verify sink normalization and the dual-reference wrapper."""
     query, key, value = make_inputs(2, 3, 5, 4, 2, 8, seed=3456)
     scale = 1.0 / math.sqrt(query.shape[-1])
     mask = torch.zeros(query.shape[0], query.shape[1], key.shape[1], dtype=torch.bool)
@@ -159,7 +161,7 @@ def test_ref_flash_attention_sink_and_pair():
 
 
 def test_ref_flash_attention_backward():
-    """验证公共基准对查询、键和值都可以进行反向计算。"""
+    """Verify that the shared reference supports gradients for Q, K, and V."""
     query, key, value = make_inputs(2, 3, 4, 4, 2, 8, seed=5678)
     query.requires_grad_()
     key.requires_grad_()
@@ -179,3 +181,42 @@ def test_ref_flash_attention_backward():
 
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-5)
+
+
+def test_assert_fa_close_detects_perturbed_output():
+    """Verify that the comparator catches output errors caused by input perturbations.
+
+    Both ref and pt are computed by ``ref_flash_attention``, while the manual
+    baseline uses the independent ``independent_attention`` implementation.
+    The assertion passes when all three agree. After adding 1 to one element of
+    V and rerunning the independent implementation, the output must diverge
+    enough for the assertion to fail. NaN outputs must also be rejected so an
+    overly loose or broken comparator cannot silently pass them.
+    """
+    query, key, value = make_inputs(2, 3, 4, 4, 2, 8, seed=42)
+    scale = 1.0 / math.sqrt(query.shape[-1])
+    ref, _, pt, _ = ref_flash_attention_pair(query, key, value, scale, None, query.dtype)
+    manual, _ = independent_attention(query, key, value, scale)
+    assert_fa_close(manual, ref, pt, name="out")  # Manual and dual references agree.
+
+    # Add 1 to one element of V and rerun the independent implementation. The
+    # output should shift by roughly its softmax weight, far beyond tolerance,
+    # proving that the comparator catches errors from real input perturbations.
+    bad_value = value.clone()
+    bad_value[0, 0, 0, 0] += 1.0
+    bad, _ = independent_attention(query, key, bad_value, scale)
+    caught = False
+    try:
+        assert_fa_close(bad, ref, pt, name="out")
+    except AssertionError:
+        caught = True
+    assert caught, "assert_fa_close 未捕获输入扰动导致的输出偏差"
+
+    nan_output = manual.clone()
+    nan_output[0, 0, 0, 0] = float("nan")
+    caught = False
+    try:
+        assert_fa_close(nan_output, ref, pt, name="out")
+    except AssertionError:
+        caught = True
+    assert caught, "assert_fa_close 未捕获 NaN 输出"
