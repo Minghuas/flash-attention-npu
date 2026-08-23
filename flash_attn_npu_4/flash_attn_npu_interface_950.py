@@ -54,6 +54,7 @@ def _flash_attn_forward(
     softcap: float = 0.0,
     num_splits: int = 0,
     pack_gqa: Optional[bool] = None,
+    return_lse: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k = (_maybe_contiguous(x) for x in (q, k))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -78,6 +79,7 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         learnable_sink,
+        return_lse,
     )
 
     if out_accum is None:
@@ -238,5 +240,6 @@ def flash_attn_varlen_func(
         softcap,
         num_splits,
         pack_gqa,
+        return_lse,
     )
     return (out, softmax_lse, *rest) if return_lse else out

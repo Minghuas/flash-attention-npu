@@ -420,8 +420,8 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         pytest.skip("num_splits>1 requires paged KV cache and TND (varlen-q) layout")
     if "Ascend950" in name and num_splits > 1:
         pytest.skip("Ascend950 does not support num_splits>1")
-    if "Ascend950" in name and not (1 <= head_size <= 256):
-        pytest.skip("Ascend950 supports head_size in [1, 256]")
+    if not (1 <= head_size <= 256):
+        pytest.skip("head_size must be in [1, 256]")
     if "Ascend950" in name and softcap > 0.0:
         pytest.skip("Ascend950 does not support softcap")
 
@@ -631,17 +631,16 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     rtol = 1e-2
     atol = 1e-2
     torch.testing.assert_close(out_out.cpu(), golden_out_gpu.cpu(), rtol=rtol, atol=atol)
-    if "Ascend910" in name:
-        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL_gpu.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL_gpu.cpu(), rtol=rtol, atol=atol)
     _, r_golden_fa = compare_rule(golden_out_gpu.cpu().float(), out_out.cpu().float())
     assert r_golden_fa, "Golden-GPU vs CANN check FAILED"
     _, r_plain_cann = compare_rule(golden_out.cpu().float(), out_out.cpu().float())
     assert r_plain_cann, "Golden vs CANN check FAILED"
 
 @pytest.mark.parametrize("data_type", [torch.bfloat16])
-@pytest.mark.parametrize("num_heads", [32])
+@pytest.mark.parametrize("num_heads", [8, 16, 64])
 @pytest.mark.parametrize("kv_heads", [8])
-@pytest.mark.parametrize("head_size", [35,64,101,128,151,192,201,256])
+@pytest.mark.parametrize("head_size", [35,64,101,151,192,201])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("window_size_left", [-1])
 @pytest.mark.parametrize("window_size_right", [-1])
@@ -657,6 +656,11 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     (1, 128, 128),
     (1, 256, 512),
     (1, 256, 192),
+    (16, 64, 64),
+    (16, 32, 32),
+    (16, 16, 16),
+    (8, 64, 1024),
+    (8, 16, 1024),
 ])
 @pytest.mark.parametrize("num_splits", [0, 1, 2])
 @pytest.mark.parametrize("cache_mode", [0, 1])

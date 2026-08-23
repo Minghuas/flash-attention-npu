@@ -25,7 +25,7 @@ namespace fai_host
 //   bit 1: dataType     (0=half, 1=bf16)
 //   bit 2: maskType     (1 if causal mask)
 //   bit 3: maskType     (1 if SWA mask)
-//   bit 4: innerPrec    (0=fp32, 1=fp16)
+//   bit 4: reserved (always 0; v3 supports FP32 QK scores only)
 //   bit 5: layout       (0=TND, 1=BSND)
 //   bit 6: cacheMode    (0=normalCache, 1=pagedCache)
 //   bit 7: pageShape    (0=BnBsND, 1=BnNBsD)
@@ -39,19 +39,35 @@ namespace fai_host
     case KEY(CL_, DT, MT, SW, IP, LO, CM_, PS_):                                       \
         if (enableDN)                                                                  \
         {                                                                              \
-            FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay> \
-                <<<blockDim, nullptr, stream>>>(                                        \
-                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,           \
-                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                       \
-                    workspaceDevice, tilingDevice);                                    \
+            if (lseMode) {                                                             \
+                FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, true> \
+                    <<<blockDim, nullptr, stream>>>(                                    \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            } else {                                                                    \
+                FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, false> \
+                    <<<blockDim, nullptr, stream>>>(                                    \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            }                                                                           \
         }                                                                              \
         else                                                                           \
         {                                                                              \
-            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay>   \
-                <<<blockDim, nullptr, stream>>>(                                        \
-                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,           \
-                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                       \
-                    workspaceDevice, tilingDevice);                                    \
+            if (lseMode) {                                                             \
+                FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, true> \
+                    <<<blockDim, nullptr, stream>>>(                                   \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            } else {                                                                    \
+                FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, false> \
+                    <<<blockDim, nullptr, stream>>>(                                   \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            }                                                                           \
         }                                                                              \
         return ACL_SUCCESS;
 
@@ -59,11 +75,19 @@ namespace fai_host
                     T, AccT, QF, KVF, CachingMode, PageShapeType,                \
                     MaskCat, CacheLay)                                           \
     case KEY(CL_, DT, MT, SW, IP, LO, CM_, PS_):                                 \
-        FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay> \
-            <<<blockDim, nullptr, stream>>>(                                     \
-                qDevice, kDevice, vDevice, maskDevice, blockTableDevice,         \
-                oDevice, lseDevice, qSeqDevice, kvSeqDevice,                     \
-                workspaceDevice, tilingDevice);                                  \
+        if (lseMode) {                                                              \
+            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, true> \
+                <<<blockDim, nullptr, stream>>>(                                  \
+                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,      \
+                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                  \
+                    workspaceDevice, tilingDevice);                               \
+        } else {                                                                     \
+            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, false> \
+                <<<blockDim, nullptr, stream>>>(                                  \
+                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,      \
+                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                  \
+                    workspaceDevice, tilingDevice);                               \
+        }                                                                            \
         return ACL_SUCCESS;
 
 // Per-(dtype, layout) forward dispatch. launch_fai_dispatch is a primary
@@ -81,7 +105,7 @@ namespace fai_host
 // fai_host_api.hpp (the primary-template declaration) and emits external
 // references that resolve to these instantiations at link time.
 template <typename DType, bool IS_TND>
-aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN,
+aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN, bool lseMode,
                          uint32_t blockDim, aclrtStream stream,
                          uint8_t *qDevice, uint8_t *kDevice, uint8_t *vDevice,
                          uint8_t *maskDevice, uint8_t *blockTableDevice,
@@ -102,15 +126,6 @@ aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN,
             LAUNCH_CASE_DN(0, 0, 0, 0, 0, 1, 1, 1, half, float, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::NO_MASK, CacheLayout::nd)
             LAUNCH_CASE(0, 0, 1, 0, 0, 1, 1, 1, half, float, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
             LAUNCH_CASE(0, 0, 0, 1, 0, 1, 1, 1, half, float, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_SWA, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 0, 1, 1, 0, 0, half, half, Format::BSND, Format::BSND, CacheMode::normalCache, PageShape::normalShape, MaskCategory::NO_MASK, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 1, 0, 1, 1, 0, 0, half, half, Format::BSND, Format::BSND, CacheMode::normalCache, PageShape::normalShape, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 1, 1, 1, 0, 0, half, half, Format::BSND, Format::BSND, CacheMode::normalCache, PageShape::normalShape, MaskCategory::MASK_SWA, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 0, 1, 1, 1, 0, half, half, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnBsND, MaskCategory::NO_MASK, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 1, 0, 1, 1, 1, 0, half, half, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnBsND, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 1, 1, 1, 1, 0, half, half, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnBsND, MaskCategory::MASK_SWA, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 0, 1, 1, 1, 1, half, half, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::NO_MASK, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 1, 0, 1, 1, 1, 1, half, half, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 1, 1, 1, 1, 1, half, half, Format::BSND, Format::BSND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_SWA, CacheLayout::nd)
 
             default:
                 break;
@@ -130,15 +145,6 @@ aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN,
             LAUNCH_CASE_DN(0, 0, 0, 0, 0, 0, 1, 1, half, float, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::NO_MASK, CacheLayout::nd)
             LAUNCH_CASE(0, 0, 1, 0, 0, 0, 1, 1, half, float, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
             LAUNCH_CASE(0, 0, 0, 1, 0, 0, 1, 1, half, float, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_SWA, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 0, 1, 0, 0, 0, half, half, Format::TND, Format::TND, CacheMode::normalCache, PageShape::normalShape, MaskCategory::NO_MASK, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 1, 0, 1, 0, 0, 0, half, half, Format::TND, Format::TND, CacheMode::normalCache, PageShape::normalShape, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 1, 1, 0, 0, 0, half, half, Format::TND, Format::TND, CacheMode::normalCache, PageShape::normalShape, MaskCategory::MASK_SWA, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 0, 1, 0, 1, 0, half, half, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnBsND, MaskCategory::NO_MASK, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 1, 0, 1, 0, 1, 0, half, half, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnBsND, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 1, 1, 0, 1, 0, half, half, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnBsND, MaskCategory::MASK_SWA, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 0, 1, 0, 1, 1, half, half, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::NO_MASK, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 1, 0, 1, 0, 1, 1, half, half, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_CAUSAL, CacheLayout::nd)
-            LAUNCH_CASE(0, 0, 0, 1, 1, 0, 1, 1, half, half, Format::TND, Format::TND, CacheMode::pagedCache, PageShape::BnNBsD, MaskCategory::MASK_SWA, CacheLayout::nd)
 
             default:
                 break;

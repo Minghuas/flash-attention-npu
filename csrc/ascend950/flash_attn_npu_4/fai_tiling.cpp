@@ -118,7 +118,21 @@ namespace optiling{
         uint32_t qRowNumCeil = Q_TILE_CEIL;
         uint32_t qNBlockTile = (qSeqlen != 0) ?
             (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
+        // The FP32 O temporary buffer supports at most 64 merged M rows
+        // when Dv is greater than 128. qSeqlen is the largest Q-S tile
+        // for this batch, so cap the grouped-Q tile accordingly.
+        if (faInfo_.embeddingSizeV > 128 && qSeqlen != 0) {
+            constexpr uint32_t MAX_M_FOR_LARGE_D = Q_TILE_CEIL / 2U;
+            uint32_t maxQNBlockTile = std::max(MAX_M_FOR_LARGE_D / qSeqlen, 1U);
+            qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
+        }
         qNBlockTile = std::min(qNBlockTile, groupSize);
+        // Keep host tiling consistent with the kernel: two AIVs can only
+        // split a multi-head grouped-Q tile evenly.  Any remaining head is
+        // scheduled as a qNBlockSize==1 tail task.
+        if (qNBlockTile > N_SPLIT_HELPER) {
+            qNBlockTile = qNBlockTile / N_SPLIT_HELPER * N_SPLIT_HELPER;
+        }
         qNBlockTile = std::max(qNBlockTile, static_cast<uint32_t>(1));
         return qNBlockTile;
     }
@@ -164,7 +178,9 @@ namespace optiling{
             (static_cast<uint32_t>(faInfo_.embeddingSize) + 15U) / 16U * 16U;
         auto embeddingSizeVAligned16_ =
             (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
-        auto qkL1TileM_ = qBaseTile_;
+        // M is qS * qN in the grouped-Q path.  qBaseTile_ may be 64 when
+        // Dv > 128, but resource planning must still cover the 128-row M cap.
+        auto qkL1TileM_ = Q_TILE_CEIL;
         auto qkL1TileKLeft_ = embeddingSizeAligned16_;
         auto qL1BufNum_ = 1;
         // K矩阵开启2buf，D按128分割，S2按256分割
@@ -177,7 +193,7 @@ namespace optiling{
         auto pvL1TileKLeft_ = kvBaseTile_;
         auto vL1BufNum_ = 2;
         // P矩阵在950上会常驻L1，由于基块的prelaunch为2，因此最好有3 buf，以免基块间流水阻塞
-        auto pvL1TileM_ = qBaseTile_;
+        auto pvL1TileM_ = Q_TILE_CEIL;
         auto pvL1TileKRight_ = kvBaseTile_;
         auto pL1BufNum_ = 3;
 
@@ -251,7 +267,7 @@ namespace optiling{
             uint32_t curQNBlockNum = qNBlockNumPerGroup * faInfo_.kvHeads;
             uint32_t curQSBlockTile = GetQSBlockTile(kvSeqlen);
             uint32_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-            uint32_t curTaskNum = faInfo_.numHeads * curQSBlockNum;
+            uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
             if (batchIdx == 0) {
                 faTilingData.set_firstBatchTaskNum(curTaskNum);
             }
