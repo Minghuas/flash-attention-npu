@@ -64,7 +64,10 @@ constexpr int PER_BATCH = N_TILE * PER_TILE;
 // 每轮独立 GM 区（round r 用 [r*B, r*B+B) 段）：S 恒为 host 原始值——避免
 // 原地覆写使第 2+ 轮输入变成"上轮 P"（首版 harness 的 host 侧 bug，devlog #44.20）
 constexpr int P_SCRATCH = P_AREA;  // t=0 的 P 落此处；t>=1 的 P[t] 链式写入 S[t-1] 死区
-constexpr int WS_FLOATS = ROUNDS * B * PER_BATCH + ROUNDS * B * P_SCRATCH;
+constexpr int TILES_BASE = ROUNDS * B * PER_BATCH;   // 批区之后的 scratch 区基址
+// scratch(ridx) = TILES_BASE + ridx*P_SCRATCH（ridx = r*B+b；#44.26 修复：
+// 原布局 (r*B+b+1)*PER_BATCH 与下一批 tile 区重叠——b0 的 P[0] 砸 b1 的 S[t0]）
+constexpr int WS_FLOATS = TILES_BASE + ROUNDS * B * P_SCRATCH;
 constexpr int SDEN = B * H * Sq;                    // S 归一化分母：S_raw ≤ Sk
 
 // ---------------- 设备侧：AIV-only softmax kernel ----------------
@@ -91,10 +94,10 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
 
-        // DBG 串行化（devlog #44.20）：单 block 顺序处理全部 batch——分离跨 block 并发因素
-        const uint32_t bCount = 2;   // DBG 恢复双批处理（复刻全流程 b1 指纹）
-        for (uint32_t bo = 0; bo < bCount; ++bo)
-        if (blockIdx == 0 || bo == 0) {
+        // 双 AIV 双批（devlog #44.26）：blk0/blk1 = 同一 block 的两个 AIV（MIX 自动
+        // 判型实证），各自执行完整 Main()，类内按 subIdx 分行——两个 AIV 都须遍历
+        // 全部 batch（原 blockIdx 门控使 b1 只有 AIV0 处理 → 行 16-31 无人算）
+        for (uint32_t bo = 0; bo < B; ++bo) {
         const uint32_t batchIdx = bo;
 
         Catlass::Arch::Resource<Catlass::Arch::AtlasA2> resource;
@@ -129,7 +132,7 @@ public:
                     // 双 AIV + 链式 P（devlog #44.25：全流程修复后仍 b1t0 s8-15 坏，
                     // 唯一未验证组合 = 双 AIV 并发 + 链式。单调用/tile，行分摊在类内）
                     const uint64_t pSlot = (t == 0)
-                        ? (static_cast<uint64_t>(r) * B + batchIdx + 1) * PER_BATCH
+                        ? (TILES_BASE + (static_cast<uint64_t>(r) * B + batchIdx) * P_SCRATCH)
                         : (tileBase - static_cast<uint64_t>(PER_TILE));
                     const uint64_t pHalf = pSlot * 2;
                     SplitB::layout::RowMajor layOutP(Sq, Sk, COLS_PAD);
@@ -272,7 +275,7 @@ int main()
                     for (int j = 0; j < Sk; ++j) {
                         const float ref = toFp16(expf(sRaw(b, t, s, j) - mx[s]));
                         // P 半元素布局：P(s,j) 在 half 索引 = base*2 + s*COLS_PAD + j
-                        const float got = static_cast<float>(p16[(t == 0 ? (static_cast<int64_t>(r)*B + b + 1) * PER_BATCH : base - PER_TILE) * 2 + s * COLS_PAD + j]);
+                        const float got = static_cast<float>(p16[(t == 0 ? TILES_BASE + (static_cast<int64_t>(r)*B + b) * P_SCRATCH : base - PER_TILE) * 2 + s * COLS_PAD + j]);
                         if (fabsf(got - ref) > 1e-3 + 1e-3 * fabsf(ref)) {
                             ++badP[h];
                             ++roundBad;

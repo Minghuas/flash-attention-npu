@@ -304,7 +304,9 @@ def compare_all(records, iters, ref, softmax_only=False):
                         off = 0 if name == "max" else 128   # sum 在 stats 块 [128..128+rows)
                         dump_flat.extend(rec[2][off: off + rows])
                     else:
-                        dump_flat.extend([0.0] * rows)
+                        # 记录缺失（t51：大单行偶被解析器漏）——标记缺 dump 而非填 0 假错
+                        print(f"  [WARN] b{b} tile{t} 的 stats dump 记录缺失（解析丢失），跳过该项比对")
+                        dump_flat.extend([-1.0] * rows)   # -1 与任何 ref 不等但明显非 0 假象
                     ref_flat.extend(ref_t[b, qs].tolist())
 
                 def label(i, b=b, name=name):

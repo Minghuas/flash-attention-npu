@@ -797,6 +797,63 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.30**｜**【判别完成】softmax-only 全对 → bug 锁定段3/4 交互（2026-08-23）**：
+t51（softmaxOnly 真正生效：段1 QK + 段2 softmax，段3 消费 softmaxReady 后 continue、
+段4 整段跳过、dump 仅 S/P/stats）结果：
+- **S：全对**（4 tile）✓
+- **P：全对**（4 tile）✓ —— 链式 P 方案在全流程 kernel 内验证通过
+- **max/sum：全对**（用户人工核对全部 batch/head 均与 ref 一致；比对器显示的
+  "b0 tile1 全 0"系 dump 记录 331 被解析器漏掉——大单行 + ShapeInfo 行交互，
+  已改为显式 WARN 标记缺失而非填 0 假错）
+**结论：QK→softmax 链路（含链式 P、S 跨核可见性）完全正确；b1t0 s8-15 指纹
+的根因在段3（PV）或段4（divout）与 softmax 的交互。**
+对照 t50（全流程）：P/stats 在 softmax-only 下对、全流程下坏（b1t0 s8-15）
+→ **PV 读到了未写完/被覆盖的 P**。头号嫌疑（机制己）：段3 批级
+WaitFlag(softmaxReady)（一次）+ 段2 逐 tile 双 AIV 各 set（每批 4 次 set）——
+"任一置位即通过"语义下 PV 可在某 AIV 的某 tile P 拷贝未完成时即开始读 P。
+下一步：段3 改逐 tile wait（循环内每次 PV 调用前 wait 一次，消耗 4 set/batch
+对齐 4 wait/batch），或恢复 PV 内部 WAIT_SOFTMAX=true 的逐调用等待。
+
+**#44.29**｜**编译：注释断行裸 `#ifdef` 被预处理吞（2026-08-23）**：
+段4 门控注释跨行时第二行行首落了裸 `#ifdef`（首行 `//` 注释未延续）→ 预处理
+当真指令 → "unterminated conditional directive"。修复：注释改写不跨指令词。
+教训（写设备代码注释的硬规则）：**多行注释每行都必须以 `//` 开头；绝不出现
+行首裸 `#if/#ifdef/#endif` 字样**（哪怕在语义上是注释内容）。
+
+**#44.28**｜**softmaxOnly 段3 门控用户方案（消费后 continue）+ 条件反转修正
+（2026-08-23）**：
+用户方案：段3 处 `WaitFlag(softmaxReady)` 后 **softmaxOnly 则 continue**——先消费
+flag 再跳批。优于我方"整段包裹不消费"设计：softmaxReady 每批 set 数=wait 数，
+**任意 B 无累积风险**（我方累积 set 有 MAX_REVERSE_DEPTH=15 上限）。
+用户初版写成 `if (!softmaxOnly) continue`（反转：全流程跳 PV / softmaxOnly 跑 PV）
+——已修正为 `if (softmaxOnly) continue`。
+softmaxOnly 模式最终 dump 集：段1 的 S + 段2 的 P + dump 块的 stats（OTmp/O/LSE
+被门控跳过）。
+
+**#44.27**｜**softmaxOnly 门控结构修正（2026-08-23，用户指出）**：
+初版把 `!softmaxOnly` 塞进段3/段4 的 **for 循环条件**——但段3 循环外还有
+批级 `CrossCoreWaitFlag(softmaxReady)` 与 `CrossCoreSetFlag(pvReady)`、段4 循环外
+有 `CrossCoreWaitFlag(pvReady)`，这些**不被循环条件覆盖**：softmaxOnly 下 CUBE 仍
+消费 softmaxReady、仍置位 pvReady（无 PV 却发"PV 完成"），VEC 仍等 pvReady——
+靠错位 set/wait 互相抵消才未挂死，语义完全错误。
+修复：段3/段4 各用显式 `if (!softmaxOnly) { 整段 }` 包裹（含批级 wait/set/循环/
+printf）；段4 的门在 dump 块**之前**闭合（stats/P dump 两种模式都要执行）。
+注：段2 在 softmaxOnly 下仍 set softmaxReady（无消费者累积；B=2×2tile×2AIV=8
+< MAX_REVERSE_DEPTH=15，调试样例安全；更大 B 需再门控 set）。
+VEC 分支模拟括号平衡 ✓、全文件平衡 ✓。
+
+**#44.26**｜**playground harness 双 bug 修复后全绿 + softmaxOnly dump 门控（2026-08-23）**：
+修复复现器两个 harness bug：①P-scratch 与下一批 tile 区重叠（原 (r*B+b+1)*PER_BATCH
+布局——b0 的 P[0] 砸 b1 的 S[t0]；全流程 kernel 无此问题，scratch 在 perBatchF 内部）；
+②双 AIV 批门控错误（blockIdx==0||bo==0 使 b1 只有 AIV0 处理）。
+**修复后双 AIV + 双批 + 链式 P 全绿**（2 轮 × 2 批 × 2 tile，P/max/sum 全 0 错）。
+**至此 softmax 类本身（含链式 P）在单 AIV / 双 AIV / 单批 / 双批 全部形态验证通过**。
+推论：全流程 b1t0 s8-15 指纹的输入侧差异只剩：S 由 QK Fixpipe 写（playground 是
+host 预写）+ 跨核逐 tile flag + PV/divout 交互——由 softmaxOnly 判别。
+kernel softmaxOnly 补 dump 门控（段3/4 未运行不 dump OTmp/O/LSE，仅 stats；用户指出）。
+教训：**复现器的 harness bug 会制造"修复无效"的假象**——两个 bug 都在"被测组合"上，
+此前双批数据全废；harness 布局必须与被测 kernel 布局逐项核对（scratch 位置尤其）。
+
 **#44.25**｜**t50 后复盘：softmaxOnly 链曾被磁盘编辑回退 + 事件分域无效（2026-08-23）**：
 t50 复验发现：①softmaxOnly 三件套（tiling 字段/host env/kernel 门控）已被磁盘编辑
 回退 → t49/t50 的"softmax-only"实为全流程（[OUT] 提示只是 python 侧），隔离实验

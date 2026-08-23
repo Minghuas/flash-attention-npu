@@ -427,10 +427,8 @@ namespace SplitB {
                         const uint8_t dimD = 2;
                         uint32_t shapeD[2] = {tgd.rowNum, colsPad};
                         AscendC::ShapeInfo infoD(dimD, shapeD);   // 设备侧不能用初始化列表转指针（devlog #44.16）
-                        // 只 dump AIV0 行（坏行在 AIV0 半区；devlog #44.15 缓冲实测阈值
-                        // ~128KB，Sq=64 全量曾丢中间段）
                         AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
-                                            descD, (tgd.rowNum / 2) * colsPad, infoD);
+                                            descD, tgd.rowNum * colsPad, infoD);
                     }
                 }
             }
@@ -483,7 +481,7 @@ namespace SplitB {
                         uint32_t shapeD[2] = {tgd.rowNum, colsPad};
                         AscendC::ShapeInfo infoD(dimD, shapeD);
                         AscendC::DumpTensor(gP[GetPHalfIdx(batchBase, tgd.tileIdx)],
-                                            descD, (tgd.rowNum / 2) * colsPad, infoD);
+                                            descD, tgd.rowNum * colsPad, infoD);
                     }
                 }
             }
@@ -495,48 +493,59 @@ namespace SplitB {
 
             // ==================== 段3：PV 全部 tile（CUBE） ====================
 #ifdef __DAV_C220_CUBE__
+            // softmaxOnly：整段跳过（含批级 wait/set——原循环条件写法漏掉循环外的
+            // CrossCoreWaitFlag(softmaxReady) 与 CrossCoreSetFlag(pvReady)，会在
+            // PV 不执行时仍消费/置位 flag，靠错位 set/wait 互相抵消才未挂死，#44.27）
+            
             Arch::CrossCoreWaitFlag(softmaxReady);   // 批次级一次：等本批全部 softmax 完成
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u b%u S3-PV\n", coreIdx, (uint32_t)boIdx);
-            }
-            for (uint32_t qSBlockIdx = 0; !softmaxOnly && qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
-                for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
-                    const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
-                    const uint64_t sOff = batchBase + tg.tileIdx * perTileF;
-                    const uint64_t oOff = sOff + s1AreaF;
-                    const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
-                        static_cast<uint64_t>(tg.kvNIdx) * embed;
-
-                    LayoutP layoutPTemp(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
-                    LayoutV layoutVTemp(static_cast<uint32_t>(kvSeqlen), strideV);
-                    LayoutOTmp layoutOTmpT(tg.rowNum, static_cast<uint32_t>(embed), dPad);
-                    GemmCoord actualBlockShapePV{tg.rowNum, static_cast<uint32_t>(embed),
-                                                static_cast<uint32_t>(kvSeqlen)};
-                    // softmaxFlag 的等待由 DispatchPolicyPV 的 WAIT_SOFTMAX=false 编译期
-                    // 关闭（上方批级 Wait 已承担同步，#39/#40）。P 为 S 区原地 fp16 视图：
-                    // half 索引 = 2×float 索引（见 workspace 注释）
-                    blockMmadPV(gP[GetPHalfIdx(batchBase, tg.tileIdx)], gV[gmV], gOTmp[oOff], gBlockTable,
-                            layoutPTemp, layoutVTemp, layoutOTmpT, actualBlockShapePV,
-                            kvSIdx, kvSLoopNumTotal, pagedBlockSize,
-                            static_cast<uint32_t>(kvSeqlen), strideV,
-                            blockStackNum, softmaxReady);
+            //（消费 softmaxReady 后 continue——用户方案，flag 收支优于我方"不消费累积"
+            // 设计：每批 set 数=wait 数，任意 B 安全，#44.28）
+            if (!softmaxOnly) {
+                if (debugFlag) {
+                    AscendC::printf("[SB] c%u b%u S3-PV\n", coreIdx, (uint32_t)boIdx);
                 }
+                for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
+                    for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
+                        const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
+                        const uint64_t sOff = batchBase + tg.tileIdx * perTileF;
+                        const uint64_t oOff = sOff + s1AreaF;
+                        const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
+                            static_cast<uint64_t>(tg.kvNIdx) * embed;
+
+                        LayoutP layoutPTemp(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
+                        LayoutV layoutVTemp(static_cast<uint32_t>(kvSeqlen), strideV);
+                        LayoutOTmp layoutOTmpT(tg.rowNum, static_cast<uint32_t>(embed), dPad);
+                        GemmCoord actualBlockShapePV{tg.rowNum, static_cast<uint32_t>(embed),
+                                                    static_cast<uint32_t>(kvSeqlen)};
+                        // softmaxFlag 的等待由 DispatchPolicyPV 的 WAIT_SOFTMAX=false 编译期
+                        // 关闭（上方批级 Wait 已承担同步，#39/#40）。P 为 S 区原地 fp16 视图：
+                        // half 索引 = 2×float 索引（见 workspace 注释）
+                        blockMmadPV(gP[GetPHalfIdx(batchBase, tg.tileIdx)], gV[gmV], gOTmp[oOff], gBlockTable,
+                                layoutPTemp, layoutVTemp, layoutOTmpT, actualBlockShapePV,
+                                kvSIdx, kvSLoopNumTotal, pagedBlockSize,
+                                static_cast<uint32_t>(kvSeqlen), strideV,
+                                blockStackNum, softmaxReady);
+                    }
+                }
+                // 段3 OTmp 不在此 dump：kernel 末尾的整区 float 视图 dump 一并覆盖
+                //（OTmp/stats 此时全部就绪且不再被写，devlog #44.12）
+                AscendC::PipeBarrier<PIPE_ALL>();
+                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);   // 每 batch 一次
             }
-            // 段3 OTmp 不在此 dump：kernel 末尾的整区 float 视图 dump 一并覆盖
-            //（OTmp/stats 此时全部就绪且不再被写，devlog #44.12）
-            AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
-            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);   // 每 batch 一次
 #endif
 
             // ==================== 段4：divout 全部 tile（VEC；每 tile 双 AIV 拆行） ====================
 #ifdef __DAV_C220_VEC__
+            // softmaxOnly：段4 整段跳过（含批级 WaitFlag(pvReady)——否则 VEC 会等
+            // 一个 CUBE 侧（段3 被 continue 跳过）永远不会 set 的 flag 而挂死）
+            if (!softmaxOnly) {
             Arch::CrossCoreWaitFlag(pvReady);   // 每 batch 一次
             if (debugFlag) {
                 AscendC::printf("[SB] c%u v%u b%u S4-DO\n", coreIdx,
                                 AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
             }
             if constexpr (MASK_TYPE == FaiKenel::MaskType::NO_MASK) {
-                for (uint32_t qSBlockIdx = 0; !softmaxOnly && qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
+                for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                     for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                         const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
                         const uint64_t sOff = batchBase + tg.tileIdx * perTileF;
@@ -562,6 +571,7 @@ namespace SplitB {
                     }
                 }
             }
+            }
 #endif   // 段4 #ifdef __DAV_C220_VEC__（devlog #44.15：dump 块移动时曾误删此 endif）
             // ---- 段4 后 dump（devlog #44.15：kernel 末尾 dump 来不及刷出，移入 batch
             // 循环内运行中时机；与段1/段2 同款）----
@@ -579,6 +589,20 @@ namespace SplitB {
                             + static_cast<uint32_t>(tgd.tileIdx);
                         const uint32_t descS = 330 + static_cast<uint32_t>(boIdx) * 10
                             + static_cast<uint32_t>(tgd.tileIdx);
+                        if (softmaxOnly) {
+                            // 剥离模式（devlog #44.26）：段3/4 未运行，OTmp/O/LSE 为垃圾
+                            // 不 dump（Q：用户指出）；stats 仍 dump（softmax 产物）
+                            const uint8_t dimS2 = 2;
+                            uint32_t shapeS2[2] = {1, static_cast<uint32_t>(statsPerTask)};
+                            AscendC::ShapeInfo infoS2(dimS2, shapeS2);
+                            AscendC::printf(
+                                "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..128)+sum[128..256) desc=%u\n",
+                                coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
+                                tgd.qNStartIdx, tgd.rowNum, descS);
+                            AscendC::DumpTensor(gS[tileBase + s1AreaF + oAreaF],
+                                                descS, static_cast<uint32_t>(statsPerTask), infoS2);
+                            continue;
+                        }
                         AscendC::printf(
                             "[SB-DUMP] stage=OTmp(fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
                             coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
@@ -596,13 +620,14 @@ namespace SplitB {
                         // ROW_NUM_MAX=128；devlog #44.15：连续 dump 2×rows 只覆盖
                         // max+未写区，须 dump 整块 statsPerTask）
                         const uint8_t dimS = 2;
-                        uint32_t shapeS[2] = {static_cast<uint32_t>(Q_TILE_CEIL + Q_TILE_CEIL / 2), 1};
+                        uint32_t shapeS[2] = {1, static_cast<uint32_t>(statsPerTask)};
                         AscendC::ShapeInfo infoS(dimS, shapeS);
                         // 192 floats：max [0..128) + sum [128..192)（rowNum≤64 时 sum 全覆盖）
                         AscendC::DumpTensor(gS[tileBase + s1AreaF + oAreaF],
-                                            descS, Q_TILE_CEIL + Q_TILE_CEIL / 2, infoS);
+                                            descS, static_cast<uint32_t>(statsPerTask), infoS);
                     }
                 }
+                if (!softmaxOnly) {   // 段4 未运行不 dump O/LSE（devlog #44.26）
                 {
                     const uint8_t dimD = 2;
                     uint32_t shapeD[2] = {static_cast<uint32_t>(qSeqlen),
@@ -635,6 +660,7 @@ namespace SplitB {
                                     static_cast<uint32_t>(qHeads * qSeqlen),
                                     infoD);
                 }
+                }   // if (!softmaxOnly)——O/LSE dump 门控闭合（devlog #44.26）
             }
 #endif
         }
