@@ -39,8 +39,6 @@ BASE_WHEEL_URL = (
 # SKIP_NPU_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any NPU compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
-DEBUG_MODE = os.getenv("DEBUG_MODE", "FALSE") == "TRUE"
-
 # FLASH_ATTN_BUILD_VERSION selects which API generations to build:
 #   "v2"   build flash_attn_npu.flash_attn_npu     (910B/C only)
 #   "v3"   build the v3 backends selected by FLASH_ATTN_BUILD_NPU:
@@ -162,6 +160,10 @@ class BishengBuildExt(build_ext):
             f"-I{ascend_home}/runtime/include",
             f"-I{ascend_home}/include/experiment/runtime",
             f"-I{ascend_home}/include/experiment/msprof",
+            # AscendC 高阶 API 头（lib/matmul_intf.h、kernel_tiling/、tiling/）：
+            # SplitB kernel 用 matmul::Matmul + IterateBatch（照搬 CANN 参考实现），
+            # 亦供 splitb_host.cpp 的 matmul_tiling::MatmulApiTiling。
+            f"-I{ascend_home}/{get_cann_arch_dir()}/ascendc/include/highlevel_api",
             f"-I{torch_package_path}/include",
             f"-I{torch_package_path}/include/torch/csrc/api/include",
             f"-I{this_dir}/csrc/catlass/include",
@@ -178,7 +180,7 @@ class BishengBuildExt(build_ext):
             "-ltorch_npu",
             "-ltiling_api",
             "-lplatform",
-            "-g" if DEBUG_MODE else ""
+            "-g"
         ]
 
         # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
@@ -192,9 +194,8 @@ class BishengBuildExt(build_ext):
 
         # compile_common = [*compiler, "-O2", *compile_arch_flags, "-fPIC", "-std=c++17",
         #                   abi_flag, *include_flags]
-        compile_common = [*compiler, *(["-O0", "-g3"] if DEBUG_MODE else ["-O2"]), *compile_arch_flags, "-fPIC", "-std=c++17",
+        compile_common = [*compiler, "-O0", "-g3", *compile_arch_flags, "-fPIC", "-std=c++17",
                           abi_flag, *include_flags]
-        
         self._toolchains[ext_name] = (compiler, compile_common, link_arch_flags, link_flags)
         return self._toolchains[ext_name]
 
@@ -220,8 +221,7 @@ class BishengBuildExt(build_ext):
         hcc_cpp = os.path.join(hcc_isys, "c++/7.3.0")
         aicpu_cmd = [
             "bisheng",
-            # "-O2",
-            *(["-O0", "-g3"] if DEBUG_MODE else ["-O2"]),
+            "-O2",
             "-std=c++17",
             "-fvisibility=default",
             "-fvisibility-inlines-hidden",

@@ -30,6 +30,8 @@
 using namespace Catlass;
 using namespace KernelCommon;
 
+#include "splitb_host.hpp"  // SplitB 大B小S 快路径（perf 项目，默认 env 门控关闭）
+
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
 uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
@@ -729,6 +731,19 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         at::device(at::kPrivateUse1).dtype(at::kFloat));
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
     auto softmaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmaxlse.data_ptr()));
+
+    // SplitB 快路径（大 Batch 小 SeqLen）：触发条件照搬 CANN TilingB::IsCapable，
+    // 默认 env 门控关闭（P3 步 1 骨架；步 2 kernel 完成后翻默认开）。
+    // FLASH_ATTN_DISABLE_SPLITB=1 强制关；FLASH_ATTN_FORCE_SPLITB=1 强制开（测试用）。
+    if (SplitB::should_use(seqlen_q, seqlen_k, num_heads, q.element_size(), p_dropout, return_softmax) &&
+        SplitB::env_enabled()) {
+        if (getenv("FLASH_ATTN_SPLITB_DEBUG") != nullptr) {
+            printf("111 [flash_api] >>> entering SplitB path\n"); fflush(stdout);
+        }
+        SplitB::mha_fwd_splitb(q, k, v, out, softmaxlse, mask_gpu_tensor, softmax_scale,
+                               is_causal, is_local, window_size_left, window_size_right, softcap);
+        return {out, softmaxlse, p, rng_state};   // 与函数尾返回形态一致（4 值）
+    }
 
     // ffts related
     uint64_t fftsAddr{0};

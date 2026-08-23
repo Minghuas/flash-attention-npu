@@ -22,6 +22,7 @@ namespace Catlass::Gemm::Block {
 template <
     bool PAGED_CACHE_FLAG_,
     bool ENABLE_UNIT_FLAG_,
+    bool WAIT_SOFTMAX_FLAG_,
     class L1TileShape_,
     class L0TileShape_,
     class AType_,
@@ -31,7 +32,7 @@ template <
     class TileCopy_,
     class TileMmad_>
 struct BlockMmad<
-    MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>,
+    MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_, WAIT_SOFTMAX_FLAG_>,
     L1TileShape_,
     L0TileShape_,
     AType_,
@@ -42,7 +43,7 @@ struct BlockMmad<
     TileMmad_> {
 public:
     // Type Aliases
-    using DispatchPolicy = MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>;
+    using DispatchPolicy = MmadAtlasA2FAIPVT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_, WAIT_SOFTMAX_FLAG_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using L1TileShape = L1TileShape_;
     using L0TileShape = L0TileShape_;
@@ -212,7 +213,12 @@ public:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-        Arch::CrossCoreWaitFlag(softmaxFlag);
+        // WAIT_SOFTMAX_FLAG（dispatch policy 编译期开关，fa_block.h）：false 时跳过
+        // softmaxFlag 的逐调用跨核等待，供批粒度同步的调用方（SplitB，devlog #39/#40）；
+        // 缺省 true = FAInfer 原行为（逐调用等 P 就绪）。
+        if constexpr (DispatchPolicy::WAIT_SOFTMAX_FLAG) {
+            Arch::CrossCoreWaitFlag(softmaxFlag);
+        }
 
         uint32_t mL1Loop = CeilDiv(rowNum, L1TileShape::M);
         uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);

@@ -103,6 +103,25 @@ def varlen_bwd_kernel(dtype_key: str) -> "Kernel":
     )
 
 
+def splitb_fwd_kernel(dtype_key: str) -> "Kernel":
+    # SplitB（大B小S 前向模板，照搬 CANN flash_attention_score_bn2gs1s2_b）：仅 BSND
+    # 布局、无 TND/paged/FD 轴，dtype 是唯一生成轴。
+    ctype, _ = DTYPE_MAP[dtype_key]
+    body = (
+        _header("forward SplitB dispatch (large-batch small-seqlen)", dtype_key, "BSND(SplitB)")
+        + '#include "../fwd_splitb_dispatch_impl.hpp"\n\n'
+        + f"template void launch_fwd_splitb_impl<{ctype}>(const FwdLaunchArgs &);"
+        f"  // SplitB BSND\n"
+    )
+    return Kernel(
+        family="fwd_splitb",
+        dtype=dtype_key,
+        layout="splitb",
+        filename=f"fwd_dispatch_{dtype_key}_splitb.cpp",
+        content=body,
+    )
+
+
 @dataclass
 class Kernel:
     family: str
@@ -119,6 +138,7 @@ def get_all_kernels() -> List[Kernel]:
             kernels.append(fwd_kernel(dtype, layout))
             kernels.append(fag_kernel(dtype, layout))
         kernels.append(varlen_bwd_kernel(dtype))
+        kernels.append(splitb_fwd_kernel(dtype))
     return kernels
 
 

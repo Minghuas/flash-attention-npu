@@ -34,3 +34,16 @@ venv
 
 # compile-time generated file
 flash_attn_config.py
+
+claude-skills-bundle/
+build*/
+*.out
+debug/logs/*
+tests/diag*
+claude-handoff/*
+docs/*
+*.txt
+CLAUDE.md
+*.log
+debug/test_softmax_playground
+debug/test_softmax_playground_O0

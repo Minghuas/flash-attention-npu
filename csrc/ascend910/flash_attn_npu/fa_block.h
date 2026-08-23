@@ -38,11 +38,16 @@ namespace Catlass::Epilogue {
 }
 
 namespace Catlass::Gemm {
-    template <bool PAGED_CACHE_FLAG_ = false, bool ENABLE_UNIT_FLAG_ = false>
+    template <bool PAGED_CACHE_FLAG_ = false, bool ENABLE_UNIT_FLAG_ = false,
+              bool WAIT_SOFTMAX_FLAG_ = true>
     struct MmadAtlasA2FAIPVT : public Gemm::MmadAtlasA2{
         static constexpr uint32_t STAGES = 2;
         static constexpr bool PAGED_CACHE_FLAG = PAGED_CACHE_FLAG_;
         static constexpr bool ENABLE_UNIT_FLAG = ENABLE_UNIT_FLAG_;
+        // WAIT_SOFTMAX_FLAG=false：operator() 内跳过 softmaxFlag 的逐调用跨核等待，
+        // 供批粒度同步的调用方使用（SplitB 四段批：整批 softmax 完成后 Wait 一次，
+        // devlog #39/#40）。缺省 true = FAInfer 原行为（逐调用等 P 就绪）。
+        static constexpr bool WAIT_SOFTMAX_FLAG = WAIT_SOFTMAX_FLAG_;
     };
 
     template <bool PAGED_CACHE_FLAG_ = false, bool ENABLE_UNIT_FLAG_ = false>
