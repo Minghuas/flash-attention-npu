@@ -30,7 +30,7 @@ uint32_t BuildKernelKey(const std::string& dataType,     // "half" | "bf16"
                         CacheMode cacheMode,
                         PageShape pageShape);
 
-aclError LaunchFAI(uint32_t kernelKey, bool enableDN,
+aclError LaunchFAI(uint32_t kernelKey, bool enableDN, bool lseMode,
                    uint32_t blockDim, aclrtStream stream,
                    uint8_t* qDevice, uint8_t* kDevice, uint8_t* vDevice,
                    uint8_t* maskDevice, uint8_t* blockTableDevice,
@@ -48,7 +48,7 @@ aclError LaunchFAI(uint32_t kernelKey, bool enableDN,
 // fai_host_api_impl.hpp. Returns ACL_SUCCESS on a registered case, or falls
 // through (returns ACL_ERROR_INVALID_PARAM) if kernelKey has no matching case.
 template <typename DType, bool IS_TND>
-aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN,
+aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN, bool lseMode,
                          uint32_t blockDim, aclrtStream stream,
                          uint8_t* qDevice, uint8_t* kDevice, uint8_t* vDevice,
                          uint8_t* maskDevice, uint8_t* blockTableDevice,

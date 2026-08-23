@@ -27,16 +27,18 @@ public:
         lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_OFFSET);
     }
 
+    template <bool LSE_MODE_>
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementO> gOutput,
                     AscendC::GlobalTensor<float> gLse,
                     uint32_t qSBlockSize,
                     uint32_t qNBlockSize,
-                    uint32_t qHeads,
+                    uint32_t lseHeadStride,
+                    bool isDN,
                     uint32_t embedV,
                     uint32_t outputStride)
     {
-        auto partition = GetFAIGroupedRowPartition(qSBlockSize, qNBlockSize, 8U);
+        auto partition = GetFAIGroupedRowPartition(qSBlockSize, qNBlockSize, isDN ? 32U : 8U);
         uint32_t rowCount = partition.validRows;
         uint32_t logicalRowStart = partition.logicalRowStart;
         if (rowCount == 0U) {
@@ -44,7 +46,6 @@ public:
         }
         uint32_t embedRound = (embedV + 15U) / 16U * 16U;
         uint32_t outputElems = rowCount * embedRound;
-        uint32_t lseElems = rowCount * LSE_ELEMS_PER_ROW;
 
         AscendC::PipeBarrier<PIPE_ALL>();
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
@@ -68,29 +69,30 @@ public:
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID6);
 
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
-        AscendC::Duplicate(
-            lseUbTensor,
-            std::numeric_limits<float>::infinity(),
-            lseElems);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
-        if (qNBlockSize == 1U) {
-            AscendC::DataCopyPad(
-                gLse[logicalRowStart * qHeads], lseUbTensor,
-                AscendC::DataCopyExtParams(rowCount, sizeof(float), 0,
-                    (qHeads - 1U) * sizeof(float), 0));
-        } else {
-            uint32_t firstHead = logicalRowStart / qSBlockSize;
-            uint32_t headCount = rowCount / qSBlockSize;
-            for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
+        if constexpr (LSE_MODE_) {
+            uint32_t lseElems = rowCount * LSE_ELEMS_PER_ROW;
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
+            AscendC::Duplicate(
+                lseUbTensor,
+                std::numeric_limits<float>::infinity(),
+                lseElems);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
+            if (qNBlockSize == 1U) {
                 AscendC::DataCopyPad(
-                    gLse[firstHead + headLocal], lseUbTensor[headLocal * qSBlockSize],
-                    AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0,
-                        (qHeads - 1U) * sizeof(float), 0));
+                    gLse[logicalRowStart], lseUbTensor,
+                    AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
+            } else {
+                uint32_t firstHead = logicalRowStart / qSBlockSize;
+                uint32_t headCount = rowCount / qSBlockSize;
+                for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
+                    AscendC::DataCopyPad(
+                        gLse[(firstHead + headLocal) * lseHeadStride], lseUbTensor[headLocal * qSBlockSize],
+                        AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0, 0, 0));
+                }
             }
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID7);
         AscendC::PipeBarrier<PIPE_ALL>();
     }
 

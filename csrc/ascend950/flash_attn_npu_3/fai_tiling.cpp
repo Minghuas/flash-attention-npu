@@ -127,6 +127,12 @@ namespace optiling{
             qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
         }
         qNBlockTile = std::min(qNBlockTile, groupSize);
+        // Keep host tiling consistent with the kernel: two AIVs can only
+        // split a multi-head grouped-Q tile evenly.  Any remaining head is
+        // scheduled as a qNBlockSize==1 tail task.
+        if (qNBlockTile > N_SPLIT_HELPER) {
+            qNBlockTile = qNBlockTile / N_SPLIT_HELPER * N_SPLIT_HELPER;
+        }
         qNBlockTile = std::max(qNBlockTile, static_cast<uint32_t>(1));
         return qNBlockTile;
     }

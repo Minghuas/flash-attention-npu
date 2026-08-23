@@ -144,6 +144,13 @@ __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize,
         tile = tile < maxTile ? tile : maxTile;
     }
     tile = tile < groupSize ? tile : groupSize;
+    // The grouped-Q execution uses two AIVs.  A multi-head tile must therefore
+    // be even; otherwise AIV1 owns an unequal 40-row tail (for example qS=20,
+    // qN=3), whose OnlineSoftmax LSE state is not valid.  Leave a single head
+    // as the only permitted odd tail.
+    if (tile > Q_N_SPLIT_ALIGN) {
+        tile = tile / Q_N_SPLIT_ALIGN * Q_N_SPLIT_ALIGN;
+    }
     return tile < 1U ? 1U : tile;
 }
 

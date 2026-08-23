@@ -36,7 +36,7 @@ namespace fai_host
         return key;
     }
 
-    aclError LaunchFAI(uint32_t kernelKey, bool enableDN,
+    aclError LaunchFAI(uint32_t kernelKey, bool enableDN, bool lseMode,
                        uint32_t blockDim, aclrtStream stream,
                        uint8_t *qDevice, uint8_t *kDevice, uint8_t *vDevice,
                        uint8_t *maskDevice, uint8_t *blockTableDevice,
@@ -54,24 +54,24 @@ namespace fai_host
         const bool is_bsnd = (kernelKey >> 5) & 1u;
         if (is_bf16) {
             if (is_bsnd) {
-                return launch_fai_dispatch<bfloat16_t, false>(kernelKey, enableDN,
+                return launch_fai_dispatch<bfloat16_t, false>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);
             } else {
-                return launch_fai_dispatch<bfloat16_t, true>(kernelKey, enableDN,
+                return launch_fai_dispatch<bfloat16_t, true>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);
             }
         } else {
             if (is_bsnd) {
-                return launch_fai_dispatch<half, false>(kernelKey, enableDN,
+                return launch_fai_dispatch<half, false>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);
             } else {
-                return launch_fai_dispatch<half, true>(kernelKey, enableDN,
+                return launch_fai_dispatch<half, true>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);

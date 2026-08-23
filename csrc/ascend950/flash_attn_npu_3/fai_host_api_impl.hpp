@@ -39,19 +39,35 @@ namespace fai_host
     case KEY(CL_, DT, MT, SW, IP, LO, CM_, PS_):                                       \
         if (enableDN)                                                                  \
         {                                                                              \
-            FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay> \
-                <<<blockDim, nullptr, stream>>>(                                        \
-                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,           \
-                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                       \
-                    workspaceDevice, tilingDevice);                                    \
+            if (lseMode) {                                                             \
+                FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, true> \
+                    <<<blockDim, nullptr, stream>>>(                                    \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            } else {                                                                    \
+                FAInferDn<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, false> \
+                    <<<blockDim, nullptr, stream>>>(                                    \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            }                                                                           \
         }                                                                              \
         else                                                                           \
         {                                                                              \
-            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay>   \
-                <<<blockDim, nullptr, stream>>>(                                        \
-                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,           \
-                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                       \
-                    workspaceDevice, tilingDevice);                                    \
+            if (lseMode) {                                                             \
+                FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, true> \
+                    <<<blockDim, nullptr, stream>>>(                                   \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            } else {                                                                    \
+                FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, false> \
+                    <<<blockDim, nullptr, stream>>>(                                   \
+                        qDevice, kDevice, vDevice, maskDevice, blockTableDevice,       \
+                        oDevice, lseDevice, qSeqDevice, kvSeqDevice,                   \
+                        workspaceDevice, tilingDevice);                                \
+            }                                                                           \
         }                                                                              \
         return ACL_SUCCESS;
 
@@ -59,11 +75,19 @@ namespace fai_host
                     T, AccT, QF, KVF, CachingMode, PageShapeType,                \
                     MaskCat, CacheLay)                                           \
     case KEY(CL_, DT, MT, SW, IP, LO, CM_, PS_):                                 \
-        FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay> \
-            <<<blockDim, nullptr, stream>>>(                                     \
-                qDevice, kDevice, vDevice, maskDevice, blockTableDevice,         \
-                oDevice, lseDevice, qSeqDevice, kvSeqDevice,                     \
-                workspaceDevice, tilingDevice);                                  \
+        if (lseMode) {                                                              \
+            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, true> \
+                <<<blockDim, nullptr, stream>>>(                                  \
+                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,      \
+                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                  \
+                    workspaceDevice, tilingDevice);                               \
+        } else {                                                                     \
+            FAInfer<T, AccT, QF, KVF, CachingMode, PageShapeType, MaskCat, CacheLay, false> \
+                <<<blockDim, nullptr, stream>>>(                                  \
+                    qDevice, kDevice, vDevice, maskDevice, blockTableDevice,      \
+                    oDevice, lseDevice, qSeqDevice, kvSeqDevice,                  \
+                    workspaceDevice, tilingDevice);                               \
+        }                                                                            \
         return ACL_SUCCESS;
 
 // Per-(dtype, layout) forward dispatch. launch_fai_dispatch is a primary
@@ -81,7 +105,7 @@ namespace fai_host
 // fai_host_api.hpp (the primary-template declaration) and emits external
 // references that resolve to these instantiations at link time.
 template <typename DType, bool IS_TND>
-aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN,
+aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN, bool lseMode,
                          uint32_t blockDim, aclrtStream stream,
                          uint8_t *qDevice, uint8_t *kDevice, uint8_t *vDevice,
                          uint8_t *maskDevice, uint8_t *blockTableDevice,

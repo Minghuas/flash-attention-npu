@@ -58,7 +58,8 @@ template <
     PageShape kvcacheShape,
     MaskCategory maskCategory,
     CacheLayout cacheLayout,
-    bool enableDN>
+    bool enableDN,
+    bool LSE_MODE_>
 class FAIKernel950 {
 public:
     using ArchTag = typename BlockMmadQK::ArchTag;
@@ -296,6 +297,17 @@ public:
             int64_t qSOffset = qSTileIdx * qBaseTile_;
             gmOffsetQ = qBOffset + qSOffset * strideQ + qNStartIdx * embed_;
             gmOffsetO = oBOffset + qSOffset * strideO + qNStartIdx * embedV_;
+            // Public LSE layout follows 910 FA3: [B, N, S] for BSND and
+            // [N, T] for TND.  Keep its head-major GM address independent
+            // from Q/O's token-major layout.
+            uint32_t lseHeadStride = static_cast<uint32_t>(faiTilingData->maxQSeqlen);
+            uint64_t lseOffset = static_cast<uint64_t>(qBOffset / strideQ) * qHeads_
+                + static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
+            if constexpr (qFormat == Format::TND) {
+                lseHeadStride = static_cast<uint32_t>(gActualQseqlen.GetValue(batch_));
+                lseOffset = static_cast<uint64_t>(qNStartIdx) * lseHeadStride
+                    + static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
+            }
             int64_t kvSOffset = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache && kvcacheShape == PageShape::BnNBsD) {
                 strideK = embed_;
@@ -353,15 +365,14 @@ public:
             uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
             uint32_t fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
             if (kvSLoopNum == 0) {
-                uint64_t qTokenOffset = static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
-                uint64_t lseOffset = qTokenOffset * qHeads_ + qNStartIdx;
 #ifdef __DAV_VEC__
-                initOutputs(
+                initOutputs.template operator()<LSE_MODE_>(
                     gO[gmOffsetO],
                     gLse[lseOffset],
                     qSBlockSize,
                     qNBlockSize,
-                    qHeads_,
+                    lseHeadStride,
+                    enableDN,
                     embedV_,
                     static_cast<uint32_t>(strideO));
 #endif
@@ -566,10 +577,8 @@ public:
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint32_t curTileMod = kvSTileIdxNow % (PRE_LAUNCH + 1);
-                    uint64_t qTokenOffset = static_cast<uint64_t>(qBOffset / strideQ + qSOffset);
-                    uint64_t lseOffset = qTokenOffset * qHeads_ + qNStartIdx;
                     if constexpr (enableDN) {
-                        epilogueRescaleO(
+                        epilogueRescaleO.template operator()<LSE_MODE_>(
                             gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
@@ -577,9 +586,10 @@ public:
                             pvReadyFlag, 1,
                             fullyMaskedRowsPerHead,
                             qSBlockSize, qNBlockSize,
+                            lseHeadStride,
                             static_cast<uint32_t>(strideO));
                     } else {
-                        epilogueRescaleO(
+                        epilogueRescaleO.template operator()<LSE_MODE_>(
                             gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
                             curTileMod, kvSTileIdxNow,
                             (kvSTileIdxNow == 0),
@@ -587,6 +597,7 @@ public:
                             pvReadyFlag, 0,
                             fullyMaskedRowsPerHead,
                             qSBlockSize, qNBlockSize,
+                            lseHeadStride,
                             static_cast<uint32_t>(strideO));
                     }
 #endif
@@ -781,7 +792,7 @@ private:
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout>
+        MaskCategory maskCategory, CacheLayout cacheLayout, bool LSE_MODE_>
 CATLASS_GLOBAL void FAInfer(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -846,7 +857,7 @@ CATLASS_GLOBAL void FAInfer(
         DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS, TileCopyRescaleO, Arch::PositionL0C>;
 
     using FAIKernel950 = FAIKernel950<
-        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, false>;
+        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LSE_MODE_>;
     FAIKernelParams params{q, k, v, mask, blockTables,
         actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
     FAIKernel950 faInfer;
@@ -856,7 +867,7 @@ CATLASS_GLOBAL void FAInfer(
 template <class InDtype, class SMDtype, 
         Format qFormat, Format kvFormat, 
         CacheMode kvcacheType, PageShape kvcacheShape, 
-        MaskCategory maskCategory, CacheLayout cacheLayout>
+        MaskCategory maskCategory, CacheLayout cacheLayout, bool LSE_MODE_>
 CATLASS_GLOBAL void FAInferDn(
     GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_ADDR blockTables,
     GM_ADDR o, GM_ADDR lse, GM_ADDR actualQseqlen, GM_ADDR actualKvseqlen,
@@ -914,7 +925,7 @@ CATLASS_GLOBAL void FAInferDn(
         DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS, TileCopyRescaleO, Arch::PositionL0C>;
 
     using FAIKernel950 = FAIKernel950<
-        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, true>;
+        BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat, kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LSE_MODE_>;
     FAIKernelParams params{q, k, v, mask, blockTables,
         actualQseqlen, actualKvseqlen, o, lse, workspace, tiling};
     FAIKernel950 faInfer;

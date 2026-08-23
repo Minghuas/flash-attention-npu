@@ -198,34 +198,59 @@ public:
         }
     }
 
+    // LSE has at most one float vector (64 elements) per sub-core.  Keep the
+    // elementwise log(sum) + max in registers, then materialize it in LM for
+    // Brcb and the existing block-aligned GM store path.
+    __simd_vf__ inline
+    void ComputeLseRegbase(__ubuf__ float *glUb, __ubuf__ float *gmUb,
+                           __ubuf__ float *lmUb, uint32_t rowCount)
+    {
+        using namespace AscendC::MicroAPI;
+        RegTensor<float> sumReg;
+        RegTensor<float> maxReg;
+        RegTensor<float> lseReg;
+        MaskReg mask = rowCount == FLOAT_VECTOR_SIZE
+            ? CreateMask<float, MaskPattern::ALL>()
+            : UpdateMask<float>(rowCount);
+        LoadAlign<float, LoadDist::DIST_NORM>(sumReg, glUb);
+        LoadAlign<float, LoadDist::DIST_NORM>(maxReg, gmUb);
+        AscendC::Reg::Ln<float>(lseReg, sumReg, mask);
+        AscendC::Reg::Add<float>(lseReg, lseReg, maxReg, mask);
+        StoreAlign<float, StoreDist::DIST_NORM_B32>(lmUb, lseReg, mask);
+    }
+
     // Keep LSE behind the final O GM write.  goUbTensor32 is free after the
     // EVENT_ID4 wait, so it is a dedicated LSE expansion scratch and never
     // aliases OnlineSoftmax's maskUb on the following task.
     __aicore__ inline
     void WriteGroupedLse(AscendC::GlobalTensor<float> gLse,
                          uint32_t qSBlockSize, uint32_t qNBlockSize,
-                         uint32_t qHeads, uint32_t fullyMaskedRowsPerHead)
+                         uint32_t lseHeadStride, bool isDN,
+                         uint32_t fullyMaskedRowsPerHead)
     {
-        auto partition = GetFAIGroupedRowPartition(qSBlockSize, qNBlockSize, 8U);
+        // LSE owns the same rows as OnlineSoftmax and PV epilogue.  In
+        // particular, DN uses 32-row ownership while the normal path uses 8.
+        // Reusing this partition is required for a single-head tail such as
+        // qS=20: DN is split as 16 + 4, not 12 + 8.
+        auto partition = GetFAIGroupedRowPartition(
+            qSBlockSize, qNBlockSize, isDN ? 32U : 8U);
         uint32_t rowCount = partition.validRows;
         if (rowCount == 0U) {
             return;
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Ln<float, false>(lmUbTensor32, glUbTensor32, (uint64_t)0,
-            CeilDiv(rowCount, FLOAT_VECTOR_SIZE), AscendC::UnaryRepeatParams(1, 1, 8, 8));
+        ComputeLseRegbase((__ubuf__ float *)glUbTensor32.GetPhyAddr(),
+            (__ubuf__ float *)gmUbTensor32.GetPhyAddr(),
+            (__ubuf__ float *)lmUbTensor32.GetPhyAddr(), rowCount);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Add<float, false>(lmUbTensor32, lmUbTensor32, gmUbTensor32, (uint64_t)0,
-            CeilDiv(rowCount, FLOAT_VECTOR_SIZE), AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-        AscendC::PipeBarrier<PIPE_V>();
+        // Brcb expands each scalar LSE into one contiguous 32-byte block.
+        // That block-aligned source is required by DataCopyPad for its 4-byte
+        // strided GM stores.
         AscendC::Brcb(goUbTensor32.template ReinterpretCast<uint32_t>(),
             lmUbTensor32.template ReinterpretCast<uint32_t>(),
             CeilDiv(rowCount, FLOAT_BLOCK_SIZE), AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
-        // Follow Ascend910's InvalidLineLSEProcess convention: Brcb expands
-        // every scalar LSE to one 32-byte block.  Mark invalid rows in that
-        // block-expanded view so every vector destination is naturally aligned.
         if (fullyMaskedRowsPerHead != 0U) {
             if (qNBlockSize == 1U) {
                 uint32_t firstLocalS = partition.logicalRowStart % qSBlockSize;
@@ -248,20 +273,16 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
-        constexpr uint32_t LSE_EXPANDED_SRC_GAP =
-            (FLOAT_BLOCK_SIZE - 1U) * sizeof(float);
         if (qNBlockSize == 1U) {
-            AscendC::DataCopyPad(gLse[partition.logicalRowStart * qHeads], goUbTensor32,
-                AscendC::DataCopyExtParams(rowCount, sizeof(float), LSE_EXPANDED_SRC_GAP,
-                    (qHeads - 1U) * sizeof(float), 0));
+            AscendC::DataCopyPad(gLse[partition.logicalRowStart], goUbTensor32,
+                AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
         } else {
             uint32_t firstHead = partition.logicalRowStart / qSBlockSize;
             uint32_t headCount = rowCount / qSBlockSize;
             for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
-                AscendC::DataCopyPad(gLse[firstHead + headLocal],
+                AscendC::DataCopyPad(gLse[(firstHead + headLocal) * lseHeadStride],
                     goUbTensor32[headLocal * qSBlockSize * FLOAT_BLOCK_SIZE],
-                    AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), LSE_EXPANDED_SRC_GAP,
-                        (qHeads - 1U) * sizeof(float), 0));
+                    AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0, 0, 0));
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
@@ -537,7 +558,7 @@ public:
         }
     }
 
-    template <class TensorDst>
+    template <bool LSE_MODE_, class TensorDst>
     __aicore__ inline
     void operator()(TensorDst &gOTensor,
                     AscendC::GlobalTensor<float> gLse,
@@ -551,6 +572,7 @@ public:
                     uint32_t fullyMaskedRowsPerHead,
                     uint32_t qSBlockSize,
                     uint32_t qNBlockSize,
+                    uint32_t lseHeadStride,
                     uint32_t outputStride)
     {
         uint32_t rowNumOri = actualOriShape[0];
@@ -616,10 +638,12 @@ public:
                 fullyMaskedRowsPerHead);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         }
-        if constexpr (std::is_same_v<SMDtype, float>) {
-            if (rowNumCurSubCore > 0U && isLastKvSTile) {
-                WriteGroupedLse(gLse, qSBlockSize, qNBlockSize, outputStride / colNumOri,
-                    fullyMaskedRowsPerHead);
+        if constexpr (LSE_MODE_) {
+            if constexpr (std::is_same_v<SMDtype, float>) {
+                if (rowNumCurSubCore > 0U && isLastKvSTile) {
+                    WriteGroupedLse(gLse, qSBlockSize, qNBlockSize, lseHeadStride,
+                        isDN, fullyMaskedRowsPerHead);
+                }
             }
         }
     }
