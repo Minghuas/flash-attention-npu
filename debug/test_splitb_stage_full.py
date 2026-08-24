@@ -326,12 +326,13 @@ def compare_all(records, iters, ref, softmax_only=False):
                         i -= rows2
                     return "b%d %s idx%d" % (b, name, i)
                 check(name, dump_flat, ref_flat, tol, 0.0, label)
-            # OTmp（desc=310+b*10+tile；每条 = AIV0 的 rows/2 行 × dPad 紧凑）
+            # OTmp（desc=600+b*10+tile，devlog #44.41 起；原 310 系在 b≥2 与 stats 撞号；
+            #       每条 = AIV0 的 rows/2 行 × dPad 紧凑）
             # softmax-only 模式：段3 未运行，跳过
             if not softmax_only:
                 dump_flat, ref_flat = [], []
                 for (t, qs, qn, qsblk, rows) in TILES:
-                    rec = nth(records, 310 + b * 10 + t, it)
+                    rec = nth(records, 600 + b * 10 + t, it)
                     if rec is not None:
                         dump_flat.extend(rec[2][: (rows // 2) * D_PAD])
                     else:
@@ -400,7 +401,7 @@ def run_kernel(iters, softmax_only=False):
     import torch
     import torch_npu
     from flash_attn_npu import flash_attn_func
-    torch.npu.set_device(1)
+    torch.npu.set_device(4)
 
     ref = make_ref()
     q = ref["q"].half().npu()
@@ -465,7 +466,7 @@ def do_compare(text, iters, softmax_only=False):
     print("\n解析到 dump 记录 %d 条，desc 集合：%s" % (len(records), descs))
     for d in sorted({100 + b * 10 + t for b in range(B) for t, *_ in TILES}
                     | {200 + b * 10 + t for b in range(B) for t, *_ in TILES}
-                    | {310 + b * 10 + t for b in range(B) for t, *_ in TILES}
+                    | {600 + b * 10 + t for b in range(B) for t, *_ in TILES}
                     | {330 + b * 10 + t for b in range(B) for t, *_ in TILES}
                     | {400 + b for b in range(B)}
                     | {450 + b for b in range(B)}):

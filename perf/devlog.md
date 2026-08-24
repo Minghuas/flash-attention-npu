@@ -797,6 +797,66 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.41**｜**【里程碑】#44.40 修复验证通过：全流程七项 -O0/-O2 × B=2/4 全绿（2026-08-24）**：
+t56（-O2）：B=2 七项全对（S/P/max/sum/OTmp/O/LSE）；B=4 仅 OTmp(b2/b3 t0) 报错——
+**desc 撞号假象**：OTmp 家族 310+b×10 在 b≥2 与 stats 家族 330+b×10 撞号（b2 t0=330
+=stats b0 t0），parser 把 stats 记录当 OTmp 比对（"错误值"0.25/0.5/0.75…正是 max
+数组小线性值）。决定性反证：O/LSE 全对（O=OTmp/sum 从真实 GM OTmp 算出）。
+修复：OTmp desc 改 **600+b×10+tile**（kernel + parser 同步；B≤9 无冲突。遗留：B≥8
+时 stats b7 t0=400 与 O b0=400 仍会撞，届时再迁 O/LSE 家族）。另：OTmp dump 的
+"data is not enough" 为 shape(2048) vs count(1024) 固有不匹配告警，B=2 亦有，无碍。
+**状态：S3（NO_MASK/fp16/B≤4/-O0/-O2）全流程正确。** 下一步：恢复 ScaleS（kernel
+注释行 + 脚本 s_sc）→ 全矩阵回归 → S4 mask/softcap → S5 性能 → S6 默认启用+清探针。
+
+**#44.40**｜**【-O2 LSE bug 定位+修复】divout 跨 tile 事件两重缺陷（2026-08-24）**：
+t55（解耦布局，B=2）：-O0 全对（t55_b2_o0.log）；-O2 仅 LSE b1 h0 s16-31 错（恰为 AIV1
+行区间；O/stats 全对）。**数值定源**：16 个错误值与 tile1(h1) 的原始 sum[16..32) **逐位
+全等**（1.528096=sm1[16] 等）——写出的不是算错的 LSE，而是未做 Ln/Add 的 h1 原始 sum。
+LSE 计算路径（divout ⑤）：Ln 就地读 glUb 写 lseUb（**lseUb≡glUb 同址**）→ Add gmUb →
+DataCopyPad(gLse)；跨 tile 顺序：t 的 LoadStats（MTE2 写 gl/gm）→ SubCoreCompute →
+末尾 O/LSE MTE3 拷贝 → 下一 tile LoadStats 覆写。**两重缺陷**：
+1. **Wait 位置错**：跨 tile 保护 Wait<MTE3_MTE2>(6) 原在 SubCoreCompute 入口——晚于
+   LoadStats 执行，gl/gm 覆写仅靠末尾 PipeBarrier<MTE3>（-O2 下不足）→ t1 的 stats
+   覆写抢在 t0 LSE 拷贝读 lseUb 之前 → 原始 sum 当 LSE 写出（数值实证的机理）。
+2. **事件无子核分域**（#44.24 同款，divout 用固定 ID0/1/2/4/6）：另一 AIV 的同 ID Set
+   可越权放行本核 wait——修 1 之后此缺陷立即成为新窗口。
+修复（splitb_divout.hpp）：① Wait<MTE3_MTE2> 移至 operator() 的 LoadStats 之前（首轮
+由 kernel init 预置 MTE3_MTE2 ID0/2 满足）；② 全部事件改 evId = 2×GetSubBlockIdx()
+（AIV0→0、AIV1→2；类型标志位空间独立，闭合对与跨 tile 共用安全，softmax 先例）。
+0 行 stub 路径的 set 同步分域。待验证：-O2/-O0 × B=2/4 全绿。
+
+**#44.39**｜**【勘误+参考背书】FAInfer 的 gP 从不复用 S 区——解耦即参考设计（2026-08-24）**：
+用户问 FAInfer 怎么处理 gP/gS。查证 mha_fwd_kvcache.cpp:160-169 + flash_api.cpp:556-565：
+workspace 分段 [LseFD|OFD|gS|gP|gOTmp|gOUpdate]，**每 stage 产物独立区段**；每核
+128×512×流水深度 3，S 系数 4B、P 系数 2B（fp16 减半直接体现在区段尺寸，无对齐应对）。
+P 布局紧凑连续（online_softmax.hpp CopyPUbToGm 行距=colsPad，无洞）；PV LayoutP 同款。
+FAInfer 的复用是**跨 tile 槽位轮转**（PRELANCH_NUM=3，QK(t+2) 覆写 S(t) 槽，flag 排序），
+读写从不落在同批同字节窗口——用内存买断这类问题。
+- **勘误 #44.23 叙事**："照搬 FAInfer 的 in-place 覆写"为误记——in-place 是 SplitB 移植时
+  自创的省 GM 优化，FAInfer 无此设计，故参考实现从未踩过跨 AIV 竞争坑。
+- **决策背书**：当前解耦布局 = FAInfer 哲学（独立 P 区/连续/零洞/零同步）；链式回归的
+  优先级降级为"仅 S5 实测 GM 成瓶颈才考虑"（stride-2 方案 #44.38 留档备查）。
+
+**#44.38**｜**回归链式的正确修法：跨距对齐（stride-2）链式，零跨 AIV 同步（2026-08-24）**：
+用户否决跨 AIV 屏障方案（性能），追问无同步的修复。解耦布局 B=4 复测亦全对（t52_full_t4_2）。
+设计：**P[t≥1] 写 S[t-1] 死区时行距用 2×colsPad（对齐 S 的 fp32 行栅格）**——P 行 r 压在
+S 行 r 的前半字节。则 AIV_s 的 P 半区（行 [sR/2,(s+1)R/2)）只落进自己刚读完的 S 行区：
+- 安全性构造性成立：tile t 的 P-copy MTE3 在本 AIV 标量流中晚于 tile t-1 compute 的
+  WaitFlag<MTE2_V>（＝自己的 S(t-1) MTE2 已完成）→ 自己的写追不上自己的读；对方 AIV
+  从不读我的行区（行对半拆分字节不交）。**零新增同步、零运行时开销**。
+- 对比事故布局：原链式 P 紧凑排（stride=colsPad）→ P 行 16-31 落 S 行 8-15（对方读区）。
+- 内存：回到 +1 slot/批（大 T 显著优于解耦的 +T slots；T=2 时两者仅差半个 slot）。
+- 改动清单：CopyPUbToGm 加 dst 行距参数；PV LayoutP stride 同步（P[0] 保 half-slot
+  紧凑则按 tileIdx 分支，或统一 stride-2 且 P[0] 开 full slot）；dump@200 按行距读；
+  host perBatchF 回 T×perTileF+pScratchF。`[需 NPU 验证]` LayoutP ld=2×colsPad 的
+  MTE1 fractal 装载。验证矩阵：-O0/-O2 × B=2/4 × sm-only/full + PRE-S 三时点一致。
+补充（用户问 PV 影响）：stride-2 下 P 为**两个连续半块**（偏移 0 与 A/2，各 R/2 行），
+仅拼接处有洞；正确性/数值零影响（ld>n 常态，LayoutS 同款）；代价 = P 装载 DMA 事务
+约 ×2（P 为最小操作数，S5 实测）。**不可能性结论**："P 连续 + 零跨 AIV 同步 + 复用
+死区"三者不可兼得——读区按行对半（R/2 行×4B），P 半区仅 R/2 行×2B，两个 P 半区总落在
+同一读区内，下半区字节上必入对方读区（按 tile 奇偶换行区分配亦然，已证）。空洞是
+零同步复用的固有代价；若 S5 不可接受则回屏障或维持解耦。
+
 **#44.37**｜**【根因定位】链式 P 的跨 AIV 写读竞争——字节级+位级双重实锤（2026-08-24）**：
 用户追问"为何解耦后 P 对、之前错在哪"。代码推演（splitb_softmax.hpp :463-481 行分摊 +
 [SOFTMAX_DEBUG] 实测 rowNumTile=64→每 AIV 单次 16 行 2KB MTE2）：

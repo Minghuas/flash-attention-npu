@@ -413,25 +413,25 @@ namespace SplitB {
             // ---- 段1 dump（devlog #44.12/#44.15，逐 tile 有效区紧凑版）----
             // 整区方案曾超 1MB 预算（数据全丢只剩最后一条）。有效 S = 每 tile 前
             // rowNum×colsPad（本配置 colsPad=Sk 无 pad），desc = 100 + b*10 + tile。
-            // if (dumpFlag && coreIdx == 0) {
-            //     AscendC::PipeBarrier<PIPE_FIX>();
-            //     for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
-            //         for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
-            //             const TileGeom tgd = GetTileGeom(qSb, qNb);
-            //             const uint32_t descD = 100 + static_cast<uint32_t>(boIdx) * 10
-            //                 + static_cast<uint32_t>(tgd.tileIdx);
-            //             AscendC::printf(
-            //                 "[SB-DUMP] stage=QK(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
-            //                 coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-            //                 tgd.qNStartIdx, tgd.rowNum, colsPad, descD);
-            //             const uint8_t dimD = 2;
-            //             uint32_t shapeD[2] = {tgd.rowNum, colsPad};
-            //             AscendC::ShapeInfo infoD(dimD, shapeD);   // 设备侧不能用初始化列表转指针（devlog #44.16）
-            //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
-            //                                 descD, tgd.rowNum * colsPad, infoD);
-            //         }
-            //     }
-            // }
+            if (dumpFlag && coreIdx == 0) {
+                AscendC::PipeBarrier<PIPE_FIX>();
+                for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
+                    for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
+                        const TileGeom tgd = GetTileGeom(qSb, qNb);
+                        const uint32_t descD = 100 + static_cast<uint32_t>(boIdx) * 10
+                            + static_cast<uint32_t>(tgd.tileIdx);
+                        AscendC::printf(
+                            "[SB-DUMP] stage=QK(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
+                            coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
+                            tgd.qNStartIdx, tgd.rowNum, colsPad, descD);
+                        const uint8_t dimD = 2;
+                        uint32_t shapeD[2] = {tgd.rowNum, colsPad};
+                        AscendC::ShapeInfo infoD(dimD, shapeD);   // 设备侧不能用初始化列表转指针（devlog #44.16）
+                        AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
+                                            descD, tgd.rowNum * colsPad, infoD);
+                    }
+                }
+            }
             AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
             Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);   // 每 batch 一次
 #endif
@@ -450,24 +450,24 @@ namespace SplitB {
             //   860 系对而 P@200 仍坏        → GM 的 S 没问题，错在 SM 的 GM→UB 搬运/事件链
             // 注意观测者效应：此处 dump 改变流水时序；若加探针后 P@200 变全对，本身即
             // "读侧时序竞争"的证据（devlog #44.34 三点一致 → 排除 PV/DO 追加写）。
-            if (dumpFlag && coreIdx == 0 && AscendC::GetSubBlockIdx() == 0) {
-                for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
-                    for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
-                        const TileGeom tgd = GetTileGeom(qSb, qNb);
-                        const uint32_t descS = 860 + static_cast<uint32_t>(boIdx) * 10
-                            + static_cast<uint32_t>(tgd.tileIdx);
-                        AscendC::printf(
-                            "[SB-DUMP] stage=PRE(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
-                            coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-                            tgd.qNStartIdx, tgd.rowNum, colsPad, descS);
-                        const uint8_t dimS = 2;
-                        uint32_t shapeS[2] = {tgd.rowNum, colsPad};
-                        AscendC::ShapeInfo infoS(dimS, shapeS);
-                        AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
-                                            descS, tgd.rowNum * colsPad, infoS);
-                    }
-                }
-            }
+            // if (dumpFlag && coreIdx == 0 && AscendC::GetSubBlockIdx() == 0) {
+            //     for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
+            //         for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
+            //             const TileGeom tgd = GetTileGeom(qSb, qNb);
+            //             const uint32_t descS = 860 + static_cast<uint32_t>(boIdx) * 10
+            //                 + static_cast<uint32_t>(tgd.tileIdx);
+            //             AscendC::printf(
+            //                 "[SB-DUMP] stage=PRE(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
+            //                 coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
+            //                 tgd.qNStartIdx, tgd.rowNum, colsPad, descS);
+            //             const uint8_t dimS = 2;
+            //             uint32_t shapeS[2] = {tgd.rowNum, colsPad};
+            //             AscendC::ShapeInfo infoS(dimS, shapeS);
+            //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
+            //                                 descS, tgd.rowNum * colsPad, infoS);
+            //         }
+            //     }
+            // }
             if constexpr (MASK_TYPE == FaiKenel::MaskType::NO_MASK) {
                 // FIXME: 理论而言，进入本kernel的QS不超过128，因此该循环次数最多为1次
                 for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
@@ -554,28 +554,28 @@ namespace SplitB {
                 // 段3 OTmp 不在此 dump：kernel 末尾的整区 float 视图 dump 一并覆盖
                 //（OTmp/stats 此时全部就绪且不再被写，devlog #44.12）
                 AscendC::PipeBarrier<PIPE_ALL>();
-                // DBG 探针（devlog #44.35）：PV 后 S 区金丝雀（desc=810+b*10+tile）。
-                // P/S 解耦后 S 自 QK 写出后本应无人再写——此处与 PRE(860) 逐值一致 →
-                // 段3 清白；出现异物 → 段3 的写落进了 S 区（GM 混用实锤）。
-                if (dumpFlag && coreIdx == 0) {
-                    AscendC::PipeBarrier<PIPE_FIX>();
-                    for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
-                        for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
-                            const TileGeom tgd = GetTileGeom(qSb, qNb);
-                            const uint32_t descD = 810 + static_cast<uint32_t>(boIdx) * 10
-                                + static_cast<uint32_t>(tgd.tileIdx);
-                            AscendC::printf(
-                                "[SB-DUMP] stage=PPV(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
-                                coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-                                tgd.qNStartIdx, tgd.rowNum, colsPad, descD);
-                            const uint8_t dimD = 2;
-                            uint32_t shapeD[2] = {tgd.rowNum, colsPad};
-                            AscendC::ShapeInfo infoD(dimD, shapeD);
-                            AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
-                                                descD, tgd.rowNum * colsPad, infoD);
-                        }
-                    }
-                }
+                // // DBG 探针（devlog #44.35）：PV 后 S 区金丝雀（desc=810+b*10+tile）。
+                // // P/S 解耦后 S 自 QK 写出后本应无人再写——此处与 PRE(860) 逐值一致 →
+                // // 段3 清白；出现异物 → 段3 的写落进了 S 区（GM 混用实锤）。
+                // if (dumpFlag && coreIdx == 0) {
+                //     AscendC::PipeBarrier<PIPE_FIX>();
+                //     for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
+                //         for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
+                //             const TileGeom tgd = GetTileGeom(qSb, qNb);
+                //             const uint32_t descD = 810 + static_cast<uint32_t>(boIdx) * 10
+                //                 + static_cast<uint32_t>(tgd.tileIdx);
+                //             AscendC::printf(
+                //                 "[SB-DUMP] stage=PPV(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
+                //                 coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
+                //                 tgd.qNStartIdx, tgd.rowNum, colsPad, descD);
+                //             const uint8_t dimD = 2;
+                //             uint32_t shapeD[2] = {tgd.rowNum, colsPad};
+                //             AscendC::ShapeInfo infoD(dimD, shapeD);
+                //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
+                //                                 descD, tgd.rowNum * colsPad, infoD);
+                //         }
+                //     }
+                // }
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);   // 每 batch 一次
             }
 #endif
@@ -631,7 +631,10 @@ namespace SplitB {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
                         const TileGeom tgd = GetTileGeom(qSb, qNb);
                         const uint64_t tileBase = batchBase + tgd.tileIdx * perTileF;
-                        const uint32_t descO = 310 + static_cast<uint32_t>(boIdx) * 10
+                        // desc=600+b*10+tile（devlog #44.41：原 310+b*10 在 b≥2 时与
+                        // stats 家族 330+b*10 撞号——B=4 的 OTmp"错误"实为 parser 读到
+                        // stats 记录的假象，O/LSE 全对已证 kernel 无恙）
+                        const uint32_t descO = 600 + static_cast<uint32_t>(boIdx) * 10
                             + static_cast<uint32_t>(tgd.tileIdx);
                         const uint32_t descS = 330 + static_cast<uint32_t>(boIdx) * 10
                             + static_cast<uint32_t>(tgd.tileIdx);
@@ -649,15 +652,15 @@ namespace SplitB {
                                                 descS, static_cast<uint32_t>(statsPerTask), infoS2);
                             continue;
                         }
-                        // AscendC::printf(
-                        //     "[SB-DUMP] stage=OTmp(fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
-                        //     coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-                        //     tgd.qNStartIdx, tgd.rowNum, dPad, descO);
-                        // const uint8_t dimD = 2;
-                        // uint32_t shapeD[2] = {tgd.rowNum, dPad};
-                        // AscendC::ShapeInfo infoD(dimD, shapeD);
-                        // AscendC::DumpTensor(gS[tileBase + s1AreaF], descO,
-                        //                     (tgd.rowNum / 2) * dPad, infoD);
+                        AscendC::printf(
+                            "[SB-DUMP] stage=OTmp(fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
+                            coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
+                            tgd.qNStartIdx, tgd.rowNum, dPad, descO);
+                        const uint8_t dimD = 2;
+                        uint32_t shapeD[2] = {tgd.rowNum, dPad};
+                        AscendC::ShapeInfo infoD(dimD, shapeD);
+                        AscendC::DumpTensor(gS[tileBase + s1AreaF], descO,
+                                            (tgd.rowNum / 2) * dPad, infoD);
                         AscendC::printf(
                             "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..rows)+sum[128..128+rows) desc=%u\n",
                             coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
@@ -675,55 +678,36 @@ namespace SplitB {
                 }
                 if (!softmaxOnly) {   // 段4 未运行不 dump O/LSE（devlog #44.26）
                 {
-                    // DBG 探针（devlog #44.35）：divout 后 S 区金丝雀（desc=840+b*10+tile）。
-                    // 位于段4 wait pvReady 之后，本批 PV/DO 均已完成。三时点 S 应逐值一致
-                    // （PRE=860 → PPV=810 → FIN=840）；首个出现异物的时点即凶手段。
-                    for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
-                        for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
-                            const TileGeom tgd = GetTileGeom(qSb, qNb);
-                            const uint32_t descP = 840 + static_cast<uint32_t>(boIdx) * 10
-                                + static_cast<uint32_t>(tgd.tileIdx);
-                            AscendC::printf(
-                                "[SB-DUMP] stage=FIN(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
-                                coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-                                tgd.qNStartIdx, tgd.rowNum, colsPad, descP);
-                            const uint8_t dimP = 2;
-                            uint32_t shapeP[2] = {tgd.rowNum, colsPad};
-                            AscendC::ShapeInfo infoP(dimP, shapeP);
-                            AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
-                                                descP, tgd.rowNum * colsPad, infoP);
-                        }
-                    }
                     const uint8_t dimD = 2;
                     uint32_t shapeD[2] = {static_cast<uint32_t>(qSeqlen),
                                           static_cast<uint32_t>(strideO)};
                     AscendC::ShapeInfo infoD(dimD, shapeD);
-                AscendC::printf(
-                    "[SB-DUMP] stage=O(fp16 final) core=%u b=%u rows=%u cols=%u layout=s*%u+h*%u+d desc=%u\n",
-                    coreIdx, (uint32_t)boIdx,
-                    static_cast<uint32_t>(qSeqlen), static_cast<uint32_t>(embed * qHeads),
-                    static_cast<uint32_t>(strideO), static_cast<uint32_t>(embed),
-                    400 + static_cast<uint32_t>(boIdx));
-                AscendC::DumpTensor(gO[static_cast<uint64_t>(boIdx) * qSeqlen * strideO],
-                                    400 + static_cast<uint32_t>(boIdx),
-                                    static_cast<uint32_t>(qSeqlen * strideO),
-                                    infoD);
+                    AscendC::printf(
+                        "[SB-DUMP] stage=O(fp16 final) core=%u b=%u rows=%u cols=%u layout=s*%u+h*%u+d desc=%u\n",
+                        coreIdx, (uint32_t)boIdx,
+                        static_cast<uint32_t>(qSeqlen), static_cast<uint32_t>(embed * qHeads),
+                        static_cast<uint32_t>(strideO), static_cast<uint32_t>(embed),
+                        400 + static_cast<uint32_t>(boIdx));
+                    AscendC::DumpTensor(gO[static_cast<uint64_t>(boIdx) * qSeqlen * strideO],
+                                        400 + static_cast<uint32_t>(boIdx),
+                                        static_cast<uint32_t>(qSeqlen * strideO),
+                                        infoD);
                 }
                 {
                     const uint8_t dimD = 2;
                     uint32_t shapeD[2] = {static_cast<uint32_t>(qHeads),
                                           static_cast<uint32_t>(qSeqlen)};
                     AscendC::ShapeInfo infoD(dimD, shapeD);
-                AscendC::printf(
-                    "[SB-DUMP] stage=LSE(ln(sum)+max) core=%u b=%u heads=%u tokens=%u layout=h*%u+s desc=%u\n",
-                    coreIdx, (uint32_t)boIdx,
-                    static_cast<uint32_t>(qHeads), static_cast<uint32_t>(qSeqlen),
-                    static_cast<uint32_t>(qSeqlen),
-                    450 + static_cast<uint32_t>(boIdx));
-                AscendC::DumpTensor(gLse[static_cast<uint64_t>(boIdx) * qHeads * qSeqlen],
-                                    450 + static_cast<uint32_t>(boIdx),
-                                    static_cast<uint32_t>(qHeads * qSeqlen),
-                                    infoD);
+                    AscendC::printf(
+                        "[SB-DUMP] stage=LSE(ln(sum)+max) core=%u b=%u heads=%u tokens=%u layout=h*%u+s desc=%u\n",
+                        coreIdx, (uint32_t)boIdx,
+                        static_cast<uint32_t>(qHeads), static_cast<uint32_t>(qSeqlen),
+                        static_cast<uint32_t>(qSeqlen),
+                        450 + static_cast<uint32_t>(boIdx));
+                    AscendC::DumpTensor(gLse[static_cast<uint64_t>(boIdx) * qHeads * qSeqlen],
+                                        450 + static_cast<uint32_t>(boIdx),
+                                        static_cast<uint32_t>(qHeads * qSeqlen),
+                                        infoD);
                 }
                 }   // if (!softmaxOnly)——O/LSE dump 门控闭合（devlog #44.26）
             }

@@ -100,8 +100,10 @@ public:
         // PipeBarrier<PIPE_MTE2>（devlog #44.10）：防 Scalar 的 set_flag 早于 MTE2
         // 拷贝完成发射（-O2 Scalar/MTE2 发射乱序窗口）
         AscendC::PipeBarrier<PIPE_MTE2>();
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
+        // 子核事件分域（devlog #44.40）：AIV0 用 0、AIV1 用 2（详见 SubCoreCompute 头注释）
+        const uint32_t evId = 2 * AscendC::GetSubBlockIdx();
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evId);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evId);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
@@ -158,7 +160,14 @@ public:
         const uint32_t qSBlockSize = layoutOutput.shape(0);
         const uint32_t oHiddenSize = layoutOutput.shape(1);
 
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
+        // 子核事件分域（devlog #44.40，softmax #44.24 同款）：HardEvent 为核级共享，
+        // 固定 ID（原 EVENT_ID0/1/2/4/6）会被另一 AIV 的同 ID Set 越权释放。
+        // evId = 2×subIdx：AIV0 用 0、AIV1 用 2；各 HardEvent 类型的标志位空间独立，
+        // 同 id 不同类型不冲突（softmax 先例）。Set+Wait 相邻闭合对与跨 tile 的
+        // MTE3_MTE2 共用本核 id 均安全（无生命周期交叠）。
+        // 跨 tile 的 Wait<MTE3_MTE2> 已移至 operator() 的 LoadStats 之前（#44.40：
+        // 原在此入口——晚于 LoadStats 执行，护不住 gl/gm 覆写）。
+        const uint32_t evId = 2 * AscendC::GetSubBlockIdx();
 
         // ① go = OTmp 块（单遍 isFirst 分支：GM 直读 GO，照抄 FAInfer）
         AscendC::DataCopy(
@@ -166,8 +175,8 @@ public:
             AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
         // PipeBarrier<PIPE_MTE2>（devlog #44.10）：同 ① LoadStats 加固
         AscendC::PipeBarrier<PIPE_MTE2>();
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evId);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evId);
 
         // ② go = go / gl（单遍 isLast 分支：gl 已由 LoadStats 从 GM 读入 UB）
         AscendC::Brcb(
@@ -176,8 +185,8 @@ public:
             curRowNumRound / FLOAT_BLOCK_SIZE,
             AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();  // FIXME: 补充同步！
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evId);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evId);
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         for (uint32_t vdiv_idx = 0; vdiv_idx < embed / FLOAT_VECTOR_SIZE; ++vdiv_idx) {
             AscendC::Div<float, false>(
@@ -220,8 +229,8 @@ public:
 
         // PipeBarrier<PIPE_V>（devlog #44.10）：防 Scalar 的 set_flag 早于 V 完成
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evId);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evId);
 
         // ④ O 散射写 GM（gOutput 基址已含本行块的头偏移，照抄 FAInfer）
         CopyOToGm(
@@ -246,8 +255,8 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
 
             // V→MTE2 自配对：Ln/Add 写 lseUb 完成后 Brcb 才读（跨 pipe RAW，devlog #44.6）
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evId);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evId);
             // LSE 广播用独立目标区（tvUb 偏移 FLOAT_VECTOR_SIZE）：与 ② Div 的除数
             // 广播区分离，消除 ②/⑤ 对 tvUb[0..) 的 WAR/RAW 竞争（devlog #44.6：
             // -O2 下 ⑤ Brcb 曾覆盖 ② 的除数 → h7 除数为 LSE 值 15.472 的实证）
@@ -257,8 +266,8 @@ public:
                 CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                 AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();  // FIXME: 补充同步！
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evId);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evId);
 
             if (qNThisSubBlock == 0U) {
                 // 单头 tile：连续行直写（gLse 基址已含 token 偏移，照抄 FAInfer）
@@ -282,7 +291,7 @@ public:
         // PipeBarrier<PIPE_MTE3>（devlog #44.10）：防 Scalar 的 set_flag 早于 MTE3
         // 的 O/LSE 拷贝完成发射
         AscendC::PipeBarrier<PIPE_MTE3>();
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(evId);
     }
 
     __aicore__ inline
@@ -332,7 +341,7 @@ public:
             stubParams.srcStride = 0;
             stubParams.dstStride = 0;
             AscendC::DataCopyPad(gOutput, goUbTensor16, stubParams);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(2 * AscendC::GetSubBlockIdx());   // #44.40 分域
             return;
         }
 
@@ -346,6 +355,14 @@ public:
             const uint32_t rowOffsetCurLoop = inRowOffsetThisSubBlock + rowOffsetLoop;
             const uint32_t rowActualCurLoop =
                 (rowLoopIdx == (rowLoopNum - 1U)) ? inRowActualThisSubBlock - rowLoopIdx * rowNumTile : rowNumTile;
+
+            // 上一 tile 的 O/LSE MTE3 读（goUb16 / lseUb≡glUb）全部完成后，才允许
+            // LoadStats 的 MTE2 写覆写 gl/gm（devlog #44.40：原 Wait 在 SubCoreCompute
+            // 入口，晚于 LoadStats → 护不住；-O2 下末尾的 PipeBarrier<MTE3> 不足，
+            // t1 的 stats 覆写抢在 t0 LSE 拷贝读之前 → b1 h0 s16-31 的 LSE 写出 h1
+            // 的原始 sum，t55 逐位实证）。evId 分域防另一 AIV 的 Set 越权放行本 wait
+            //（#44.24/#44.40）；首轮由 kernel init 预置（MTE3_MTE2 ID 0/2 已 set）。
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(2 * AscendC::GetSubBlockIdx());
 
             // stats GM→UB（全局行偏移；与 SplitBSoftmax::CopyStatsToGm 布局严格配对）
             LoadStats(gStats, rowOffsetCurLoop, rowActualCurLoop);
