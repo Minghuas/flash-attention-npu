@@ -797,6 +797,24 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.44**｜**【清理】workspace 规范化：P 区独立基址 + 布局量命名对齐 FAInfer（2026-08-24）**：
+用户清理阶段第一步（历史遗留：链式时代 gS/gP 同基址 + 寻址掺混合偏移）。改动：
+- **布局重排**：每核两段连续 [tile 区（2 批 × T tile 块）| P 区（2 批 × T 槽）]——
+  原"#44.35 每批内交错 [tiles|P 槽]"废止。总量不变（perCoreElems = 2×T×(perTileElems+pSlotElems)）。
+- **独立基址**：gS/gOTmp/gStats → 本核 tile 区首；**gP → 本核 P 区首**（独立指针）。
+  视图含 coreWsOffset，runMainLoop 的 batchBase = batchBuf×perBatchTileElems（不再掺
+  coreWsOffset，签名删参）；GetPHalfIdx(batchBuf, tileIdx) 一行寻址（原实现掺
+  batchBase+tile 区偏移，是链式遗留的不优雅）。
+- **命名规约**（用户指出 F 后缀含义不明）：废除 *F 后缀，改 **\*Elems = float 元素数**
+  （对齐 FAInfer 元素计数语义 MAX_UB_S_ELEM_NUM）：sTileElems/pSlotElems/oTmpTileElems/
+  perTileElems/perBatchTileElems/tileAreaElems/perCoreElems；coreWsF→coreWsOffset。
+  kernel+host 同步重命名；FAInfer 区段对照（S=mm1Out/P=smOnlineOut/OTmp=mm2Out）记于
+  成员声明注释。
+待验证：重编译后 -O2 B=2/4 七项全绿（布局等总量重排，功能不应变化）。
+追加（用户要求）：**GetPHalfIdx 整个删除**——P 偏移与 gS 同款就地计算
+（`pOff = (batchBuf×T + tileIdx)×pSlotElems×2`，紧邻 sOff/oOff 声明；dump 点内联同式），
+顺带修正 PV 处过时的"P 为 S 区原地视图"注释（链式时代残留）。
+
 **#44.43**｜**【S3 完成】ScaleS 恢复后全矩阵回归全绿（2026-08-24）**：
 用户复测（t57）：-O2 B=2/4（含 B=6 抽查）七项全对——S3（NO_MASK/fp16/B≤4）全流程
 正确收官。本阶段（#44.12-#44.43）三大根因：①P/S GM 复用跨 AIV 竞争（#44.23/#44.37，

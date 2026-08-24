@@ -119,10 +119,6 @@ namespace SplitB {
         __aicore__ inline
         void operator()(FAIKernelParams const &params)
         {
-            // 调试标识：块号（CUBE/VEC 通用）+ 子块号（仅 VEC 段使用，区分双 AIV）；
-            // 插入各 printf 标识来源核。调通后随 #42 清单移除。
-            const uint32_t dbgBlockIdx = AscendC::GetBlockIdx();
-
             // ---- tiling 读取（GM→栈；getter 为 [host]，设备侧直访公有字段） ----
             SplitBTilingData tilingLocal;
             const __gm__ uint8_t *src = reinterpret_cast<const __gm__ uint8_t *>(params.tiling);
@@ -148,8 +144,6 @@ namespace SplitB {
             dumpFlag = (in.dumpFlag != 0);     // 设备 Dump Tensor 探针开关（env FLASH_ATTN_SPLITB_DUMP，devlog #44）
             softmaxOnly = (in.softmaxOnly != 0); // 只跑段1+2（env FLASH_ATTN_SPLITB_SOFTMAX_ONLY，devlog #44.25）
             splitFactorSize = tilingLocal.multiCoreParams.splitFactorSize;
-            // AscendC::printf("4103 [SB] blk=%u operator called debugFlag=%u\n",
-                            // dbgBlockIdx, (uint32_t)in.debugFlag);
 
             AscendC::GlobalTensor<ElementQ> gQ;
             gQ.SetGlobalBuffer((__gm__ ElementQ *)params.q);
@@ -161,24 +155,7 @@ namespace SplitB {
             gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
             AscendC::GlobalTensor<float> gLse;
             gLse.SetGlobalBuffer((__gm__ float *)params.lse);
-            // ws 三视图（与 splitb_host.cpp 分配公式严格一致）：
-            //   S/OTmp/stats 为 float 视图；P 为 fp16 视图——批尾独立 P 区（devlog #44.35
-            //   临时全解耦调试布局：P[t]→批尾第 t 槽；修 bug 后回归 #44.23 链式优化）
-            AscendC::GlobalTensor<ElementS> gS;
-            AscendC::GlobalTensor<ElementP> gP;
-            AscendC::GlobalTensor<ElementOTmp> gOTmp;
-            AscendC::GlobalTensor<float> gStats;
-            __gm__ uint8_t *ws = reinterpret_cast<__gm__ uint8_t *>(params.workSpace);
-            __gm__ float *wsF = reinterpret_cast<__gm__ float *>(ws);
-            gS.SetGlobalBuffer(wsF);
-            gP.SetGlobalBuffer((__gm__ ElementP *)ws); // FIXME: S和P复用了相同的地址空间，在这种整Batch粒度做流水会出错！
-            gOTmp.SetGlobalBuffer(wsF);
-            gStats.SetGlobalBuffer(wsF);
-            AscendC::GlobalTensor<int32_t> gBlockTable;   // 非 paged 占位（FAInfer 非 paged 分支不触碰）
-
-            GlobalTensorBundle globalTensors{
-                gQ, gK, gV, gS, gP, gOTmp, gStats, gO, gLse, gBlockTable
-            };
+            // ws 四视图（gS/gP/gOTmp/gStats）依赖布局参数，移至几何段之后设置（devlog #44.44）
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
 #ifdef __DAV_C220_CUBE__
@@ -249,25 +226,19 @@ namespace SplitB {
             dPad = RoundUp(static_cast<uint32_t>(embed), FaiKenel::BLOCK_SIZE);
             blockStackNum = CeilDiv(S2_STACK_LEN, pagedBlockSize);   // 非 paged 且 PV 体内未使用（残留参数，#36）；=1
 
-            // ---- workspace 布局（单位一律为 float 元素个数；与 splitb_host.cpp 公式严格一致，devlog #34/#44.23） ----
-            // 整体分层：workspace = 各核连续分段；每核 = ping/pong 两个批缓冲；每批 = 逐 tile 块 + 批尾 P-scratch：
-            //   coreWsF → [batchBuf0（本核奇偶批 0）: T × tile 块 + P-scratch][batchBuf1: 同构]
-            //   每 tile 块 = [S 区 | OTmp 区 | stats 区]（三区面积 + 求和）
-            //
-            // 【P 区独立：全解耦方案（devlog #44.35 临时调试布局——修 bug 后回归 #44.23 链式优化）】
-            //   背景：full 流水下 P(b1,t0) 在 SM 写出即坏（200/810/840 三点数值一致）且
-            //   指纹自洽（坏行 = "S≈0 输入"的正确 softmax 结果：max≈0/sum≈32/P≈0.992）
-            //   → 疑点在 SM 读到的 S。为剔除"P 借 S 死区"这一变量，P 完全独立 GM 空间：
-            //     P[t] → 批尾独立 P 区第 t 槽（batchBase + T×perTileF + t×pScratchF）
-            //   解耦红利：S 自 QK 写出后永无人覆写 → 任意时点 dump gS 都是干净观测。
-            //   空间开销：每批 +T 个 P 槽（链式为 +1 个）——仅调试期接受。
-            // ⚠ 回归链式（#44.23）时：GetPHalfIdx 改死区寻址 + host/kernel perBatchF 尾区
-            //   只留 1 槽；softmax 的 MTE2_V 事件链未动，回归时零改动可用。
-            s1AreaF = static_cast<uint64_t>(Q_TILE_CEIL) * colsPad;   // 单 tile 的 S 区大小（fp32 元素计）
-            pScratchF = s1AreaF / 2;                                  // 单 P 槽大小（128×colsPad 个 half = S 区一半，fp32 元素计；#44.35 起批尾 T 槽全独立）
-            oAreaF = static_cast<uint64_t>(Q_TILE_CEIL) * dPad;       // 单 tile 的 OTmp 区大小（PV 未归一 O，fp32）
+            // ---- workspace 布局（单位一律为 float 元素个数；与 splitb_host.cpp 公式严格一致）----
+            // devlog #44.44 规范化（FAInfer 哲学）：每核两段连续，P 与 tile 区完全独立——
+            //   coreWsOffset → [tile 区: batchBuf0 的 T tile 块 | batchBuf1 的 T tile 块]
+            //             [P 区:   batchBuf0 的 T P 槽 | batchBuf1 的 T P 槽]
+            //   每 tile 块 = [S 区 | OTmp 区 | stats 区]；gP 基址 = 本核 P 区首（独立指针）。
+            // 历史注（#44.23/#44.35/#44.37）：P 曾复用 S 区（in-place→链式死区），批流水下
+            //   跨 AIV 写读竞争致 P(b1,t0) s8-15 坏 → 全解耦。链式回归仅 S5 实测 GM 成瓶颈
+            //   才考虑（stride-2 方案 #44.38 留档；softmax 的 MTE2_V 事件链未动）。
+            sTileElems = static_cast<uint64_t>(Q_TILE_CEIL) * colsPad;   // 单 tile 的 S 区大小（fp32 元素计）
+            pSlotElems = sTileElems / 2;                                  // 单 P 槽大小（128×colsPad 个 half = S 区一半，fp32 元素计）
+            oTmpTileElems = static_cast<uint64_t>(Q_TILE_CEIL) * dPad;       // 单 tile 的 OTmp 区大小（PV 未归一 O，fp32）
             statsPerTask = 2 * static_cast<uint64_t>(Q_TILE_CEIL);    // 单 tile 的行统计区：max 128 + sum 128
-            perTileF = s1AreaF + oAreaF + statsPerTask;               // 单 tile 块总大小（三区之和；P 不占 tile 块）
+            perTileElems = sTileElems + oTmpTileElems + statsPerTask;               // 单 tile 块总大小（三区之和；P 不占 tile 块）
 
             // ---- tile 几何（FAInfer :513-517，device 侧公式） ----
             curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), static_cast<uint32_t>(groupSize));
@@ -275,17 +246,34 @@ namespace SplitB {
             curQNBlockNum = qNBlockNumPerGroup * static_cast<uint32_t>(kvHeads);
             curQSBlockTile = GetQSBlockTile(static_cast<uint32_t>(kvSeqlen));
             curQSBlockNum = CeilDiv(static_cast<uint32_t>(qSeqlen), curQSBlockTile);
-            const uint64_t tileNumT = static_cast<uint64_t>(curQNBlockNum) *
+            tileNumPerBatch = static_cast<uint64_t>(curQNBlockNum) *
                 static_cast<uint64_t>(curQSBlockNum);                 // 批内 tile 数 T
-            perBatchF = tileNumT * (perTileF + pScratchF);
-                                                                      // 单 batch 缓冲 = T×(tile 块 + 1 个独立 P 槽)——#44.35 调试
-                                                                      // 布局；回归 #44.23 链式时改为 tileNumT*perTileF + pScratchF
-                                                                      // （P[t≥1] 借 S[t-1] 死区，批内 tile 块不复用：批级 flag 下
-                                                                      //   全批中间结果须并存；复用仅 P 死区与 ping/pong 批槽两层）
-            perCoreF = 2 * perBatchF;                                 // 单核配额 = ping/pong 两个批缓冲（×2）
+            perBatchTileElems = tileNumPerBatch * perTileElems;               // 单批 tile 区（ping/pong 槽内 tile 块连续）
+            tileAreaElems = 2 * perBatchTileElems;                        // 本核 tile 区总大小（两批）
+            perCoreElems = tileAreaElems + 2 * tileNumPerBatch * pSlotElems;
+                                                                      // 单核配额 = tile 区 + P 区（每批 T 个独立 P 槽；批内
+                                                                      //   tile 块不复用：批级 flag 下全批中间结果须并存）
 
             // ---- 核间 B 切分（aic 基数；CUBE 用原始 blockIdx、VEC 除以子核数，照 FAInfer :178/:235） ----
-            const uint64_t coreWsF = static_cast<uint64_t>(coreIdx) * perCoreF;  // 本核 workspace 基址偏移（float 元素计，= 前面所有核配额之和）
+            const uint64_t coreWsOffset = static_cast<uint64_t>(coreIdx) * perCoreElems;  // 本核 workspace 基址偏移（float 元素计，= 前面所有核配额之和）
+
+            // ---- ws 四视图（devlog #44.44 规范化：各视图基址 = 本核对应区首，寻址不再掺 coreWsOffset）----
+            // gS/gOTmp/gStats → 本核 tile 区首；gP → 本核 P 区首（独立指针，FAInfer 哲学）
+            __gm__ uint8_t *ws = reinterpret_cast<__gm__ uint8_t *>(params.workSpace);
+            AscendC::GlobalTensor<ElementS> gS;
+            AscendC::GlobalTensor<ElementP> gP;
+            AscendC::GlobalTensor<ElementOTmp> gOTmp;
+            AscendC::GlobalTensor<float> gStats;
+            gS.SetGlobalBuffer(reinterpret_cast<__gm__ ElementS *>(ws + coreWsOffset * sizeof(float)));
+            gOTmp.SetGlobalBuffer(reinterpret_cast<__gm__ ElementOTmp *>(ws + coreWsOffset * sizeof(float)));
+            gStats.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(ws + coreWsOffset * sizeof(float)));
+            gP.SetGlobalBuffer(reinterpret_cast<__gm__ ElementP *>(
+                ws + (coreWsOffset + tileAreaElems) * sizeof(float)));
+            AscendC::GlobalTensor<int32_t> gBlockTable;   // 非 paged 占位（FAInfer 非 paged 分支不触碰）
+
+            GlobalTensorBundle globalTensors{
+                gQ, gK, gV, gS, gP, gOTmp, gStats, gO, gLse, gBlockTable
+            };
             int64_t batchStart = static_cast<int64_t>(coreIdx) * splitFactorSize;   // 本核负责的批区间起点（host 按核均分 B）
             int64_t batchEnd = batchStart + splitFactorSize;
             if (batchSize < batchEnd) {
@@ -305,7 +293,7 @@ namespace SplitB {
                                 curQNBlockNum * curQSBlockNum);
             }
             for (int64_t boIdx = batchStart; boIdx < batchEnd; ++boIdx) {
-                runMainLoop(coreIdx, boIdx, coreWsF, globalTensors);
+                runMainLoop(coreIdx, boIdx, globalTensors);
             }
 
             // ---- 收尾：事件全量 drain（照抄 FAInfer :372-410，保证异步拷贝全部落盘） ----
@@ -362,7 +350,6 @@ namespace SplitB {
         __aicore__ inline void runMainLoop(
             uint32_t coreIdx,
             int64_t boIdx,
-            uint64_t coreWsF,
             GlobalTensorBundle& globalTensors
         ) {
             auto& gQ = globalTensors.gQ;
@@ -377,7 +364,8 @@ namespace SplitB {
             auto& gBlockTable = globalTensors.gBlockTable;
 
             const uint64_t batchBuf = static_cast<uint64_t>(boIdx) % 2;   // ping/pong 槽（照搬参考）
-            const uint64_t batchBase = coreWsF + batchBuf * perBatchF;
+            // batchBase 相对本核 tile 区首（视图已含 coreWsOffset，devlog #44.44）
+            const uint64_t batchBase = batchBuf * perBatchTileElems;
 
             // ==================== 段1：QK 全部 tile → S 写批缓冲（CUBE） ====================
 #ifdef __DAV_C220_CUBE__
@@ -395,7 +383,7 @@ namespace SplitB {
                         static_cast<uint64_t>(tg.qNStartIdx) * embed;
                     const uint64_t gmK = static_cast<uint64_t>(boIdx) * kvSeqlen * strideK +
                         static_cast<uint64_t>(tg.kvNIdx) * embed;
-                    const uint64_t sOff = batchBase + tg.tileIdx * perTileF;
+                    const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
 
                     LayoutQ layoutQTemp(tg.rowNum, static_cast<uint32_t>(embed));
                     LayoutK layoutKTemp(strideK, static_cast<uint32_t>(kvSeqlen));
@@ -427,12 +415,12 @@ namespace SplitB {
                         const uint8_t dimD = 2;
                         uint32_t shapeD[2] = {tgd.rowNum, colsPad};
                         AscendC::ShapeInfo infoD(dimD, shapeD);   // 设备侧不能用初始化列表转指针（devlog #44.16）
-                        AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
+                        AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileElems],
                                             descD, tgd.rowNum * colsPad, infoD);
                     }
                 }
             }
-            AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
+            // AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
             Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);   // 每 batch 一次
 #endif
 
@@ -463,7 +451,7 @@ namespace SplitB {
             //             const uint8_t dimS = 2;
             //             uint32_t shapeS[2] = {tgd.rowNum, colsPad};
             //             AscendC::ShapeInfo infoS(dimS, shapeS);
-            //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
+            //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileElems],
             //                                 descS, tgd.rowNum * colsPad, infoS);
             //         }
             //     }
@@ -473,13 +461,16 @@ namespace SplitB {
                 for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                     for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                         const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
-                        const uint64_t sOff = batchBase + tg.tileIdx * perTileF;
-                        const uint64_t statOff = sOff + s1AreaF + oAreaF;
+                        const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                        const uint64_t statOff = sOff + sTileElems + oTmpTileElems;
+                        // P 槽 half 偏移（与 gS 同款就地计算）：槽号 = 批内槽基 + tileIdx；
+                        // pSlotElems 为 float 计，×2 换 half（gP 为 fp16 视图）
+                        const uint64_t pOff = (batchBuf * tileNumPerBatch + tg.tileIdx) * pSlotElems * 2;
                         LayoutP layOutP(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
                         LayoutS layOutS(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
                         GemmCoord actualBlockShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
                                                     static_cast<uint32_t>(embed)};
-                        smEpilogue(gP[GetPHalfIdx(batchBase, tg.tileIdx)], gS[sOff], gStats[statOff],
+                        smEpilogue(gP[pOff], gS[sOff], gStats[statOff],
                                 layOutP, layOutS, actualBlockShapeQK,
                                 tg.qSBlockSize, tg.qNBlockSize);
                     }
@@ -504,14 +495,14 @@ namespace SplitB {
                         const uint8_t dimD = 2;
                         uint32_t shapeD[2] = {tgd.rowNum, colsPad};
                         AscendC::ShapeInfo infoD(dimD, shapeD);
-                        AscendC::DumpTensor(gP[GetPHalfIdx(batchBase, tgd.tileIdx)],
+                        AscendC::DumpTensor(gP[(batchBuf * tileNumPerBatch + tgd.tileIdx) * pSlotElems * 2],
                                             descD, tgd.rowNum * colsPad, infoD);
                     }
                 }
             }
             // 每 batch 一次（双 AIV 各自执行；FAInfer :849 同款段尾单点）：
             // PIPE_MTE3 保证在本分支全部 P/stats 拷贝之后才置位
-            AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
+            // AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
             Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
 #endif
 
@@ -531,8 +522,10 @@ namespace SplitB {
                 for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                     for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                         const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
-                        const uint64_t sOff = batchBase + tg.tileIdx * perTileF;
-                        const uint64_t oOff = sOff + s1AreaF;
+                        const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                        const uint64_t oOff = sOff + sTileElems;
+                        // P 槽 half 偏移（与 gS 同款就地计算；pSlotElems float 计 ×2 → half）
+                        const uint64_t pOff = (batchBuf * tileNumPerBatch + tg.tileIdx) * pSlotElems * 2;
                         const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
                             static_cast<uint64_t>(tg.kvNIdx) * embed;
 
@@ -542,9 +535,8 @@ namespace SplitB {
                         GemmCoord actualBlockShapePV{tg.rowNum, static_cast<uint32_t>(embed),
                                                     static_cast<uint32_t>(kvSeqlen)};
                         // softmaxFlag 的等待由 DispatchPolicyPV 的 WAIT_SOFTMAX=false 编译期
-                        // 关闭（上方批级 Wait 已承担同步，#39/#40）。P 为 S 区原地 fp16 视图：
-                        // half 索引 = 2×float 索引（见 workspace 注释）
-                        blockMmadPV(gP[GetPHalfIdx(batchBase, tg.tileIdx)], gV[gmV], gOTmp[oOff], gBlockTable,
+                        // 关闭（上方批级 Wait 已承担同步，#39/#40）
+                        blockMmadPV(gP[pOff], gV[gmV], gOTmp[oOff], gBlockTable,
                                 layoutPTemp, layoutVTemp, layoutOTmpT, actualBlockShapePV,
                                 kvSIdx, kvSLoopNumTotal, pagedBlockSize,
                                 static_cast<uint32_t>(kvSeqlen), strideV,
@@ -553,7 +545,7 @@ namespace SplitB {
                 }
                 // 段3 OTmp 不在此 dump：kernel 末尾的整区 float 视图 dump 一并覆盖
                 //（OTmp/stats 此时全部就绪且不再被写，devlog #44.12）
-                AscendC::PipeBarrier<PIPE_ALL>();
+                // AscendC::PipeBarrier<PIPE_ALL>();
                 // // DBG 探针（devlog #44.35）：PV 后 S 区金丝雀（desc=810+b*10+tile）。
                 // // P/S 解耦后 S 自 QK 写出后本应无人再写——此处与 PRE(860) 逐值一致 →
                 // // 段3 清白；出现异物 → 段3 的写落进了 S 区（GM 混用实锤）。
@@ -571,7 +563,7 @@ namespace SplitB {
                 //             const uint8_t dimD = 2;
                 //             uint32_t shapeD[2] = {tgd.rowNum, colsPad};
                 //             AscendC::ShapeInfo infoD(dimD, shapeD);
-                //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileF],
+                //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileElems],
                 //                                 descD, tgd.rowNum * colsPad, infoD);
                 //         }
                 //     }
@@ -594,9 +586,9 @@ namespace SplitB {
                     for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                         for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                             const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
-                            const uint64_t sOff = batchBase + tg.tileIdx * perTileF;
-                            const uint64_t oOff = sOff + s1AreaF;
-                            const uint64_t statOff = sOff + s1AreaF + oAreaF;
+                            const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                            const uint64_t oOff = sOff + sTileElems;
+                            const uint64_t statOff = sOff + sTileElems + oTmpTileElems;
                             const uint64_t gmO = static_cast<uint64_t>(boIdx) * qSeqlen * strideO +
                                 static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile * strideO +
                                 static_cast<uint64_t>(tg.qNStartIdx) * embed;
@@ -630,7 +622,7 @@ namespace SplitB {
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
                         const TileGeom tgd = GetTileGeom(qSb, qNb);
-                        const uint64_t tileBase = batchBase + tgd.tileIdx * perTileF;
+                        const uint64_t tileBase = batchBase + tgd.tileIdx * perTileElems;
                         // desc=600+b*10+tile（devlog #44.41：原 310+b*10 在 b≥2 时与
                         // stats 家族 330+b*10 撞号——B=4 的 OTmp"错误"实为 parser 读到
                         // stats 记录的假象，O/LSE 全对已证 kernel 无恙）
@@ -648,7 +640,7 @@ namespace SplitB {
                                 "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..128)+sum[128..256) desc=%u\n",
                                 coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
                                 tgd.qNStartIdx, tgd.rowNum, descS);
-                            AscendC::DumpTensor(gS[tileBase + s1AreaF + oAreaF],
+                            AscendC::DumpTensor(gS[tileBase + sTileElems + oTmpTileElems],
                                                 descS, static_cast<uint32_t>(statsPerTask), infoS2);
                             continue;
                         }
@@ -659,7 +651,7 @@ namespace SplitB {
                         const uint8_t dimD = 2;
                         uint32_t shapeD[2] = {tgd.rowNum, dPad};
                         AscendC::ShapeInfo infoD(dimD, shapeD);
-                        AscendC::DumpTensor(gS[tileBase + s1AreaF], descO,
+                        AscendC::DumpTensor(gS[tileBase + sTileElems], descO,
                                             (tgd.rowNum / 2) * dPad, infoD);
                         AscendC::printf(
                             "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..rows)+sum[128..128+rows) desc=%u\n",
@@ -672,7 +664,7 @@ namespace SplitB {
                         uint32_t shapeS[2] = {1, static_cast<uint32_t>(statsPerTask)};
                         AscendC::ShapeInfo infoS(dimS, shapeS);
                         // 192 floats：max [0..128) + sum [128..192)（rowNum≤64 时 sum 全覆盖）
-                        AscendC::DumpTensor(gS[tileBase + s1AreaF + oAreaF],  // FIXME: Stats为什么用gS
+                        AscendC::DumpTensor(gS[tileBase + sTileElems + oTmpTileElems],  // FIXME: Stats为什么用gS
                                             descS, static_cast<uint32_t>(statsPerTask), infoS);
                     }
                 }
@@ -712,17 +704,6 @@ namespace SplitB {
                 }   // if (!softmaxOnly)——O/LSE dump 门控闭合（devlog #44.26）
             }
 #endif
-        }
-
-        // P 区寻址（#44.35 临时全独立布局——修 bug 后回归 #44.23 链式，见 workspace 注释）：
-        //   P[t] → 批尾独立 P 区第 t 槽。返回 half 元素索引（供 gP[...] 直接使用）。
-        // 回归链式时改回：t==0 → 批尾首槽；t≥1 → S[t-1] 区首（死区，安全性由 softmax
-        //   的 MTE2_V 事件链保证，该链未动）。
-        __aicore__ inline
-        uint64_t GetPHalfIdx(uint64_t batchBase, uint64_t tileIdx) const
-        {
-            const uint64_t tileNum = static_cast<uint64_t>(curQNBlockNum) * curQSBlockNum;
-            return (batchBase + tileNum * perTileF + tileIdx * pScratchF) * 2;   // float 索引 → half 索引
         }
 
     private:
@@ -771,14 +752,20 @@ namespace SplitB {
         uint32_t dPad;
         uint32_t blockStackNum;
 
-        // workspace 布局（float 计；与 splitb_host.cpp 公式严格一致，改动必须同步）
-        uint64_t s1AreaF;
-        uint64_t pScratchF;
-        uint64_t oAreaF;
+        // workspace 布局（与 splitb_host.cpp 公式严格一致，改动必须同步）。
+        // 命名规约（devlog #44.44，对齐 FAInfer 元素计数语义如 MAX_UB_S_ELEM_NUM）：
+        //   *Elems = float 元素个数（gS/gOTmp/gStats 为 float 视图；P 区按 half 存，
+        //   gP 寻址时 ×2 换算，见各段就地计算的 pOff）。FAInfer 区段对照：S 区=mm1Out、
+        //   P 区=smOnlineOut、OTmp 区=mm2Out（我方为逐 tile 交错结构，故不直接借用其区段名）。
+        uint64_t sTileElems;
+        uint64_t pSlotElems;       // 单 P 槽
+        uint64_t oTmpTileElems;
         uint64_t statsPerTask;
-        uint64_t perTileF;
-        uint64_t perBatchF;
-        uint64_t perCoreF;
+        uint64_t perTileElems;
+        uint64_t tileNumPerBatch; // 批内 tile 数 T
+        uint64_t perBatchTileElems;   // 单批 tile 区 = T × perTileElems
+        uint64_t tileAreaElems;   // 本核 tile 区 = 2 × perBatchTileElems（gP 基址在本核此偏移之后）
+        uint64_t perCoreElems;
 
         // tile 几何（FAInfer :513-517 device 侧公式）
         uint32_t curQNBlockTile;

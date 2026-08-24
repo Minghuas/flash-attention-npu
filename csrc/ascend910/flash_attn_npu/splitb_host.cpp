@@ -140,28 +140,27 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     mc.set_splitFactorSize(splitFactorSize);
     mc.set_splitFactorTailSize(totalSize - (coreNum - 1) * splitFactorSize);
 
-    // ---------------- workspace（与 kernel perTileF/perBatchF 布局严格一致，见 mha_fwd_splitb.cpp） ----------------
-    // 每核 [batchBuf0: nTilePerBatch × tile 块 + P-scratch | batchBuf1: 同构]；每 tile 块（float 计）：
-    //   S 区: ROW_NUM_MAX(=Q_TILE_CEIL=128) × colsPad（fp32）
-    //   OTmp 区: ROW_NUM_MAX × dPad
-    //   stats:   2 × ROW_NUM_MAX（max+sum 各 128 行距）
-    // P（fp16）独立区（devlog #44.35 临时调试布局，修 bug 后回归 #44.23 链式）：
-    //   批尾连续 T 个独立 P 槽，P 与 S 完全不复用（S 自 QK 写出后永无人覆写）
+    // ---------------- workspace（与 kernel 布局公式严格一致，见 mha_fwd_splitb.cpp） ----------------
+    // 每核两段连续（devlog #44.44 规范化，FAInfer 哲学）：
+    //   [tile 区: batchBuf0 的 nTilePerBatch × tile 块 | batchBuf1 同构]
+    //   [P 区:   batchBuf0 的 nTilePerBatch × P 槽 | batchBuf1 同构]（gP 独立基址）
+    // 每 tile 块（float 计）：S 区 128×colsPad | OTmp 区 128×dPad | stats 2×128
+    // P 槽 = 128×colsPad 个 half（= sTileElems/2 float）；P 与 S 完全不复用（S 自 QK 写出后
+    //   永无人覆写——#44.37 根因：复用在批流水下跨 AIV 写读竞争非法）
     // tile 数 = CeilDiv(G, qNBlockTile) × N2 × CeilDiv(Sq, 128)（与 kernel GetQNBlockTile/
     //   GetQSBlockTile 公式严格一致——两者独立计算，改动必须同步，devlog #34）
     const int64_t rowNumMax = 128;                            // = Q_TILE_CEIL（kernel_common.hpp）
     const int64_t colsPad = alignedS2;                        // align16(Sk)
     const int64_t dPad = AlignUpI(D, FRACTAL_NUM);            // align16(D)
-    const int64_t s1AreaF = rowNumMax * colsPad;              // floats
-    const int64_t pScratchF = s1AreaF / 2;                     // 单 P 槽（128×colsPad half；#44.35 起 T 槽全独立）
-    const int64_t oAreaF = rowNumMax * dPad;
+    const int64_t sTileElems = rowNumMax * colsPad;              // floats
+    const int64_t pSlotElems = sTileElems / 2;                     // 单 P 槽（128×colsPad half）
+    const int64_t oTmpTileElems = rowNumMax * dPad;
     const int64_t statsPerTask = 2 * rowNumMax;
     const int64_t qNBlockTile = std::min(std::max((rowNumMax / Sq) / 2 * 2, (int64_t)1), G);
     const int64_t nTilePerBatch = CeilDivI(G, qNBlockTile) * N2 * CeilDivI(Sq, rowNumMax);
-    const int64_t perTileF = s1AreaF + oAreaF + statsPerTask;
-    const int64_t perBatchF = nTilePerBatch * (perTileF + pScratchF); // T×(tile 块+独立 P 槽)（#44.35 调试；回归链式改 + pScratchF）
-    const int64_t perCoreF = 2 * perBatchF;
-    const int64_t perCoreBytes = AlignUpI(perCoreF * 4, GM_ALIGN);
+    const int64_t perTileElems = sTileElems + oTmpTileElems + statsPerTask;
+    const int64_t perCoreElems = 2 * nTilePerBatch * (perTileElems + pSlotElems);   // tile 区 + P 区（各 2 批）
+    const int64_t perCoreBytes = AlignUpI(perCoreElems * 4, GM_ALIGN);
     const int64_t workSpaceSize = perCoreBytes * coreNum;
     (void)dtypeSize;
     if (dbgEnv) {
