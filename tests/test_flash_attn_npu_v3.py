@@ -143,8 +143,6 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
         pytest.skip("Ascend950 does not support num_splits>1")
     if not (1 <= head_size <= 256):
         pytest.skip("head_size must be in [1, 256]")
-    if "Ascend950" in name and (window_size_right != -1 or window_size_left != -1):
-        pytest.skip("Ascend950 support SWA")
     if "Ascend950" in name and (softcap != 0.0):
         pytest.skip("Ascend950 support softcap")
     if is_varied and layout != "TND":

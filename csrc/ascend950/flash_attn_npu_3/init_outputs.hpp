@@ -1,3 +1,12 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * Modified by Minghua Shen, 2026.
+ *
+ * InitOut for Ascend950 FA v3 empty spans (dense / causal / SWA):
+ * write O=0 and LSE=+inf for the current Q tile / head.
+ * SWA host already prefills LSE=+inf; rewriting +inf is harmless.
+ */
+
 #ifndef FAI950_INIT_OUTPUTS_HPP
 #define FAI950_INIT_OUTPUTS_HPP
 
@@ -110,6 +119,6 @@ private:
     AscendC::LocalTensor<float> lseUbTensor;
 };
 
-}
+}  // namespace Catlass::Epilogue::Block
 
-#endif
+#endif  // FAI950_INIT_OUTPUTS_HPP

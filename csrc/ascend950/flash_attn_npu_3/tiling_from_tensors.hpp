@@ -101,6 +101,9 @@ inline void fill_inference_context(
     int  num_blocks,
     int  max_num_blocks_per_seq,
     bool is_causal,
+    bool is_local,
+    int64_t window_size_left,
+    int64_t window_size_right,
     bool is_varlen_q,
     bool is_bf16,
     int  batch_size,
@@ -180,13 +183,24 @@ inline void fill_inference_context(
     ctx.kvSeqlenList = scratch.kv.data();
 
     ctx.scaleValue = softmax_scale;
-    ctx.maskType = is_causal ? optiling::MaskType::MASK_SPEC
-                                    : optiling::MaskType::NO_MASK;
+    if (is_local) {
+        ctx.maskType = optiling::MaskType::MASK_BAND;
+        ctx.windowSizeLeft = window_size_left;
+        ctx.windowSizeRight = window_size_right;
+    } else if (is_causal) {
+        ctx.maskType = optiling::MaskType::MASK_SPEC;
+        ctx.windowSizeLeft = 0;
+        ctx.windowSizeRight = 0;
+    } else {
+        ctx.maskType = optiling::MaskType::NO_MASK;
+        ctx.windowSizeLeft = 0;
+        ctx.windowSizeRight = 0;
+    }
     ctx.dataType = is_bf16 ? optiling::DataType::BF16
                                   : optiling::DataType::FP16;
     ctx.pagedCacheFlag = paged_KV;
     ctx.lseFlag = lse_flag;
-    ctx.cacheLayout = "nd"; // ND only; 
+    ctx.cacheLayout = "nd"; // ND only;
     ctx.layout = layout_str;    // "TND" | "BSND"
 
     ctx.innerPrecise = 0;   // fixed FP32 accumulation
@@ -194,12 +208,10 @@ inline void fill_inference_context(
     ctx.learnableSinkFlag = false;
     ctx.flashDecodeFlag = false;    // disables FlashDecode multi-split
     ctx.kvcacheNzFlag = false;
-    ctx.pagedShapeFlag = false;      
+    ctx.pagedShapeFlag = false;
     ctx.preToken = 0;
     ctx.nextToken = 0;
     ctx.sparseMode = 0;
-    // ctx.globalWindowSize   = 4;  // SWA defaults; kernel reads them only when SWA is on
-    // ctx.localWindowSize    = 0;
     ctx.numTokens = 0;  // not used by DoTiling on this path
 }
 
