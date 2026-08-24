@@ -288,12 +288,17 @@ namespace SplitB {
             //              VEC  段4 divout 全部 tile（epilogue 内部双 AIV 拆行，O/LSE 散射）
             // flag 每 batch 每 stage 一次；ping/pong 按 boIdx 奇偶。
             if (debugFlag) {
-                AscendC::printf("[SB] c%u enter bs=%u be=%u tiles=%u\n", coreIdx,
-                                (uint32_t)batchStart, (uint32_t)batchEnd,
+                AscendC::printf("[SB] c%u v%u enter: Batch range:(%u, %u) tile_nums=%u BBBBBBBBBBBBBBBBBBBBB\n",
+                                coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)batchStart, (uint32_t)batchEnd,
                                 curQNBlockNum * curQSBlockNum);
             }
             for (int64_t boIdx = batchStart; boIdx < batchEnd; ++boIdx) {
                 runMainLoop(coreIdx, boIdx, globalTensors);
+            }
+            if (debugFlag) {
+                AscendC::printf("[SB] c%u v%u exit: Batch range:(%u, %u) tile_nums=%u EEEEEEEEEEEEEEEEEEEEEE\n",
+                                coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)batchStart, (uint32_t)batchEnd,
+                                curQNBlockNum * curQSBlockNum);
             }
 
             // ---- 收尾：事件全量 drain（照抄 FAInfer :372-410，保证异步拷贝全部落盘） ----
@@ -321,6 +326,7 @@ namespace SplitB {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);   // softmax AIV1 的 pingpong1 链（evId=1+2×1=3，#44.24）——曾缺席（照抄 FAInfer drain 的遗漏，#44.45 补）
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
@@ -369,9 +375,9 @@ namespace SplitB {
 
             // ==================== 段1：QK 全部 tile → S 写批缓冲（CUBE） ====================
 #ifdef __DAV_C220_CUBE__
-            // if (debugFlag) {
-            //     AscendC::printf("[SB] c%u b%u S1-QK\n", coreIdx, (uint32_t)boIdx);
-            // }
+            if (debugFlag) {
+                AscendC::printf("[SB] c%u | batch=%u S1-QK 1111111111\n", coreIdx, (uint32_t)boIdx);
+            }
             uint32_t kvSIdx = 0;            // 单 KV 栈（S2 不切分）：栈索引恒 0
             uint32_t kvSLoopNumTotal = 1;   // 栈数恒 1
             // FIXME: 理论而言，进入本kernel的QS不超过128，因此该循环次数最多为1次
@@ -401,7 +407,7 @@ namespace SplitB {
             // ---- 段1 dump（devlog #44.12/#44.15，逐 tile 有效区紧凑版）----
             // 整区方案曾超 1MB 预算（数据全丢只剩最后一条）。有效 S = 每 tile 前
             // rowNum×colsPad（本配置 colsPad=Sk 无 pad），desc = 100 + b*10 + tile。
-            if (dumpFlag && coreIdx == 0) {
+            if (dumpFlag) {   // 多核 dump：desc 按全局 boIdx 跨核唯一（#44.46）
                 AscendC::PipeBarrier<PIPE_FIX>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
@@ -420,7 +426,6 @@ namespace SplitB {
                     }
                 }
             }
-            // AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
             Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);   // 每 batch 一次
 #endif
 
@@ -428,7 +433,7 @@ namespace SplitB {
 #ifdef __DAV_C220_VEC__
             Arch::CrossCoreWaitFlag(qkReady);   // 每 batch 一次
             if (debugFlag) {
-                AscendC::printf("[SB] c%u v%u b%u S2-SM\n", coreIdx,
+                AscendC::printf("[SB] c%u v%u | batch=%u S2-SM 2222222222\n", coreIdx,
                                 AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
             }
             // ---- DBG 探针（devlog #44.35）：SM 消费前的 S 快照（desc=860+b*10+tile）----
@@ -481,7 +486,7 @@ namespace SplitB {
             }
             // ---- 段2 dump（devlog #44.12/#44.15）：逐 tile 有效 P（half 紧凑）----
             // P 独立区（#44.35）有效数据 = 每 tile 前 rowNum×colsPad half。desc = 200 + b*10 + tile。
-            if (dumpFlag && coreIdx == 0 && AscendC::GetSubBlockIdx() == 0) {
+            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // AIV0-only 防双份；全核 dump（#44.46）
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
@@ -502,7 +507,6 @@ namespace SplitB {
             }
             // 每 batch 一次（双 AIV 各自执行；FAInfer :849 同款段尾单点）：
             // PIPE_MTE3 保证在本分支全部 P/stats 拷贝之后才置位
-            // AscendC::PipeBarrier<PIPE_ALL>();   // DBG 注入：阶段1 段边界二分（devlog #44.11）
             Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
 #endif
 
@@ -517,7 +521,7 @@ namespace SplitB {
             // 设计：每批 set 数=wait 数，任意 B 安全，#44.28）
             if (!softmaxOnly) {
                 if (debugFlag) {
-                    AscendC::printf("[SB] c%u b%u S3-PV\n", coreIdx, (uint32_t)boIdx);
+                    AscendC::printf("[SB] c%u | batch=%u S3-PV 3333333333\n", coreIdx, (uint32_t)boIdx);
                 }
                 for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                     for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
@@ -579,7 +583,7 @@ namespace SplitB {
             if (!softmaxOnly) {
                 Arch::CrossCoreWaitFlag(pvReady);   // 每 batch 一次
                 if (debugFlag) {
-                    AscendC::printf("[SB] c%u v%u b%u S4-DO\n", coreIdx,
+                    AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 4444444444\n", coreIdx,
                                     AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
                 }
                 if constexpr (MASK_TYPE == FaiKenel::MaskType::NO_MASK) {
@@ -617,7 +621,7 @@ namespace SplitB {
             // O=400+b（本 batch 区，fp16 行主序 s*strideO+h*embed+d）
             // LSE=450+b（本 batch 区，[H,Sq] 头主序 h*Sq+s）
 #ifdef __DAV_C220_VEC__
-            if (dumpFlag && coreIdx == 0 && AscendC::GetSubBlockIdx() == 0) {
+            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // AIV0-only 防双份；全核 dump（#44.46）
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {

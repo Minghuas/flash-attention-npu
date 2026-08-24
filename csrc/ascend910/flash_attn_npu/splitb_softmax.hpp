@@ -430,11 +430,6 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evId);
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evId);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evId);
-        // DBG（devlog #44.22：-O0 同指纹=确定性逻辑 bug，printf 无扰动）：打印 P 拷贝的
-        // 全部参数——dst 地址/行数/块参数/src UB 偏移
-        AscendC::printf("[P-COPY] rows=%u colRound=%u colPad=%u ubOff=%u subIdx=%u\n",
-                        rowNumCurLoop, columnNumRound, columnNumPad, sUbOffset,
-                        AscendC::GetSubBlockIdx());
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
         CopyStatsToGm(gStats, rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoopRound);
         // MTE3_V 置于两个拷贝之后：覆盖 P+stats 双写。原位于 P 拷贝后（devlog #44.6）：
@@ -480,9 +475,6 @@ public:
         rowNumTile = AscendC::Std::min(rowNumTile, FLOAT_VECTOR_SIZE);
         const uint32_t rowLoopNum = CeilDiv(rowActualThisSubBlock, rowNumTile);
         const uint32_t preLoad = 1;
-        // TODO: 增加printf 打印 rowNumTile，rowLoopNum, rowActualThisSubBlock，maxRowNumPerLoop等关键参数信息
-        AscendC::printf("[SOFTMAX_DEBUG] SublockIdx: %u | rowNumTile: %u | rowLoopNum: %u | rowActualThisSubBlock: %u | maxRowNumPerLoop: %u\n",
-                subBlockIdx, rowNumTile, rowLoopNum, rowActualThisSubBlock, maxRowNumPerLoop);
 
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {

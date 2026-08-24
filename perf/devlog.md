@@ -797,6 +797,44 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.47**｜**【多核首测全通过】B=4→1024 × 20 核全 pass；B=128 挂死销案（2026-08-24）**：
+t60 系列（用户跑，`--multi-core --debug`，无 dump）：B=4（×5 重复）/10/30/60/100/128/
+512/1024 全部 `[OUT] max_err=… PASS`。证据：host 打印 coreNum=20 splitF=52（20 核 ×
+每核 52 批），每核 enter/exit 标记完整；max_err=0.0156 = fp16 在 [16,32) 的 1 ULP
+（量化噪声级）。用户已自行给脚本加 **O 张量级校验**（[OUT] 行）——多核/无 dump 形态下
+的正确验证方式。**记录在案的"B=128 多核挂死"未复现 → 销案**（推测被 #44.40 系列事件
+修复顺带解决）。目标工作负载（B=1024, S=32）多核正确性达成。
+剩余测试矩阵：bf16 / GQA（H≠Hkv）/ 多头 tile（G≥2 使 qNBlockTile>1，如 heads=8
+kv-heads=4）/ Sq=128 / Sk≠Sq / D=128 / 官方 pytest 套件 + 触发闸门路由确认。
+
+**#44.46**｜**多核开关独立化：MULTI_CORE env 与调试开关解耦 + dump 全核化（2026-08-24）**：
+用户指出：此前所有测试（t5x 全系列）都被强制单核——链路＝脚本无条件设
+FLASH_ATTN_SPLITB_DUMP → host `usedCoreNum=(dbg||dump||smOnly)?1:min(B,aicNum)`（调试
+早期按用户要求加的单核防串扰），**多核路径从未执行过**。按用户设计改为：
+- host：独立 `FLASH_ATTN_SPLITB_MULTI_CORE` env 控制 usedCoreNum（未设→单核默认；
+  已设→min(B,aicNum)），与 debug/dump/smOnly 完全解耦——少核也可以 dump。
+- kernel：dump 门放开到全核（CUBE 侧 `dumpFlag`；VEC 侧 `dumpFlag && AIV0-only` 防双份）；
+  desc 按全局 boIdx 编号跨核唯一，多核 dump 记录不撞号；DumpTensor 预算按核独立。
+- 脚本：`--multi-core` 开关（设上述 env，dump 照常）。追加（用户要求）：`--debug`/
+  `--dump` 参数化——FLASH_ATTN_SPLITB_DUMP **不再默认开启**（此前脚本无条件设置），
+  FLASH_ATTN_SPLITB_DEBUG 补上显式开关；不带 --dump 的运行提示"--log 比对将无数据"。
+待验证：多核首测（B=2/4 → 2/4 核）七项全绿——注意多核 dump 记录的跨核交错是否影响
+parser 的记录组装（printf 行与数据行配对）；若解析乱，需按 desc 关联而非行序。
+
+**#44.45**｜**【清理收尾】裸 printf/PIPE_ALL/drain 修复 + host 静默化（2026-08-24）**：
+用户清理阶段第二步（DumpTensor 七项数据代码**全部保留**——用户明确要求，后续排障还要用）：
+- 删 softmax.hpp 未门控 printf：[P-COPY]（#44.22 遗留）与 [SOFTMAX_DEBUG]（含 TODO 注释）。
+- 删 kernel 两处 PIPE_ALL"DBG 注入"死注释行（用户已注释，#44.11 遗留；两处 PIPE_ALL 本体
+  均已不在执行路径——**注意：这意味着当前验证过的形态本就无注入屏障**）。
+- **drain 补 MTE3_V(3)**：softmax AIV1 的 pingpong1 链（evId=1+2×1=3，#44.24）——原
+  drain 照抄 FAInfer 只有 0/1/2/4，AIV1 末 tile 的 MTE3 拷贝（P/stats）未被等待即出核，
+  back-to-back launch 有脏写风险。
+- host printf 静默化：编号梯子 333/444/555/777/888 删除，222/999/1000/9999 收敛到
+  dbgEnv 门控（定义提前至函数头，默认完全静默——此前每次 forward 打 10 条）。
+- 保留：dumpFlag 门控的 DumpTensor 块（七项数据）、debugFlag 门控的 [SB] printf、
+  softmaxOnly 机制（S4 排障用）、用户已注释的探针块原样不动。
+待验证：重编译后 -O0/-O2 × B=2/4 回归（printf 删除改变时序，必须回归）。
+
 **#44.44**｜**【清理】workspace 规范化：P 区独立基址 + 布局量命名对齐 FAInfer（2026-08-24）**：
 用户清理阶段第一步（历史遗留：链式时代 gS/gP 同基址 + 寻址掺混合偏移）。改动：
 - **布局重排**：每核两段连续 [tile 区（2 批 × T tile 块）| P 区（2 批 × T 槽）]——
@@ -1111,6 +1149,16 @@ splitb_host.cpp workspace 公式（新 perTileF = s1AreaF + pAreaF + oAreaF + st
 floats）| OTmp 区 | stats 区]；perTileF 相应加大。消费点同步：splitb_host.cpp workspace
 公式、kernel 三视图与段2/段3 的 gP 基址、dump 探针。
 
+**#44.23**｜**编译：aicore 代码禁用 fflush/stdout（2026-08-24）**：
+mha_fwd_splitb.cpp 加调试 printf 时顺手写了 `fflush(stdout)`（host 习惯），编译报
+`call to [host] function from [aicore] function` + `global variable 'stdout' is
+not allowed in aicore function`。根因：设备侧不存在 libc，`fflush`/`stdout` 均
+host-only；`AscendC::printf` 输出走调试通道，**kernel 结束 host 同步时自动刷出**，
+设备代码里本就无需（也无法）flush（代码 809 行注释已写明此约定）。修复：删 14 处
+` fflush(stdout);`，printf 语句全保留。注意 host 侧（splitb_host.cpp、
+fwd_splitb_dispatch_impl.hpp 等）的 fflush 合法不动。经验法则 #6 的延伸：不只 printf
+要换 `AscendC::printf`，**任何紧跟它的 host 侧 flush 习惯也要去掉**。
+
 **#44.22**｜**关键判别：-O0 -g3 下指纹完全相同（2026-08-22，用户提议）**：
 复现器以 -O0 -g3 编译运行：**逐位相同的失败**（2744 处、同 h1-P 丢失指纹）。
 → **这不是 -O2 优化/时序/竞态问题，是确定性的逻辑 bug**（与编译模式无关）。
@@ -1241,7 +1289,7 @@ SetFlag 之间**（FAInfer 的屏障常散落在函数中间，逐行对照才�
 3. 设备挂死定位用执行掩码二分，不依赖设备 printf（#16）
 4. 向量指令 count：元素级=总元素/64；行串行=行数（建议分批 ≤16，FAInfer 验证区间）（#18/#20）
 5. `__gm__` 指针只能解引用，不能转普通指针（#2）
-6. 设备函数一律 `__aicore__ inline`（#9）；printf 用 `AscendC::printf`（#14）
+6. 设备函数一律 `__aicore__ inline`（#9）；printf 用 `AscendC::printf`（#14），且不得跟 `fflush(stdout)`——host-only，输出 kernel 结束自动刷（#44.23）
 7. CANN 9.0.0 API 形态先查重载/在本仓库找已编译先例（#10/#13）
 8. catlass 引用参数传具名变量（#12）
 9. 同进程无法切换 C++ 静态 env 开关（#7）

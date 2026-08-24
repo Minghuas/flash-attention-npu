@@ -2,7 +2,7 @@
 # 清理残留的 test_splitb_s3.py 相关进程（挂死测试会占用 NPU 卡，影响后续运行——devlog #21）
 # 用法：bash debug/kill_test.sh          （默认清理 test_splitb_s3.py）
 #       bash debug/kill_test.sh 关键字    （清理其它测试脚本，如 test_flash_attn_npu_v2.py）
-KEYWORD="${1:-test_splitb_s3}"
+KEYWORD="${1:-splitb}"
 
 echo "== 查找含 '$KEYWORD' 的进程 =="
 PIDS=$(pgrep -f "$KEYWORD")

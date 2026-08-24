@@ -59,12 +59,14 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     const int64_t G = H / Hkv;      // GQA 组数
     const bool isBf16 = q.dtype() == at::kBFloat16;
     const int64_t dtypeSize = 2;    // fp16/bf16
-    printf("222 [splitb] ENTER mha_fwd_splitb (build=%s)\n", SPLITB_BUILD_TAG); fflush(stdout);
+    const bool dbgEnv = getenv("FLASH_ATTN_SPLITB_DEBUG") != nullptr;   // host 调试输出总开关（#44.45；默认静默）
+    if (dbgEnv) {
+        printf("222 [splitb] ENTER mha_fwd_splitb (build=%s)\n", SPLITB_BUILD_TAG); fflush(stdout);
+    }
 
     // ---------------- 平台参数（aic 基数） ----------------
     auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
     const uint32_t aicNum = platform->GetCoreNumAic();
-    printf("333 [splitb] platform ok aicNum=%u\n", aicNum); fflush(stdout);
 
     // ---------------- 基本块（照搬 TilingB::CalcS1S2BasicBlock / SetCoreParams） ----------------
     const int64_t alignedS1 = AlignUpI(Sq, FRACTAL_NUM);
@@ -81,7 +83,6 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
 
     const int64_t bBaseSize = 1;             // 每个 boIdx = 1 个 batch 的全部头
     const int64_t bOuterSize = B;
-    printf("444 [splitb] blocks ok s1Base=%lld\n", (long long)s1BasicBlock); fflush(stdout);
 
     // ---------------- tiling 结构填充 ----------------
     SplitBTilingData tiling;
@@ -101,8 +102,7 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     in.set_windowSizeLeft(window_size_left);
     in.set_windowSizeRight(window_size_right);
     in.set_isCausalFlag(is_causal ? 1 : 0);
-    const bool dbgEnv = getenv("FLASH_ATTN_SPLITB_DEBUG") != nullptr;
-    in.set_debugFlag(dbgEnv ? 1 : 0);
+    in.set_debugFlag(dbgEnv ? 1 : 0);   // dbgEnv 定义见函数头部（#44.45）
     const bool smOnlyEnv = getenv("FLASH_ATTN_SPLITB_SOFTMAX_ONLY") != nullptr;
     in.set_softmaxOnly(smOnlyEnv ? 1 : 0);
     const bool dumpEnv = getenv("FLASH_ATTN_SPLITB_DUMP") != nullptr;
@@ -128,12 +128,14 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
 
     // ---------------- 核间切分（aic 基数；参考为 aiv 基数——D7 因地制宜项） ----------------
     const int64_t totalSize = bOuterSize;
-    // debug/dump 均强制单核：避免多核 printf/DumpTensor 输出串扰（用户要求）
-    const int64_t usedCoreNum = (dbgEnv || dumpEnv || smOnlyEnv) ? 1 : std::min(totalSize, static_cast<int64_t>(aicNum));
+    // 核数由 MULTI_CORE 独立控制（devlog #44.46，与 debug/dump/smOnly 解耦——少核也
+    // 可 dump）：未设 → 单核（调试期默认，防输出串扰）；已设 → min(B, aicNum) 多核。
+    // kernel dump 门已放开到全核（desc 按全局 boIdx 跨核唯一；VEC 侧 AIV0-only 防双份）。
+    const bool multiCoreEnv = getenv("FLASH_ATTN_SPLITB_MULTI_CORE") != nullptr;
+    const int64_t usedCoreNum = multiCoreEnv ? std::min(totalSize, static_cast<int64_t>(aicNum)) : 1;
     const int64_t splitFactorSize = CeilDivI(totalSize, usedCoreNum);
     const int64_t coreNum = CeilDivI(totalSize, splitFactorSize);
 
-    printf("555 [splitb] tiling filled\n"); fflush(stdout);
     auto &mc = tiling.multiCoreParams;
     mc.set_coreNum(static_cast<int32_t>(coreNum));
     mc.set_totalSize(totalSize);
@@ -173,21 +175,21 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     }
     at::Tensor workspace_tensor =
         at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
-    printf("777 [splitb] ws alloc ok %lld bytes\n", (long long)workSpaceSize); fflush(stdout);
 
     // ---------------- tiling 拷贝到 device ----------------
     at::Tensor tiling_cpu_tensor =
         at::empty({static_cast<int64_t>(sizeof(SplitBTilingData))}, at::device(at::kCPU).dtype(at::kByte));
     std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &tiling, sizeof(SplitBTilingData));
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
-    printf("888 [splitb] tiling H2D ok\n"); fflush(stdout);
 
     // ---------------- ffts 同步基址（CrossCoreFlag 依赖，照抄 flash_api.cpp:734-736） ----------------
     uint64_t fftsAddr = 0;
     uint32_t fftsLen = 0;
     rtError_t rtErr = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
     TORCH_CHECK(rtErr == 0, "splitb: rtGetC2cCtrlAddr failed, ret=", rtErr);
-    printf("999 [splitb] ffts ok addr=%llx len=%u\n", (unsigned long long)fftsAddr, fftsLen); fflush(stdout);
+    if (dbgEnv) {
+        printf("999 [splitb] ffts ok addr=%llx len=%u\n", (unsigned long long)fftsAddr, fftsLen); fflush(stdout);
+    }
 
     // ---------------- launch ----------------
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -213,11 +215,15 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     fwd_args.kvSeqDevice = nullptr;
     fwd_args.workspaceDevice = static_cast<uint8_t *>(workspace_tensor.data_ptr());
     fwd_args.tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
-    printf("1000 [splitb] pre-launch blockDim=%u dtype=%s mask(c=%d,l=%d) sc=%d\n",
-           fwd_args.blockDim, isBf16 ? "bf16" : "fp16", (int)fwd_args.is_causal,
-           (int)fwd_args.is_local, (int)fwd_args.has_softcap); fflush(stdout);
+    if (dbgEnv) {
+        printf("1000 [splitb] pre-launch blockDim=%u dtype=%s mask(c=%d,l=%d) sc=%d\n",
+               fwd_args.blockDim, isBf16 ? "bf16" : "fp16", (int)fwd_args.is_causal,
+               (int)fwd_args.is_local, (int)fwd_args.has_softcap); fflush(stdout);
+    }
     launch_fwd_splitb(fwd_args);
-    printf("9999 [splitb] launch ENQUEUED (async)\n"); fflush(stdout);
+    if (dbgEnv) {
+        printf("9999 [splitb] launch ENQUEUED (async)\n"); fflush(stdout);
+    }
 }
 
 }  // namespace SplitB
