@@ -269,8 +269,8 @@ mha_fwd(at::Tensor q,
         batch_size, seqlen_q, num_heads, num_heads_k,
         head_size_q, head_size_v,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
-        /* lse_flag= */ return_softmax_lse,
-        /* layout_str= */ is_varlen_q ? "TND" : "BSND");
+        return_softmax_lse,
+        is_varlen_q ? "TND" : "BSND");
 
     FAInferTilingData tilingData{};
     {

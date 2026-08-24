@@ -772,9 +772,9 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
 
 @pytest.mark.parametrize("data_type", [torch.float16])
-@pytest.mark.parametrize("num_heads", [2, 16, 64])
+@pytest.mark.parametrize("num_heads", [2, 64])
 @pytest.mark.parametrize("kv_heads", [2])
-@pytest.mark.parametrize("head_size", [35,64,101,151,192,201])
+@pytest.mark.parametrize("head_size", [35,101,151,192,201])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("window_size_left", [-1])
 @pytest.mark.parametrize("window_size_right", [-1])

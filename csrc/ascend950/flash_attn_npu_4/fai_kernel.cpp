@@ -224,7 +224,6 @@ public:
         } else {
             kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1);
         }
-        // int64_t kvNumTokens = gActualKvseqlen.GetValue(batch_ - 1); // used for TND_NZ
 
         strideQ = qHeads_ * embed_;
         if constexpr (cacheLayout == CacheLayout::nd) {
@@ -300,9 +299,6 @@ public:
             int64_t qSOffset = qSTileIdx * qBaseTile_;
             gmOffsetQ = qBOffset + qSOffset * strideQ + qNStartIdx * embed_;
             gmOffsetO = oBOffset + qSOffset * strideO + qNStartIdx * embedV_;
-            // Public LSE layout follows 910 FA3: [B, N, S] for BSND and
-            // [N, T] for TND.  Keep its head-major GM address independent
-            // from Q/O's token-major layout.
             uint32_t lseHeadStride = static_cast<uint32_t>(faiTilingData->maxQSeqlen);
             uint64_t lseOffset = static_cast<uint64_t>(qBOffset / strideQ) * qHeads_
                 + static_cast<uint64_t>(qNStartIdx) * lseHeadStride + qSOffset;
@@ -328,29 +324,11 @@ public:
             uint32_t qSBlockSize = qSTileIdx == qsBlockNum - 1 ?
                 qSeqlen - (qsBlockNum - 1) * qBaseTile_ : qBaseTile_;
             uint32_t rowNum = qSBlockSize * qNBlockSize;
-            // QK is split to two AIVs.  Materialise each AIV's group at a
-            // pad-aligned L0C boundary so FixPipe can read the second group
-            // without crossing a fractal-M tile.  non-DN pads to 16; DN to 32.
-            uint32_t qkRowNum = rowNum;
-            uint32_t qkRowsPerAiv = 0U;
-            if (qNBlockSize > 1U) {
-                uint32_t firstAivRows = qSBlockSize * (qNBlockSize / 2U);
-                uint32_t secondAivRows = rowNum - firstAivRows;
-                uint32_t padUnit = 16U;
-                if constexpr (enableDN) {
-                    padUnit = 32U;
-                }
-                uint32_t firstAivRowsAligned = RoundUp(firstAivRows, padUnit);
-                uint32_t secondAivRowsAligned = RoundUp(secondAivRows, padUnit);
-                qkRowsPerAiv = firstAivRowsAligned > secondAivRowsAligned ?
-                    firstAivRowsAligned : secondAivRowsAligned;
-                qkRowNum = 2U * qkRowsPerAiv;
-            }
             uint32_t rowNumRound = 0;
             if constexpr (enableDN) {
-                rowNumRound = RoundUp(qkRowNum, 32U);
+                rowNumRound = RoundUp(rowNum, 32U);
             } else {
-                rowNumRound = RoundUp(qkRowNum, 16U);
+                rowNumRound = RoundUp(rowNum, 16U);
             }
             uint32_t qkRowNumRound = rowNumRound;
             uint32_t kvSTileSizeAct = kvBaseTile_;
@@ -375,7 +353,6 @@ public:
                     qSBlockSize,
                     qNBlockSize,
                     lseHeadStride,
-                    enableDN,
                     embedV_,
                     static_cast<uint32_t>(strideO));
 #endif
@@ -393,10 +370,10 @@ public:
             GemmCoord actualBlockShapeQ{rowNum, embed_, 0};
             if constexpr (enableDN) {
                 blockMmadQK.loadQGM(gmQTensorTlaDN, actualBlockShapeQ,
-                    qSBlockSize, qNBlockSize, qkRowsPerAiv);
+                    qSBlockSize, qNBlockSize);
             } else {
                 blockMmadQK.loadQGM(gmQTensorTla, actualBlockShapeQ,
-                    qSBlockSize, qNBlockSize, qkRowsPerAiv);
+                    qSBlockSize, qNBlockSize);
             }
             uint32_t kShapeRow = 0;
             if constexpr (kvcacheType == CacheMode::pagedCache) {
@@ -423,7 +400,7 @@ public:
                     } else {
                         kvSTileSizeAct = kvBaseTile_;
                     }
-                    GemmCoord actualBlockShapeQK{qkRowNum, kvSTileSizeAct, embed_};
+                    GemmCoord actualBlockShapeQK{rowNum, kvSTileSizeAct, embed_};
                     uint32_t ubSBufId = kvSTileIdx % UB_S_OTMP_BUF_STAGES;
                     int64_t stride = 64;
                     auto ubSLayoutTla = tla::MakeLayout<ElementS, LayoutS>(qkRowNumRound, RoundUp(kvSTileSizeAct, ubSRoundTile));
@@ -473,7 +450,7 @@ public:
                     uint32_t l1PBufId = kvSTileIdx % pL1BufNum_;
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
-                    auto l1PLayoutTla = tla::MakeLayout<ElementP, Catlass::layout::zN>(qkRowNum, kvSTileSizeAct);
+                    auto l1PLayoutTla = tla::MakeLayout<ElementP, Catlass::layout::zN>(rowNum, kvSTileSizeAct);
                     auto l1PTensorTla = tla::MakeTensor(l1PTensor[l1PBufId],
                     l1PLayoutTla, Arch::PositionL1{});
 #ifdef __DAV_VEC__
@@ -550,7 +527,7 @@ public:
                     } else {
                         kvSTileSizeAct = kvBaseTile_;
                     }
-                    GemmCoord actualBlockShapePV{qkRowNum, embedV_, kvSTileSizeAct};
+                    GemmCoord actualBlockShapePV{rowNum, embedV_, kvSTileSizeAct};
                     uint32_t ubOTmpBufId = kvSTileIdxNow % UB_S_OTMP_BUF_STAGES;
                     uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__

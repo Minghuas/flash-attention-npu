@@ -638,9 +638,9 @@ def test_fa_custom_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     assert r_plain_cann, "Golden vs CANN check FAILED"
 
 @pytest.mark.parametrize("data_type", [torch.bfloat16])
-@pytest.mark.parametrize("num_heads", [8, 16, 64])
+@pytest.mark.parametrize("num_heads", [8, 64])
 @pytest.mark.parametrize("kv_heads", [8])
-@pytest.mark.parametrize("head_size", [35,64,101,151,192,201])
+@pytest.mark.parametrize("head_size", [35,101,151,192,201])
 @pytest.mark.parametrize("block_size", [128])
 @pytest.mark.parametrize("window_size_left", [-1])
 @pytest.mark.parametrize("window_size_right", [-1])

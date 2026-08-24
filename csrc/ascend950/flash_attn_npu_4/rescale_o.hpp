@@ -10,6 +10,7 @@
 
 #ifndef EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP_T
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_FLASH_ATTENTION_RESCALE_O_HPP_T
+#include <limits>
 
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
@@ -198,28 +199,38 @@ public:
     template <class TensorDst>
     __aicore__ inline
     void ScatterGroupedOutput(TensorDst &gOTensor, uint32_t qSBlockSize,
-                              uint32_t logicalRowStart, uint32_t rowCount,
+                              uint32_t rowStart, uint32_t rowCount,
                               uint32_t embedV, uint32_t outputStride,
                               uint32_t colStride, uint32_t fullyMaskedRowsPerHead)
     {
-        uint32_t firstHead = logicalRowStart / qSBlockSize;
-        uint32_t headCount = rowCount / qSBlockSize;
         auto gO = gOTensor.data();
-        for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
-            if (fullyMaskedRowsPerHead != 0U) {
-                AscendC::Duplicate(goUbTensor16[headLocal * qSBlockSize * colStride],
-                    static_cast<ElementO>(0), fullyMaskedRowsPerHead * colStride);
+        uint32_t groupRow = rowStart;
+        uint32_t ubRowOffset = 0U;
+        uint32_t remainingRows = rowCount;
+        while (remainingRows > 0U) {
+            uint32_t head = groupRow / qSBlockSize;
+            uint32_t localS = groupRow % qSBlockSize;
+            uint32_t rowsThisHead = qSBlockSize - localS;
+            rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+            if (fullyMaskedRowsPerHead > localS) {
+                uint32_t maskedRows = fullyMaskedRowsPerHead - localS;
+                maskedRows = maskedRows < rowsThisHead ? maskedRows : rowsThisHead;
+                AscendC::Duplicate(goUbTensor16[ubRowOffset * colStride],
+                    static_cast<ElementO>(0), maskedRows * colStride);
             }
             AscendC::DataCopyPad(
-                gO[(firstHead + headLocal) * embedV],
-                goUbTensor16[headLocal * qSBlockSize * colStride],
-                AscendC::DataCopyExtParams(qSBlockSize, embedV * sizeof(ElementO), 0,
+                gO[head * embedV + localS * outputStride],
+                goUbTensor16[ubRowOffset * colStride],
+                AscendC::DataCopyExtParams(rowsThisHead, embedV * sizeof(ElementO), 0,
                     (outputStride - embedV) * sizeof(ElementO), 0));
+            groupRow += rowsThisHead;
+            ubRowOffset += rowsThisHead;
+            remainingRows -= rowsThisHead;
         }
     }
 
     __simd_vf__ inline
-    void ComputeLseRegbase(__ubuf__ float *glUb, __ubuf__ float *gmUb,
+    void ComputeLse(__ubuf__ float *glUb, __ubuf__ float *gmUb,
                            __ubuf__ float *lmUb, uint32_t rowCount)
     {
         using namespace AscendC::MicroAPI;
@@ -242,15 +253,21 @@ public:
                          uint32_t lseHeadStride, bool isDN,
                          uint32_t fullyMaskedRowsPerHead)
     {
-        auto partition = GetFAIGroupedRowPartition(
-            qSBlockSize, qNBlockSize, isDN ? 32U : 8U);
-        uint32_t rowCount = partition.validRows;
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        uint32_t groupRows = qSBlockSize * qNBlockSize;
+        uint32_t rowAlign = isDN ? 32U : 8U;
+        uint32_t splitRows = (groupRows + rowAlign - 1U) / rowAlign * rowAlign / subBlockNum;
+        uint32_t firstSubBlockRows = splitRows < groupRows ? splitRows : groupRows;
+        uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
+        uint32_t rowCount = subBlockIdx == 0U ? firstSubBlockRows :
+            (groupRows > splitRows ? groupRows - splitRows : 0U);
         if (rowCount == 0U) {
             return;
         }
         AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
         AscendC::PipeBarrier<PIPE_V>();
-        ComputeLseRegbase((__ubuf__ float *)glUbTensor32.GetPhyAddr(),
+        ComputeLse((__ubuf__ float *)glUbTensor32.GetPhyAddr(),
             (__ubuf__ float *)gmUbTensor32.GetPhyAddr(),
             (__ubuf__ float *)lmUbTensor32.GetPhyAddr(), rowCount);
         AscendC::PipeBarrier<PIPE_V>();
@@ -260,20 +277,30 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         if (fullyMaskedRowsPerHead != 0U) {
             if (qNBlockSize == 1U) {
-                uint32_t firstLocalS = partition.logicalRowStart % qSBlockSize;
+                uint32_t firstLocalS = rowStart % qSBlockSize;
                 if (firstLocalS < fullyMaskedRowsPerHead) {
                     uint32_t maskedRows = fullyMaskedRowsPerHead - firstLocalS;
                     maskedRows = maskedRows < rowCount ? maskedRows : rowCount;
-                    AscendC::Duplicate(goUbTensor32, AscendC::NumericLimits<float>::Infinity(),
+                    AscendC::Duplicate(goUbTensor32, std::numeric_limits<float>::infinity(),
                         maskedRows * FLOAT_BLOCK_SIZE);
                 }
             } else {
-                uint32_t headCount = rowCount / qSBlockSize;
-                uint32_t maskedRows = fullyMaskedRowsPerHead < qSBlockSize ?
-                    fullyMaskedRowsPerHead : qSBlockSize;
-                for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
-                    AscendC::Duplicate(goUbTensor32[headLocal * qSBlockSize * FLOAT_BLOCK_SIZE],
-                        AscendC::NumericLimits<float>::Infinity(), maskedRows * FLOAT_BLOCK_SIZE);
+                uint32_t groupRow = rowStart;
+                uint32_t ubRowOffset = 0U;
+                uint32_t remainingRows = rowCount;
+                while (remainingRows > 0U) {
+                    uint32_t localS = groupRow % qSBlockSize;
+                    uint32_t rowsThisHead = qSBlockSize - localS;
+                    rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+                    if (fullyMaskedRowsPerHead > localS) {
+                        uint32_t maskedRows = fullyMaskedRowsPerHead - localS;
+                        maskedRows = maskedRows < rowsThisHead ? maskedRows : rowsThisHead;
+                        AscendC::Duplicate(goUbTensor32[ubRowOffset * FLOAT_BLOCK_SIZE],
+                            std::numeric_limits<float>::infinity(), maskedRows * FLOAT_BLOCK_SIZE);
+                    }
+                    groupRow += rowsThisHead;
+                    ubRowOffset += rowsThisHead;
+                    remainingRows -= rowsThisHead;
                 }
             }
         }
@@ -281,15 +308,23 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         if (qNBlockSize == 1U) {
-            AscendC::DataCopyPad(gLse[partition.logicalRowStart], goUbTensor32,
+            AscendC::DataCopyPad(gLse[rowStart], goUbTensor32,
                 AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
         } else {
-            uint32_t firstHead = partition.logicalRowStart / qSBlockSize;
-            uint32_t headCount = rowCount / qSBlockSize;
-            for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
-                AscendC::DataCopyPad(gLse[(firstHead + headLocal) * lseHeadStride],
-                    goUbTensor32[headLocal * qSBlockSize * FLOAT_BLOCK_SIZE],
-                    AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0, 0, 0));
+            uint32_t groupRow = rowStart;
+            uint32_t ubRowOffset = 0U;
+            uint32_t remainingRows = rowCount;
+            while (remainingRows > 0U) {
+                uint32_t head = groupRow / qSBlockSize;
+                uint32_t localS = groupRow % qSBlockSize;
+                uint32_t rowsThisHead = qSBlockSize - localS;
+                rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+                AscendC::DataCopyPad(gLse[head * lseHeadStride + localS],
+                    goUbTensor32[ubRowOffset * FLOAT_BLOCK_SIZE],
+                    AscendC::DataCopyExtParams(rowsThisHead, sizeof(float), 0, 0, 0));
+                groupRow += rowsThisHead;
+                ubRowOffset += rowsThisHead;
+                remainingRows -= rowsThisHead;
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
@@ -756,10 +791,16 @@ public:
     {
         uint32_t rowNumOri = actualOriShape[0];
         uint32_t colNumOri = actualOriShape[1];
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
         uint32_t colNumOriAligned16 = RoundUp(colNumOri, 16);
-        auto partition = GetFAIGroupedRowPartition(qSBlockSize, qNBlockSize, isDN ? 32U : 8U);
-        uint32_t rowNumCurSubCore = partition.validRows;
-        uint32_t rowOffsetCurSubCore = partition.logicalRowStart;
+        uint32_t groupRows = qSBlockSize * qNBlockSize;
+        uint32_t rowAlign = isDN ? 32U : 8U;
+        uint32_t splitRows = (groupRows + rowAlign - 1U) / rowAlign * rowAlign / subBlockNum;
+        uint32_t firstSubBlockRows = splitRows < groupRows ? splitRows : groupRows;
+        uint32_t rowOffsetCurSubCore = subBlockIdx == 0U ? 0U : firstSubBlockRows;
+        uint32_t rowNumCurSubCore = subBlockIdx == 0U ? firstSubBlockRows :
+            (groupRows > splitRows ? groupRows - splitRows : 0U);
         uint32_t colNumCurSubCore = colNumOri;
         uint32_t colStrideCurSubCore = colNumOriAligned16;
         uint32_t zeroRowCount = 0;

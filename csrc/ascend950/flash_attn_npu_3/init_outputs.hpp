@@ -34,13 +34,26 @@ public:
                     uint32_t qSBlockSize,
                     uint32_t qNBlockSize,
                     uint32_t lseHeadStride,
-                    bool isDN,
                     uint32_t embedV,
                     uint32_t outputStride)
     {
-        auto partition = GetFAIGroupedRowPartition(qSBlockSize, qNBlockSize, isDN ? 32U : 8U);
-        uint32_t rowCount = partition.validRows;
-        uint32_t logicalRowStart = partition.logicalRowStart;
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        uint32_t qNStart = 0U;
+        uint32_t qNThisSubBlock = 1U;
+        uint32_t rowStart = 0U;
+        uint32_t rowCount = 0U;
+        if (qNBlockSize == 1U) {
+            uint32_t qSSplitSubBlock = qSBlockSize / subBlockNum;
+            rowStart = subBlockIdx * qSSplitSubBlock;
+            rowCount = subBlockIdx + 1U < subBlockNum ? qSSplitSubBlock : qSBlockSize - rowStart;
+        } else {
+            uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
+            qNStart = subBlockIdx * qNSplitSubBlock;
+            qNThisSubBlock = subBlockIdx + 1U < subBlockNum ? qNSplitSubBlock : qNBlockSize - qNStart;
+            rowStart = qNStart * qSBlockSize;
+            rowCount = qNThisSubBlock * qSBlockSize;
+        }
         if (rowCount == 0U) {
             return;
         }
@@ -54,15 +67,13 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID6);
         if (qNBlockSize == 1U) {
             AscendC::DataCopyPad(
-                gOutput[logicalRowStart * outputStride], outputUbTensor,
+                gOutput[rowStart * outputStride], outputUbTensor,
                 AscendC::DataCopyExtParams(rowCount, embedV * sizeof(ElementO), 0,
                     (outputStride - embedV) * sizeof(ElementO), 0));
         } else {
-            uint32_t firstHead = logicalRowStart / qSBlockSize;
-            uint32_t headCount = rowCount / qSBlockSize;
-            for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
+            for (uint32_t qNIdx = 0U; qNIdx < qNThisSubBlock; ++qNIdx) {
                 AscendC::DataCopyPad(
-                    gOutput[(firstHead + headLocal) * embedV], outputUbTensor[headLocal * qSBlockSize * embedRound],
+                    gOutput[(qNStart + qNIdx) * embedV], outputUbTensor[qNIdx * qSBlockSize * embedRound],
                     AscendC::DataCopyExtParams(qSBlockSize, embedV * sizeof(ElementO), 0,
                         (outputStride - embedV) * sizeof(ElementO), 0));
             }
@@ -80,14 +91,12 @@ public:
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID7);
             if (qNBlockSize == 1U) {
                 AscendC::DataCopyPad(
-                    gLse[logicalRowStart], lseUbTensor,
+                    gLse[rowStart], lseUbTensor,
                     AscendC::DataCopyExtParams(rowCount, sizeof(float), 0, 0, 0));
             } else {
-                uint32_t firstHead = logicalRowStart / qSBlockSize;
-                uint32_t headCount = rowCount / qSBlockSize;
-                for (uint32_t headLocal = 0; headLocal < headCount; ++headLocal) {
+                for (uint32_t qNIdx = 0U; qNIdx < qNThisSubBlock; ++qNIdx) {
                     AscendC::DataCopyPad(
-                        gLse[(firstHead + headLocal) * lseHeadStride], lseUbTensor[headLocal * qSBlockSize],
+                        gLse[(qNStart + qNIdx) * lseHeadStride], lseUbTensor[qNIdx * qSBlockSize],
                         AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0, 0, 0));
                 }
             }

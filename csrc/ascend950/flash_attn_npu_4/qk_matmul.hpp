@@ -213,60 +213,49 @@ public:
     __aicore__ inline
     ~BlockMmadTla() {}
 
+    __aicore__ inline
+    auto MakeCustomLayout(uint32_t rowNum, uint32_t embedPhysical, uint32_t qSBlockSize)
+    {
+        uint32_t rowFractalCount = CeilDiv(rowNum, tla::Int<C0_ELEMS>{});
+        uint32_t embedFractalCount = CeilDiv(embedPhysical, tla::Int<C0_ELEMS>{});
+        auto rowFractalShape = tla::MakeShape(tla::Int<C0_ELEMS>{}, rowFractalCount);
+        auto embedFractalShape = tla::MakeShape(tla::Int<C0_ELEMS>{}, embedFractalCount);
+
+        auto rowInnerStride = tla::MakeStride(
+            qSBlockSize * C0_ELEMS, tla::Int<C0_ELEMS * C0_ELEMS>{});
+        auto paddedRowCount = RoundUp(static_cast<int64_t>(rowNum), tla::Int<C0_ELEMS>{});
+        auto embedInnerStride = tla::MakeStride(
+            tla::Int<1>{}, paddedRowCount * C0_ELEMS);
+
+        auto l1AShape = tla::MakeShape(rowFractalShape, embedFractalShape);
+        auto l1AStride = tla::MakeStride(rowInnerStride, embedInnerStride);
+        auto l1AOriginShape = tla::MakeShape(rowNum, embedPhysical);
+        return tla::MakeLayout(l1AShape, l1AStride, l1AOriginShape);
+    }
+
     template <class TensorA>
     __aicore__ inline
     void loadQGM(TensorA &gATensor, GemmCoord actualOriShape,
-                 uint32_t qSBlockSize, uint32_t qNBlockSize,
-                 uint32_t physicalRowsPerAiv)
+                 uint32_t qSBlockSize, uint32_t qNBlockSize)
     {
         using CopyGmToL1A = typename TileCopy_::template CopyGmToL1A<TensorA>;
         CopyGmToL1A copyGmToL1A;
         uint32_t embed = actualOriShape[1];
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
-        uint32_t firstAivHeadCount = qNBlockSize == 1U ? 1U : qNBlockSize / 2U;
-        uint32_t secondAivHeadCount = qNBlockSize - firstAivHeadCount;
-        uint32_t l1Rows = qNBlockSize == 1U ? qSBlockSize : 2U * physicalRowsPerAiv;
-
-        // CopyGmToL1A derives dstNzNStride and dstNzC0Stride from the
-        // destination layout.  Keep the physical zN fractal strides while
-        // making adjacent N entries in one ND matrix qSBlockSize rows apart.
-        auto l1ALayoutTla = tla::MakeLayout(
-            tla::MakeShape(
-                tla::MakeShape(tla::Int<C0_ELEMS>{}, CeilDiv(l1Rows, tla::Int<C0_ELEMS>{})),
-                tla::MakeShape(tla::Int<C0_ELEMS>{}, CeilDiv(embedPhysical, tla::Int<C0_ELEMS>{}))),
-            tla::MakeStride(
-                tla::MakeStride(qSBlockSize * C0_ELEMS, tla::Int<C0_ELEMS * C0_ELEMS>{}),
-                tla::MakeStride(tla::Int<1>{},
-                    RoundUp(static_cast<int64_t>(l1Rows), tla::Int<C0_ELEMS>{}) * C0_ELEMS)),
-            tla::MakeShape(l1Rows, embedPhysical));
+        uint32_t rowNum = actualOriShape[0];
+        auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-        // Reinterpret each S slice as a [head, D] matrix. The source's
-        // inner (head) stride is D, while ndNum advances between S slices
-        // with the original BSND stride below.
-        auto gmFirstAivLayoutTla = tla::MakeLayout(
-            tla::MakeShape(firstAivHeadCount, embed),
+        auto gmQLayoutTla = tla::MakeLayout(
+            tla::MakeShape(qNBlockSize, embed),
             tla::MakeStride(embed, tla::Int<1>{}));
-        auto gmFirstAivTensorTla = tla::MakeTensor(
-            gATensor.data(), gmFirstAivLayoutTla, Arch::PositionGM{});
-        auto l1FirstAivTile = GetTile(l1ATensorTla,
-            tla::MakeCoord(0, 0), tla::MakeShape(firstAivHeadCount, embed));
-        copyGmToL1A(l1FirstAivTile, gmFirstAivTensorTla,
+        auto gmQTensorTla = tla::MakeTensor(
+            gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
+        auto l1QTile = GetTile(l1ATensorTla,
+            tla::MakeCoord(0, 0), tla::MakeShape(qNBlockSize, embed));
+        copyGmToL1A(l1QTile, gmQTensorTla,
             qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
-
-        if (secondAivHeadCount > 0U) {
-            auto gmSecondAivLayoutTla = tla::MakeLayout(
-                tla::MakeShape(secondAivHeadCount, embed),
-                tla::MakeStride(embed, tla::Int<1>{}));
-            auto gmSecondAivTensorTla = tla::MakeTensor(
-                gATensor.data()[firstAivHeadCount * embed],
-                gmSecondAivLayoutTla, Arch::PositionGM{});
-            auto l1SecondAivTile = GetTile(l1ATensorTla,
-                tla::MakeCoord(physicalRowsPerAiv, 0), tla::MakeShape(secondAivHeadCount, embed));
-            copyGmToL1A(l1SecondAivTile, gmSecondAivTensorTla,
-                qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
-        }
 
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
@@ -350,7 +339,7 @@ public:
         uint32_t l1BBufId = kvSTileIdx % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 1;
 
-        auto l1ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(rowNum, embedPhysical);
+        auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         // P full base tile already on L1
@@ -358,15 +347,9 @@ public:
         uint32_t nL0LoopNum = CeilDiv(curBaseTileSize, L0_TILE_N);
         uint32_t kL0LoopNum = CeilDiv(embed, L0_TILE_K);
 
-        // while splitting the base tile S to 2 AIVs,
-        // the order of the elements in each column is expected to be preserved,
-        // which means a column in l0C cannot be chunked and processed by dualMode FixPipe seperately.
-        // therefore, FixPipe won't launch until each portion(chunked only by columns, based on nbuffer strategy)
-        // of the base tile is ready on l0C
         for (uint32_t nL0Itr = 0; nL0Itr < nL0LoopNum; nL0Itr++) {
             uint32_t l0TileNAct = (nL0Itr == nL0LoopNum - 1) ? (curBaseTileSize - nL0Itr * L0_TILE_N) : L0_TILE_N;
             uint32_t nLoopCounter = GetCurLoopCounter(nL0Itr, nL0LoopNum, nL0Itr);
-            // l0C nbuffer chunked only in n loop
             uint32_t l0CLoopCounter = kvSTileIdx;
             uint32_t l0CBufId = l0CLoopCounter % L0_STAGES;
             uint32_t l0CEventId = l0CBufId;

@@ -190,39 +190,23 @@ public:
     template <class TensorA>
     __aicore__ inline
     void loadQGM(TensorA &gATensor, GemmCoord actualOriShape,
-                 uint32_t qSBlockSize, uint32_t qNBlockSize,
-                 uint32_t physicalRowsPerAiv)
+                 uint32_t qSBlockSize, uint32_t qNBlockSize)
     {
-        // DN Q is ColumnMajor [D, S]. Treat each Q head as one D x S
-        // matrix and use the multi-matrix CopyGmToL1B interface to load the
-        // complete AIV half in one DMA operation.
         using CopyGmToL1B = typename TileCopy_::template CopyGmToL1B<TensorA>;
         CopyGmToL1B copyGmToL1B;
         uint32_t embed = actualOriShape[1];
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
-        uint32_t firstAivHeadCount = qNBlockSize == 1U ? 1U : qNBlockSize / 2U;
-        uint32_t secondAivHeadCount = qNBlockSize - firstAivHeadCount;
-        uint32_t l1Rows = qNBlockSize == 1U ? qSBlockSize : 2U * physicalRowsPerAiv;
-        auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(
-            embedPhysical, l1Rows);
+        uint32_t rowNum = actualOriShape[0];
+        auto l1ALayoutTla = tla::MakeLayout<ElementB, LayoutTagL1B>(embedPhysical, rowNum);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-        auto l1FirstAivTile = GetTile(l1ATensorTla,
+        auto l1QTile = GetTile(l1ATensorTla,
             tla::MakeCoord(0, 0), tla::MakeShape(embed, qSBlockSize));
-        auto gmFirstAivTile = GetTile(gATensor,
+        auto gmQTile = GetTile(gATensor,
             tla::MakeCoord(0, 0), tla::MakeShape(embed, qSBlockSize));
-        copyGmToL1B(l1FirstAivTile, gmFirstAivTile,
-            firstAivHeadCount, embed, qSBlockSize * C0_ELEMS);
-
-        if (secondAivHeadCount > 0U) {
-            auto l1SecondAivTile = GetTile(l1ATensorTla,
-                tla::MakeCoord(0, physicalRowsPerAiv), tla::MakeShape(embed, qSBlockSize));
-            auto gmSecondAivTile = GetTile(gATensor,
-                tla::MakeCoord(firstAivHeadCount * embed, 0), tla::MakeShape(embed, qSBlockSize));
-            copyGmToL1B(l1SecondAivTile, gmSecondAivTile,
-                secondAivHeadCount, embed, qSBlockSize * C0_ELEMS);
-        }
+        copyGmToL1B(l1QTile, gmQTile,
+            qNBlockSize, embed, qSBlockSize * C0_ELEMS);
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
     }
@@ -531,12 +515,6 @@ public:
             }
             AscendC::SetFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEventId);
-            // Grouped-Q pads each AIV half to 32 rows (see fai_kernel qkRowsPerAiv).
-            // rowNum is already the physical M (2 * pad) when qN>1; dual FixPipe
-            // therefore splits into two equal pad-aligned private UB views that
-            // match GetFAIGroupedRowPartition(storageRowStart/validRows).
-            // valid rows in AIV0: [0, valid0)
-            // valid rows in AIV1 private view: [0, valid1); L1 write uses storageRowStart
             if constexpr (std::is_same_v<ElementC, half>) {
                 uint32_t mFixPAligned32 = RoundUp(rowNum, 32);
                 uint32_t mPerSubCore = mFixPAligned32 / 2;

@@ -118,18 +118,12 @@ namespace optiling{
         uint32_t qRowNumCeil = Q_TILE_CEIL;
         uint32_t qNBlockTile = (qSeqlen != 0) ?
             (qRowNumCeil / qSeqlen) / N_SPLIT_HELPER * N_SPLIT_HELPER : Q_TILE_CEIL;
-        // The FP32 O temporary buffer supports at most 64 merged M rows
-        // when Dv is greater than 128. qSeqlen is the largest Q-S tile
-        // for this batch, so cap the grouped-Q tile accordingly.
         if (faInfo_.embeddingSizeV > 128 && qSeqlen != 0) {
             constexpr uint32_t MAX_M_FOR_LARGE_D = Q_TILE_CEIL / 2U;
             uint32_t maxQNBlockTile = std::max(MAX_M_FOR_LARGE_D / qSeqlen, 1U);
             qNBlockTile = std::min(qNBlockTile, maxQNBlockTile);
         }
         qNBlockTile = std::min(qNBlockTile, groupSize);
-        // Keep host tiling consistent with the kernel: two AIVs can only
-        // split a multi-head grouped-Q tile evenly.  Any remaining head is
-        // scheduled as a qNBlockSize==1 tail task.
         if (qNBlockTile > N_SPLIT_HELPER) {
             qNBlockTile = qNBlockTile / N_SPLIT_HELPER * N_SPLIT_HELPER;
         }
@@ -178,8 +172,6 @@ namespace optiling{
             (static_cast<uint32_t>(faInfo_.embeddingSize) + 15U) / 16U * 16U;
         auto embeddingSizeVAligned16_ =
             (static_cast<uint32_t>(faInfo_.embeddingSizeV) + 15U) / 16U * 16U;
-        // M is qS * qN in the grouped-Q path.  qBaseTile_ may be 64 when
-        // Dv > 128, but resource planning must still cover the 128-row M cap.
         auto qkL1TileM_ = Q_TILE_CEIL;
         auto qkL1TileKLeft_ = embeddingSizeAligned16_;
         auto qL1BufNum_ = 1;
