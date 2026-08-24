@@ -797,6 +797,109 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.37**｜**【根因定位】链式 P 的跨 AIV 写读竞争——字节级+位级双重实锤（2026-08-24）**：
+用户追问"为何解耦后 P 对、之前错在哪"。代码推演（splitb_softmax.hpp :463-481 行分摊 +
+[SOFTMAX_DEBUG] 实测 rowNumTile=64→每 AIV 单次 16 行 2KB MTE2）：
+- **布局算术**：P[t≥1] 以 fp16 写入 S[t-1] 区，半行距映射 P 行 r ↔ S 行 r/2（P 行偏移
+  r×colsPad×2B、S 行偏移 k×colsPad×4B）。AIV1 的 P(t1) 行 16-31 落在字节 [1024,2048)
+  = **S(t0) 行 8-15 = AIV0 那次 2KB MTE2 读的后半程**——与错误位置（b1 t0 s8-15、
+  仅 tile0、行 0-7 恒安全=映射 AIV0 自写半区、tile1 的 P 恒好=无人覆写）**精确重合**。
+- **位级指纹**：fp16(1.0)=0x3C00 作 fp32 高半字 → 0x3C000000=2⁻⁷=0.0078125 ≈ 实测
+  max 0.007825；P(t1) 行内峰值≈1 打满高半字 → 整行读出≈0.0078 均匀值 → exp(x−max)≈1
+  → sum≈31.77 → P≈0.992188——**三个指纹数全部由"P 字节被当 S 读"定量导出**。
+- **排除法**：UB 残留类机制不依赖 GM 布局，解耦不可能修复——但实际修复了 → 只剩
+  GM 字节覆写。stats 同坏 → 计算侧（非事后覆写）；三时点 P 不变 → 无后续写（#44.34）。
+- **被证伪的前提**：链式安全论证"softmax 顺序执行保证 S[t-1] 读先于 P[t] 写"只在
+  单 AIV 自链成立（#44.24 evId 域）；P[t] 须等两个 AIV 的读完成，跨 AIV 写读顺序不存在。
+  sm-only 对称起步天然大余量；full 模式 VEC 流水态（DO(b0) 残留/队列占用）制造偏斜命中
+  （b1-only 吻合"首个 DO 之后"；B=4 时 b2/b3 干净为待解细节）。
+- **回归链式的正确修法**：P[t] 写 S[t-1] 前加跨 AIV 屏障（两 sub-block 互等对方
+  MTE2_V），只还原布局不够。遗留：①控制组（去 PRE 探针重跑 -O0）封 attribution；
+  ②-O2 专属 LSE bug（b1 h0 s16-31）另案。
+
+**#44.36**｜**【主 bug 修复确认】P/S 解耦后 -O0/-O2 双双全对；残留 -O2 专属 LSE bug（2026-08-24）**：
+t54 解耦布局两轮（用户跑）：**-O0**（t54_decouple.log）P/max/sum/O/LSE 全对——LSE 经
+stats(340) 反推 ln(sum)+max 与 dump(451)/ref 三方逐值一致（脚本汇总曾误读，-O0/-O2 日志
+张冠李戴过）；**-O2**（t54_decouple2.log）P/max/sum/O 全对，主指纹（b1 t0 s8-15）消失。
+- 主修复归因基本成立（-O0/-O2 两套时序都过 → 非探针时序扰动），**待控制组定案**：
+  注释 PRE 探针（860 系）重编译跑 -O0，仍全对 → 铁案。
+- **新暴露第二 bug（-O2 专属）**：LSE 仅 b1 h0 s16-31 错（16/128，值 1.528→1.157，
+  与 t53 链式时 s16-31 的错误值完全相同——t53 时代即存在，被 s8-15 大指纹掩盖）。
+  O 与 GM stats 全对 → divout 的 sum 正确，错在 LSE 计算/写出路径（AIV1 行区间，
+  疑 -O2 的 ln 向量化/Stats 读回 UB 时序）。下一步：读 splitb_divout.hpp LSE 路径。
+- 归因口径：隔离的是**地址区间**（gP/gS 同一 workspace 两视图），非独立指针 →
+  链式"P[t]→S[t-1] 死区"的写以硬件可见方式干扰了同批 S 读，机制待查（回归链式前必修）。
+
+**#44.35**｜**P/S GM 全解耦（临时调试布局）+ 三时点 gS 探针（2026-08-24）**：
+用户决策：为剔除"P 借 S 死区"变量，P 改完全独立 GM 空间——`perBatchF = T×(perTileF+pScratchF)`，
+P[t]→批尾第 t 槽（GetPHalfIdx 单点改）；S 自 QK 写出后**永无人覆写**（任意时点 dump gS
+都是干净观测）。**修好 full 流水 bug 后必须回归 #44.23 链式**（省 (T-1)×pScratchF/批）：
+还原点在代码内搜 `#44.35`（workspace 布局注释 + GetPHalfIdx 两处）+ memory
+splitb-p-gm-layout.md；softmax 的 MTE2_V 事件链未动，回归零改动可用。
+三时点 gS 探针（每 tile dump rowNum×colsPad fp32）：**PRE=860+b\*10+tile**（段2 wait
+qkReady 后、SM 前——"SM 将读到的 S"的直接观测）、**PPV=810**（段3 后金丝雀）、
+**FIN=840**（段4 后金丝雀）。判读：①860 坏（b1 t0 s8-15≈0/垃圾）→ S 在 [QK 完成, SM 读]
+窗口被写坏（full 语境）；②860 对而 P@200 仍坏 → GM 没问题，错在 SM 的 GM→UB 搬运/事件链
+（转 splitb_softmax.hpp 读路径）；③三时点首个异物即凶手段；④加探针后 P 变全对 →
+读侧时序竞争实锤（观测者效应本身是证据）。
+
+**#44.34**｜**t53 三时点 P dump：三点数值一致 + 指纹自洽定案（2026-08-24）**：
+200（SM 后）/810（PV 后）/840（DO 后）三个时点的 P **数值完全一致**，恒为 b1 t0
+s8-15 错 → PV/divout 无任何追加写，P 一次写错后保持不变（#44.33 的 Fixpipe 越界猜想
+对 P 不成立）。**指纹自洽**：坏行 max=0.0078、sum=31.766≈32×0.9927、P=0.992188 恰为
+"该行 S≈全 0"输入的正确 softmax 输出；LSE=3.466227=ln(31.766)+0.0078 严丝合缝 →
+**不是 P 被写坏，而是 SM 拿着近似全零的 S 行算出了自洽垃圾**——错误在读到的 S 本身
+（GM 里的 S 就错，或 GM→UB 搬运/事件同步错）。结论：后续探针目标从 gP 改为 gS。
+
+**#44.33**｜**用户七组对照实验：错误与段3/4 执行强相关，恒在 b1 t0（2026-08-23）**：
+①②③ softmax-only B=2/4/6：S/P/max/sum 全对（任意批数都干净）。
+④⑦ full B=2/4：S✓，P✗ 恒在 **b1 t0**（0.992188 老指纹）；B=4 时 b2/b3 干净。
+⑤ 混合（b0 full、b1 sm-only）：错误仍恒在 b1 t0——**b1 自己没跑段3/4 仍坏**。
+⑥ 混合（b0 sm-only、b1 full）：错误仍恒在 b1 t0。
+用户假设：GM 空间冲突（类似 #44.23 S/P 复用），段3/4 某中间数据地址与段1/2 混用。
+公式层核验：链式 P[t]→S[t-1] 与 OTmp[t-1]/stats[t-1] 子区不重叠（同 tile 块内
+不同偏移）；P[0]→批尾 scratch 独占。**公式层无冲突 → 嫌疑转向硬件级写入粒度**：
+copyL0CToGm（Fixpipe）按 L0C 全 tile 对齐写——若实际写入行数/宽度超过
+rowNum×dPad 的软件假设（如按 fractal 16×16 或 128 行对齐补齐），OTmp/stats 写
+可能越出 tile 块进入相邻区（批尾 scratch 恰在最后 tile 块之后！）。
+待验证：PV 的 OTmp 实际写入范围（dump tile 块后 256B 边界外区域在 full 前后对照）。
+
+**#44.32**｜**t52 全流程 vs t51 softmax-only 对照定案（2026-08-23，供用户分析）**：
+同二进制、同输入、唯一变量 = 段3/4 是否运行：
+- softmax-only（t51_2）：S✓ P✓ max✓ sum✓（双批全部 tile）
+- 全流程（t52）：S✓ **P✗（b1 t0 s8-15 = 0.992188）** max✗（同位置 = 0.007825 恒定）
+  sum✗（= 31.766）→ OTmp/O/LSE 连带错
+关键事实（P dump 代码位置 mha_fwd_splitb.cpp:466-487）：**P dump 在段2 tile 循环
+之后**（PipeBarrier<MTE3> 后读 GM），即 t0 与 t1 的 smEpilogue 都完成后才 dump。
+P(b1,t0) 在 dump 时已坏 → t0 的 smEpilogue 写入的 P 就是坏的（t1 的链式写去
+S[0] 死区、不碰 t0 的 scratch 槽，排除"后被覆盖"）。
+指纹解读：max s8-15 = 0.007825 **8 行恒定**（若为 lmUb 残留应逐行不同）+
+P = exp(−0.00784) → RowMax 第 2 级归约对第 2 个 repeat-8 组产出同一异常值，
+或 S 载入 rows 8-15 读到的旧数据恰有此最大值。
+**全流程 vs softmax-only 的结构差异（当前代码实证，qkReady 已被磁盘编辑回退为
+批级：set 在段1 循环后 :436 / wait 在段2 循环前 :441）**：
+① VEC 侧 SM(b1) 之前紧邻 DO(b0)（softmax-only 无）——DO(b0) 用过 tvUb/gmUb/glUb
+（与 SM 的 tvUb/lmUb/llUb 同区或邻近）+ MTE3_MTE2(6)/MTE2_V(0)/V_MTE3(0) 事件；
+② CUBE 侧 QK(b1) 之前紧邻 PV(b0)（时序推迟，QK(b1) 的 Fixpipe 写 S 与 VEC 的
+MTE2 读更近）；③ pvReady/softmaxReady 交叉流量。
+候选机制（按当前证据排序）：
+庚-1 S 跨核可见性窗口：QK(b1) Fixpipe 落盘（FIX flag 后）→ VEC MTE2 读同一 GM，
+FIX 完成语义是否含"对 VEC 可见"未证；rows 0-7 可见 / 8-15 未见的粒度吻合。
+庚-2 DO(b0) 的 UB/事件残留干扰 SM(b1) 第一个调用的 RowMax 第 2 组。
+建议用户的判别实验（不必改 kernel）：A. 段2 的 qkReady wait 后加
+PipeBarrier<PIPE_MTE2>+PipeBarrier<PIPE_V> 延迟读；B. dump S 于 smEpilogue 调用
+前一刻（stage2 循环内）对照段1 dump——直接看 S 在读时刻的可见性。
+
+**#44.31**｜**比对器修复：Block 子串静默丢记录 + 自适应长度（2026-08-23）**：
+① t51 desc=331 丢失根因：`[SOFTMAX_DEBUG] ... rowActualThisSubBlock` 行含子串
+"SubBlock"→"Block"，命中 parse_log 第一分支被当块头行——**未闭合记录被静默丢弃**。
+修复：该分支先 append 再重置。t51 复验：S/P/max/sum 全 ✓（OTmp/O/LSE 因段3/4
+未跑为 ✗，正常）——与用户人工核对一致，#44.30 结论获得工具背书。
+② check() 改自适应长度（dump 可短于 ref=AIV0 半行版或等于 ref=全行版，比对公共
+前缀）——用户已把 S/P dump 改全行（1024），比对器不再依赖固定长度假设。
+③ 教训：**解析器对"含关键字子串的无关行"的静默分支是丢失记录的温床**——
+每个丢弃分支都必须先闭合在途记录。
+
 **#44.30**｜**【判别完成】softmax-only 全对 → bug 锁定段3/4 交互（2026-08-23）**：
 t51（softmaxOnly 真正生效：段1 QK + 段2 softmax，段3 消费 softmaxReady 后 continue、
 段4 整段跳过、dump 仅 S/P/stats）结果：

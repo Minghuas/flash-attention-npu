@@ -172,7 +172,12 @@ def parse_log(text):
     cur = None
     for ln in text.splitlines():
         if "Block" in ln and "DumpTensor" not in ln and ln.strip().startswith("["):
-            cur = None
+            # "[SOFTMAX_DEBUG] ... rowActualThisSubBlock" 等含 Block 子串的设备 printf
+            # 也会命中此分支——先闭合未完成记录再重置，否则整条 dump 被静默丢弃
+            #（t51 desc=331 丢失根因，devlog #44.31）
+            if cur is not None:
+                records.append(tuple([cur[0], cur[1], cur[2]]))
+                cur = None
             continue
         m = DUMP_HDR.search(ln)
         if m:
@@ -227,13 +232,18 @@ def compare_all(records, iters, ref, softmax_only=False):
                 stages_ok[stage] = False
                 rep.append((stage, "(missing)", "无 dump 数据（可能超 1MB 被丢弃）"))
                 return
+            # 自适应长度：dump 可短于 ref（AIV0 半行版）或等于 ref（全行版），
+            # 比对公共前缀；dump 为空报缺失
             n_exp = len(ref_flat)
-            if len(dump) < n_exp:
+            n = min(len(dump), n_exp)
+            if n == 0:
                 stages_ok[stage] = False
-                rep.append((stage, "(truncated)", "dump 长度 %d < 期望 %d" % (len(dump), n_exp)))
+                rep.append((stage, "(empty)", "dump 无数据"))
                 return
-            d = torch.tensor(dump[:n_exp])
-            r = torch.tensor(ref_flat)
+            if len(dump) > n_exp:
+                rep.append((stage, "(warn)", "dump %d > 期望 %d，比对前 %d" % (len(dump), n_exp, n)))
+            d = torch.tensor(dump[:n])
+            r = torch.tensor(ref_flat[:n])
             bad = ((d - r).abs() > tol_abs + tol_rel * r.abs())
             n = int(bad.sum())
             if n:

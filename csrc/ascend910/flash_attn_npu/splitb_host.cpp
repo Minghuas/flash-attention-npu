@@ -145,21 +145,21 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     //   S 区: ROW_NUM_MAX(=Q_TILE_CEIL=128) × colsPad（fp32）
     //   OTmp 区: ROW_NUM_MAX × dPad
     //   stats:   2 × ROW_NUM_MAX（max+sum 各 128 行距）
-    // P（fp16）链式独立区（devlog #44.23 根因修复）：P[t=0]→批尾 scratch、P[t≥1]→S[t-1]
-    //   死区——P 不再原地覆写 S（批粒度流水下非法，MTE2 读/MTE3 写同字节冲突）
+    // P（fp16）独立区（devlog #44.35 临时调试布局，修 bug 后回归 #44.23 链式）：
+    //   批尾连续 T 个独立 P 槽，P 与 S 完全不复用（S 自 QK 写出后永无人覆写）
     // tile 数 = CeilDiv(G, qNBlockTile) × N2 × CeilDiv(Sq, 128)（与 kernel GetQNBlockTile/
     //   GetQSBlockTile 公式严格一致——两者独立计算，改动必须同步，devlog #34）
     const int64_t rowNumMax = 128;                            // = Q_TILE_CEIL（kernel_common.hpp）
     const int64_t colsPad = alignedS2;                        // align16(Sk)
     const int64_t dPad = AlignUpI(D, FRACTAL_NUM);            // align16(D)
     const int64_t s1AreaF = rowNumMax * colsPad;              // floats
-    const int64_t pScratchF = s1AreaF / 2;                     // P 槽（128×colsPad half；链式方案 #44.23）
+    const int64_t pScratchF = s1AreaF / 2;                     // 单 P 槽（128×colsPad half；#44.35 起 T 槽全独立）
     const int64_t oAreaF = rowNumMax * dPad;
     const int64_t statsPerTask = 2 * rowNumMax;
     const int64_t qNBlockTile = std::min(std::max((rowNumMax / Sq) / 2 * 2, (int64_t)1), G);
     const int64_t nTilePerBatch = CeilDivI(G, qNBlockTile) * N2 * CeilDivI(Sq, rowNumMax);
     const int64_t perTileF = s1AreaF + oAreaF + statsPerTask;
-    const int64_t perBatchF = nTilePerBatch * perTileF + pScratchF;   // 批尾 P-scratch（#44.23）
+    const int64_t perBatchF = nTilePerBatch * (perTileF + pScratchF); // T×(tile 块+独立 P 槽)（#44.35 调试；回归链式改 + pScratchF）
     const int64_t perCoreF = 2 * perBatchF;
     const int64_t perCoreBytes = AlignUpI(perCoreF * 4, GM_ALIGN);
     const int64_t workSpaceSize = perCoreBytes * coreNum;
