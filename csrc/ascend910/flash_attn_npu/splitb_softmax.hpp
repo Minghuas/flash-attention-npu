@@ -522,7 +522,9 @@ public:
 
                 const uint32_t evId = pingpongFlag + 2 * AscendC::GetSubBlockIdx();
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evId);
-                // ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);  // FIXME: 暂时不做，方便debug
+                // ScaleS 恢复（devlog #44.42：调试期曾禁用对齐脚本；GM 的 S 保持 raw QK
+                // 输出，scale 在 UB 内做——S dump(100 系) 对脚本 s_raw 仍然成立）
+                ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 if constexpr (HAS_SOFTCAP) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }

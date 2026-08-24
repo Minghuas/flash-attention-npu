@@ -92,7 +92,7 @@ def make_ref():
     s_raw = torch.matmul(q16.transpose(1, 2), k16.transpose(1, 2).transpose(-1, -2))  # [B,H,Sq,Sk]
     # DBG（2026-08-21 用户要求，临时禁用 ScaleS）：kernel 已注释 ScaleS，此处同样不乘。
     # 数值健全性：S_raw≤64 不溢出；max=64；P=exp(S−64)∈(0,1]；sum≈2-3；O≈30-32。
-    s_sc = s_raw   # s_raw * SCALE
+    s_sc = s_raw * SCALE   # 恢复 scale（devlog #44.42；调试期曾用 s_raw 对齐禁用的 ScaleS）
     mx = s_sc.max(dim=-1, keepdim=True).values                    # [B,H,Sq,1]
     p32 = torch.exp(s_sc - mx)
     p16 = p32.half().float()

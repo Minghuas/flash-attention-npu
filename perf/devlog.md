@@ -797,6 +797,20 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.43**｜**【S3 完成】ScaleS 恢复后全矩阵回归全绿（2026-08-24）**：
+用户复测（t57）：-O2 B=2/4（含 B=6 抽查）七项全对——S3（NO_MASK/fp16/B≤4）全流程
+正确收官。本阶段（#44.12-#44.43）三大根因：①P/S GM 复用跨 AIV 竞争（#44.23/#44.37，
+解耦=FAInfer 哲学 #44.39）；②divout 跨 tile 事件两重缺陷（#44.40）；③dump desc 撞号
+假象（#44.41）。下一步 S4：causal/SWA mask（softmax mask 重载 + host 分发）+ softcap
+验证；S5 性能；S6 默认启用+清探针（含 kernel 末尾 drain 缺 MTE3_V(3)、B≥8 desc 撞号）。
+
+**#44.42**｜**ScaleS 恢复（2026-08-24）**：
+splitb_softmax.hpp :527 的 ScaleS 解注释（调试期曾禁用对齐脚本，#44 早期）；脚本
+s_sc = s_raw × SCALE（=1/√D）恢复。一致性核验：scale 在 softmax 的 UB 拷贝内做
+（Muls in-place），GM 的 S 保持 raw QK 输出 → S dump(100 系) 对脚本 s_raw 的比对
+不变；P/max/sum/OTmp/O/LSE 的 ref 自动经 s_sc 生效。待跑全矩阵回归：
+-O0/-O2 × B=2/4/6（fp16；bf16 走主测试套件）。
+
 **#44.41**｜**【里程碑】#44.40 修复验证通过：全流程七项 -O0/-O2 × B=2/4 全绿（2026-08-24）**：
 t56（-O2）：B=2 七项全对（S/P/max/sum/OTmp/O/LSE）；B=4 仅 OTmp(b2/b3 t0) 报错——
 **desc 撞号假象**：OTmp 家族 310+b×10 在 b≥2 与 stats 家族 330+b×10 撞号（b2 t0=330
