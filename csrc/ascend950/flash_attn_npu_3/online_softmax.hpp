@@ -509,6 +509,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
+    // SWA Pre/Next mask path. Trailing swaPathTag keeps arity distinct from causal mask overload.
     template <class TensorP, class TensorMask>
     __aicore__ inline
     void operator()(TensorP &l1PTensorTla, TensorMask &gmMaskTensorTla, GemmCoord actualBlockShape,
@@ -517,11 +518,17 @@ public:
         int32_t kvSStartIdx,
         bool doTriUPreMask, bool doTriUNextMask,
         int32_t preTokenStartLen, int32_t /*preTokenEndLen*/,
-        int32_t nextTokenStartLen, int32_t /*nextTokenEndLen*/)
+        int32_t nextTokenStartLen, int32_t /*nextTokenEndLen*/,
+        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t /*swaPathTag*/)
     {
-        uint32_t mCopyOffset = RoundUp(actualBlockShape.m(), 8) / 2;
-        uint32_t m = actualBlockShape.m() < mCopyOffset ? actualBlockShape.m() : mCopyOffset;
-        m = subBlockIdx_ == 0 ? m : actualBlockShape.m() - m;
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        uint32_t totalRows = qSBlockSize * qNBlockSize;
+        uint32_t splitRows = (totalRows + 8U - 1U) / 8U * 8U / subBlockNum;
+        uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
+        uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
+        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows :
+            (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (m == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -567,34 +574,78 @@ public:
         CopyGmToUbMask copyGmToUbMask;
         auto ubMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(m, maskColumnRound);
         auto ubMaskTensorTla = tla::MakeTensor(maskUbTensor, ubMaskLayoutTla, Arch::PositionUB{});
-        constexpr uint32_t MASK_NEXT_ELEM_OFFSET = 8192;
+        // Next-band mask sits after Pre; sized for max online-softmax rows (m<=64
+        // with kvS=128). qN>1 reuses the same S-band rows per head via localS fill.
+        constexpr uint32_t MASK_NEXT_ELEM_OFFSET = MAX_UB_S_ELEM_NUM;
         auto ubMaskNextTensorTla = tla::MakeTensor(
             maskUbTensor[MASK_NEXT_ELEM_OFFSET], ubMaskLayoutTla, Arch::PositionUB{});
 
+        // Fill Pre/Next mask by localS within each head segment (same mapping as causal).
+        // This is the qN>=1 path: mid-head AIV splits still map localS correctly.
         if (doTriUPreMask) {
-            auto gMaskPreTile = GetTile(gmMaskTensorTla,
-                tla::MakeCoord(gmOffsetMaskRowPre + subBlockIdx_ * mCopyOffset, gmOffsetMaskColumnPre),
-                tla::MakeShape(m, maskColumnRound));
-            auto ubMaskPreTile = GetTile(ubMaskTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, maskColumnRound));
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
-            copyGmToUbMask(ubMaskPreTile, gMaskPreTile);
+            uint32_t groupRow = rowStart;
+            uint32_t ubRowOffset = 0U;
+            uint32_t remainingRows = m;
+            while (remainingRows > 0U) {
+                uint32_t localS = groupRow % qSBlockSize;
+                uint32_t rowsThisHead = qSBlockSize - localS;
+                rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+                auto gMaskTile = GetTile(gmMaskTensorTla,
+                    tla::MakeCoord(gmOffsetMaskRowPre + localS, gmOffsetMaskColumnPre),
+                    tla::MakeShape(rowsThisHead, maskColumnRound));
+                auto ubMaskTile = GetTile(ubMaskTensorTla,
+                    tla::MakeCoord(ubRowOffset, 0),
+                    tla::MakeShape(rowsThisHead, maskColumnRound));
+                copyGmToUbMask(ubMaskTile, gMaskTile);
+                groupRow += rowsThisHead;
+                ubRowOffset += rowsThisHead;
+                remainingRows -= rowsThisHead;
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(4);
         }
         if (doTriUNextMask) {
-            auto gMaskNextTile = GetTile(gmMaskTensorTla,
-                tla::MakeCoord(gmOffsetMaskRowNext + subBlockIdx_ * mCopyOffset, gmOffsetMaskColumnNext),
-                tla::MakeShape(m, maskColumnRound));
             if (doTriUPreMask) {
-                auto ubMaskNextTile = GetTile(
-                    ubMaskNextTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, maskColumnRound));
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(5);
-                copyGmToUbMask(ubMaskNextTile, gMaskNextTile);
+                uint32_t groupRow = rowStart;
+                uint32_t ubRowOffset = 0U;
+                uint32_t remainingRows = m;
+                while (remainingRows > 0U) {
+                    uint32_t localS = groupRow % qSBlockSize;
+                    uint32_t rowsThisHead = qSBlockSize - localS;
+                    rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+                    auto gMaskTile = GetTile(gmMaskTensorTla,
+                        tla::MakeCoord(gmOffsetMaskRowNext + localS, gmOffsetMaskColumnNext),
+                        tla::MakeShape(rowsThisHead, maskColumnRound));
+                    auto ubMaskTile = GetTile(ubMaskNextTensorTla,
+                        tla::MakeCoord(ubRowOffset, 0),
+                        tla::MakeShape(rowsThisHead, maskColumnRound));
+                    copyGmToUbMask(ubMaskTile, gMaskTile);
+                    groupRow += rowsThisHead;
+                    ubRowOffset += rowsThisHead;
+                    remainingRows -= rowsThisHead;
+                }
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(5);
             } else {
-                auto ubMaskNextTile = GetTile(
-                    ubMaskTensorTla, tla::MakeCoord(0, 0), tla::MakeShape(m, maskColumnRound));
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
-                copyGmToUbMask(ubMaskNextTile, gMaskNextTile);
+                uint32_t groupRow = rowStart;
+                uint32_t ubRowOffset = 0U;
+                uint32_t remainingRows = m;
+                while (remainingRows > 0U) {
+                    uint32_t localS = groupRow % qSBlockSize;
+                    uint32_t rowsThisHead = qSBlockSize - localS;
+                    rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+                    auto gMaskTile = GetTile(gmMaskTensorTla,
+                        tla::MakeCoord(gmOffsetMaskRowNext + localS, gmOffsetMaskColumnNext),
+                        tla::MakeShape(rowsThisHead, maskColumnRound));
+                    auto ubMaskTile = GetTile(ubMaskTensorTla,
+                        tla::MakeCoord(ubRowOffset, 0),
+                        tla::MakeShape(rowsThisHead, maskColumnRound));
+                    copyGmToUbMask(ubMaskTile, gMaskTile);
+                    groupRow += rowsThisHead;
+                    ubRowOffset += rowsThisHead;
+                    remainingRows -= rowsThisHead;
+                }
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(4);
             }
         }
@@ -702,7 +753,7 @@ public:
         auto ubPTensorTlaTile = GetTile(ubPTensorTla,
                 tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(subBlockIdx_ * mCopyOffset, 0), tla::MakeShape(m, n));
+                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);

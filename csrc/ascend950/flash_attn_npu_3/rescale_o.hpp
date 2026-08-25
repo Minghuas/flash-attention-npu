@@ -97,25 +97,31 @@ public:
         }
     }
 
+    // Clear O rows whose absolute Q-token index falls outside the SWA-valid
+    // range [delEndRow, delStartRow).  Logical UB rows are S/N combined:
+    //   localS = groupRow % qSBlockSize, absQ = qSTileStart + localS
+    // so each head replica of the same token is cleared together when qN>1.
     __aicore__ inline
     void ZeroInvalidSwaRows(
         uint32_t rowNumCurSubCore,
         uint32_t embedRound,
         uint32_t rowOffsetCurSubCore,
+        uint32_t qSBlockSize,
         int32_t delStartRow,
         int32_t delEndRow,
         uint32_t qSeqlen,
         uint32_t qSTileStart)
     {
-        if (qSeqlen == 0U) {
+        if (qSeqlen == 0U || qSBlockSize == 0U) {
             return;
         }
         if (delStartRow == 0 && delEndRow == static_cast<int32_t>(qSeqlen)) {
             return;
         }
-        const int32_t absBase = static_cast<int32_t>(qSTileStart + rowOffsetCurSubCore);
         for (uint32_t i = 0; i < rowNumCurSubCore; ++i) {
-            const int32_t absQ = absBase + static_cast<int32_t>(i);
+            const uint32_t groupRow = rowOffsetCurSubCore + i;
+            const uint32_t localS = groupRow % qSBlockSize;
+            const int32_t absQ = static_cast<int32_t>(qSTileStart + localS);
             const bool clearTail = (delStartRow != 0) && (absQ >= delStartRow);
             const bool clearHead = (delEndRow != static_cast<int32_t>(qSeqlen)) && (absQ < delEndRow);
             if (clearTail || clearHead) {
@@ -123,6 +129,39 @@ public:
                     goUbTensor16[i * embedRound],
                     static_cast<ElementO>(0),
                     embedRound);
+            }
+        }
+    }
+
+    // Mirror ZeroInvalidSwaRows for LSE: invalid tokens get +inf (host/emptySpan
+    // convention), written into the Brcb-expanded LSE scratch (goUbTensor32).
+    __aicore__ inline
+    void InvalidSwaLseRows(
+        uint32_t rowStart,
+        uint32_t rowCount,
+        uint32_t qSBlockSize,
+        int32_t delStartRow,
+        int32_t delEndRow,
+        uint32_t qSeqlen,
+        uint32_t qSTileStart)
+    {
+        if (qSeqlen == 0U || qSBlockSize == 0U || rowCount == 0U) {
+            return;
+        }
+        if (delStartRow == 0 && delEndRow == static_cast<int32_t>(qSeqlen)) {
+            return;
+        }
+        for (uint32_t i = 0; i < rowCount; ++i) {
+            const uint32_t groupRow = rowStart + i;
+            const uint32_t localS = groupRow % qSBlockSize;
+            const int32_t absQ = static_cast<int32_t>(qSTileStart + localS);
+            const bool clearTail = (delStartRow != 0) && (absQ >= delStartRow);
+            const bool clearHead = (delEndRow != static_cast<int32_t>(qSeqlen)) && (absQ < delEndRow);
+            if (clearTail || clearHead) {
+                AscendC::Duplicate(
+                    goUbTensor32[i * FLOAT_BLOCK_SIZE],
+                    std::numeric_limits<float>::infinity(),
+                    FLOAT_BLOCK_SIZE);
             }
         }
     }
@@ -140,6 +179,7 @@ public:
                         uint32_t tailCols,
                         bool skipOutput = false,
                         uint32_t rowOffsetCurSubCore = 0,
+                        uint32_t qSBlockSize = 1,
                         int32_t delStartRow = 0,
                         int32_t delEndRow = 0,
                         uint32_t qSeqlen = 0,
@@ -198,7 +238,7 @@ public:
             }
             AscendC::PipeBarrier<PIPE_V>();
             ZeroInvalidSwaRows(
-                rowNumCurSubCore, colStride, rowOffsetCurSubCore,
+                rowNumCurSubCore, colStride, rowOffsetCurSubCore, qSBlockSize,
                 delStartRow, delEndRow, qSeqlen, qSTileStart);
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -276,7 +316,11 @@ public:
     void WriteGroupedLse(AscendC::GlobalTensor<float> gLse,
                          uint32_t qSBlockSize, uint32_t qNBlockSize,
                          uint32_t lseHeadStride, bool isDN,
-                         uint32_t fullyMaskedRowsPerHead)
+                         uint32_t fullyMaskedRowsPerHead,
+                         int32_t delStartRow = 0,
+                         int32_t delEndRow = 0,
+                         uint32_t qSeqlen = 0,
+                         uint32_t qSTileStart = 0)
     {
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
@@ -332,6 +376,8 @@ public:
                 }
             }
         }
+        InvalidSwaLseRows(rowStart, rowCount, qSBlockSize,
+            delStartRow, delEndRow, qSeqlen, qSTileStart);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
@@ -682,27 +728,27 @@ public:
         if (rowNumCurSubCore > 0) {
             if (colNumCurSubCore <= vlElemNum) {
                 if (headdimAligned64) {
-                    SubCoreCompute<64, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<64, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 } else {
-                    SubCoreCompute<64, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<64, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 }
             } else if (colNumCurSubCore <= 2 * vlElemNum) {
                 if (headdimAligned64) {
-                    SubCoreCompute<128, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<128, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 } else {
-                    SubCoreCompute<128, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<128, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 }
             } else if (colNumCurSubCore <= 3 * vlElemNum) {
                 if (headdimAligned64) {
-                    SubCoreCompute<192, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<192, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 } else {
-                    SubCoreCompute<192, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<192, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 2 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 }
             } else {
                 if (headdimAligned64) {
-                    SubCoreCompute<256, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<256, true>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 } else {
-                    SubCoreCompute<256, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, delStartRow, delEndRow, qSeqlen, qSTileStart);
+                    SubCoreCompute<256, false>(gOTensorTlaTile, colStrideCurSubCore, curTileMod, ubOTmpBufId, isFirstKvSTile, isLastKvSTile, pvReadyFlag, zeroRowCount, colNumCurSubCore - 3 * vlElemNum, qNBlockSize > 1U, rowOffsetCurSubCore, qSBlockSize, delStartRow, delEndRow, qSeqlen, qSTileStart);
                 }
             }
         } else {
@@ -720,7 +766,8 @@ public:
             if constexpr (std::is_same_v<SMDtype, float>) {
                 if (rowNumCurSubCore > 0U && isLastKvSTile) {
                     WriteGroupedLse(gLse, qSBlockSize, qNBlockSize, lseHeadStride,
-                        isDN, fullyMaskedRowsPerHead);
+                        isDN, fullyMaskedRowsPerHead,
+                        delStartRow, delEndRow, qSeqlen, qSTileStart);
                 }
             }
         }

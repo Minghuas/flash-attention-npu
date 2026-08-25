@@ -790,8 +790,7 @@ def _run_swa_test(
 
     rtol, atol = 1e-2, 1e-2
     torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
-    if "Ascend910" in name:
-        torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize(
