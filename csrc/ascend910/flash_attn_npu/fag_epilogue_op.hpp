@@ -575,7 +575,7 @@ public:
 
     CATLASS_DEVICE
     void SubGrapA(int64_t curIdx, int64_t curS1Idx, int64_t curS2Idx, DBParams& dbParam,
-                                event_t mte2WaitMte3A)
+                                event_t mte2WaitMte3A, event_t dropMte2WaitV)
     {
         pingpongIdx = dbParam.taskId % 2;
         s2Extend = (curS2Idx == s2VecLoop - 1) ? (dbParam.s2CvExtend - (s2VecLoop - 1) * s2VecSize) : s2VecSize;
@@ -709,40 +709,39 @@ public:
             int64_t dropMaskOffset = GetDropMaskOffset(dbParam, curS1Idx, s2VBegin, dropMaskS2Stride);
             LocalTensor<uint8_t> dropMaskU8 =
                 unifiedBuffer.GetWithOffset<uint8_t>(8 * 1024 / sizeof(uint8_t), ubBufferOffset + U8Begin);
-            event_t v2Mte2A = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(v2Mte2A);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(v2Mte2A);
             AscendC::DataCopyExtParams dropCopyParams;
             dropCopyParams.blockCount = static_cast<uint16_t>(s1ExtendSubGraph);
             dropCopyParams.blockLen = maskRowBytes;
             dropCopyParams.srcStride = dropMaskS2Stride - maskRowBytes;
             dropCopyParams.dstStride = 0;
             dropCopyParams.rsv = 0;
-            AscendC::DataCopyPad(dropMaskU8, dropMaskGm[dropMaskOffset], dropCopyParams,
-                                 {false, 0, 0, 0});
-            event_t dropMte2WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(dropMte2WaitV);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(dropMte2WaitV);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
+            AscendC::DataCopyPad(dropMaskU8, dropMaskGm[dropMaskOffset], dropCopyParams, {false, 0, 0, 0});
+
+            event_t dropVWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(dropVWaitMte2);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(dropVWaitMte2);
             // The pre-dropout P in simpleSoftmaxResBuf (DbBegin) is left
             // untouched for SubGrapB.
             vecDropBuffer = unifiedBuffer.GetWithOffset<T2>(TMP_UB_SIZE / sizeof(T2), TMP_UB_OFFSET);
-            AscendC::Muls(vecDropBuffer, simpleSoftmaxResBuf,
-                          static_cast<float>(1.0f / keepProb), s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::Muls(
+                vecDropBuffer, simpleSoftmaxResBuf, static_cast<float>(1.0f / keepProb),
+                s1ExtendSubGraph * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
             if (s2Extend == 256) {
-                AscendC::Select(vecDropBuffer, dropMaskU8, vecDropBuffer, static_cast<T2>(0.0f),
-                                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s1ExtendSubGraph * s2ExtendAlign);
-                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Select(
+                    vecDropBuffer, dropMaskU8, vecDropBuffer, static_cast<T2>(0.0f),
+                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s1ExtendSubGraph * s2ExtendAlign);
             } else {
                 for (uint32_t r = 0; r < s1ExtendSubGraph; r++) {
-                    AscendC::Select(vecDropBuffer[r * s2ExtendAlign],
-                                    dropMaskU8[r * DROP_MASK_UB_ROW_STRIDE],
-                                    vecDropBuffer[r * s2ExtendAlign], static_cast<T2>(0.0f),
-                                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s2ExtendAlign);
-                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Select(
+                        vecDropBuffer[r * s2ExtendAlign], dropMaskU8[r * DROP_MASK_UB_ROW_STRIDE],
+                        vecDropBuffer[r * s2ExtendAlign], static_cast<T2>(0.0f),
+                        AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s2ExtendAlign);
                 }
             }
         }
+
         LocalTensor<T1> vecCopyOutBuffer = vecDropBuffer.template ReinterpretCast<T1>();
         if constexpr (!AscendC::IsSameType<T1, float>::value) {
             vecCopyOutBuffer = unifiedBuffer.GetWithOffset<T1>(17 * 1024 / sizeof(T1), ubBufferOffset + T1Begin);
@@ -771,7 +770,8 @@ public:
 
     CATLASS_DEVICE
     void SubGrapB(int64_t curIdx, int64_t s1VecLoop, int64_t s2VecLoop,
-                                 int64_t curS1Idx, int64_t curS2Idx, DBParams& dbParam, event_t mte2WaitMte3B)
+                                 int64_t curS1Idx, int64_t curS2Idx, DBParams& dbParam, 
+                                 event_t mte2WaitMte3B, event_t dropMte2WaitV)
     {
         pingpongIdx = dbParam.taskId % 2;
         uint32_t ubBufferOffset = DbBegin;
@@ -791,9 +791,9 @@ public:
             AscendC::DataCopy(savedS, srcS, s1ExtendSubGraph * s2ExtendAlign);
         }
 
+        LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
         if (preS1Idx != curS1Idx) {
             preS1Idx = curS1Idx;
-            LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
             AscendC::DataCopy(sfmgClc3, sfmgWorkspaceGm[sfmgOffset + curS1Idx * s1VecSize * 8], s1ExtendSubGraph * 8);
         }
 
@@ -816,28 +816,26 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
 
-        AscendC::PipeBarrier<PIPE_V>();
         if constexpr (IS_DROP == ENABLE) {
             if (s2Extend == 256) {
-                AscendC::Select(vecClc1Buffer, dropMaskU8, vecClc1Buffer, static_cast<T2>(0.0f),
-                                AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s1ExtendSubGraph * s2ExtendAlign);
-                AscendC::PipeBarrier<PIPE_V>();
+                AscendC::Select(
+                    vecClc1Buffer, dropMaskU8, vecClc1Buffer, static_cast<T2>(0.0f),
+                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s1ExtendSubGraph * s2ExtendAlign);
             } else {
                 for (uint32_t r = 0; r < s1ExtendSubGraph; r++) {
-                    AscendC::Select(vecClc1Buffer[r * s2ExtendAlign],
-                                    dropMaskU8[r * DROP_MASK_UB_ROW_STRIDE],
-                                    vecClc1Buffer[r * s2ExtendAlign], static_cast<T2>(0.0f),
-                                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s2ExtendAlign);
-                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Select(
+                        vecClc1Buffer[r * s2ExtendAlign], dropMaskU8[r * DROP_MASK_UB_ROW_STRIDE],
+                        vecClc1Buffer[r * s2ExtendAlign], static_cast<T2>(0.0f),
+                        AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s2ExtendAlign);
                 }
             }
-            AscendC::Muls(vecClc1Buffer, vecClc1Buffer, static_cast<float>(1.0f / keepProb),
-                          s1ExtendSubGraph * s2ExtendAlign);
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
             AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(
+                vecClc1Buffer, vecClc1Buffer, static_cast<float>(1.0f / keepProb), s1ExtendSubGraph * s2ExtendAlign);
         }
-        uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
-        LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
 
+        uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t subIdx = 0; subIdx < sub_block_cout; subIdx++) {
             uint32_t subMaskCout =
@@ -963,11 +961,16 @@ public:
 
             event_t mte2WaitMte3A = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
             event_t mte2WaitMte3B = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
-            SubGrapA(loopCnt, curS1Idx, curS2Idx, dbParam, mte2WaitMte3A);
-            SubGrapB(loopCnt, s1VecLoop, s2VecLoop, curS1Idx, curS2Idx, dbParam, mte2WaitMte3B);
+            event_t dropMte2WaitV = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
 
+            SubGrapA(loopCnt, curS1Idx, curS2Idx, dbParam, mte2WaitMte3A, dropMte2WaitV);
+            SubGrapB(loopCnt, s1VecLoop, s2VecLoop, curS1Idx, curS2Idx, dbParam, mte2WaitMte3B, dropMte2WaitV);
+
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
             GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3A);
             GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3B);
+            GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
         }
     }
 };
