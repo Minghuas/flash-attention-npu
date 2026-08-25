@@ -8,7 +8,7 @@
  *   ✅ Paged KV (page_table)
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
- *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
+ *   ✅ return_softmax_lse
  *   ❌ SWA / window_size != (-1, -1)
  *   ❌ num_splits > 1 (FlashDecode)
  *   ❌ pack_gqa, scheduler_metadata, leftpad_k
@@ -68,7 +68,8 @@ mha_fwd(at::Tensor q,
         std::optional<at::Tensor> scheduler_metadata_,
         int64_t                   num_splits,
         std::optional<bool>       pack_gqa_,
-        int64_t                   sm_margin)
+        int64_t                   sm_margin,
+        bool                      return_softmax_lse)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -268,8 +269,8 @@ mha_fwd(at::Tensor q,
         batch_size, seqlen_q, num_heads, num_heads_k,
         head_size_q, head_size_v,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
-        /* lse_flag= */ true,
-        /* layout_str= */ is_varlen_q ? "TND" : "BSND");
+        return_softmax_lse,
+        is_varlen_q ? "TND" : "BSND");
 
     FAInferTilingData tilingData{};
     {
@@ -291,16 +292,18 @@ mha_fwd(at::Tensor q,
         {static_cast<int64_t>(tilingData.workSpaceSize)},
         at::device(at::kPrivateUse1).dtype(at::kByte));
 
-    at::Tensor softmaxlse;
-    if (is_varlen_q) {
-        // Match v3's varlen lse shape: {total_q, num_heads}
-        softmaxlse = at::empty({sizes[0], num_heads},
+    at::Tensor softmaxlse = at::empty(
+        {0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    if (return_softmax_lse && is_varlen_q) {
+        softmaxlse = at::empty({num_heads, sizes[0]},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
-    } else {
-        softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+    } else if (return_softmax_lse) {
+        softmaxlse = at::empty({batch_size, num_heads, seqlen_q},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    if (return_softmax_lse) {
+        softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    }
 
     // ============================================================
     // 9. Tiling host→device (CPU byte tensor + .to(kPrivateUse1) —
@@ -335,7 +338,11 @@ mha_fwd(at::Tensor q,
     auto kDev = static_cast<uint8_t*>(k.data_ptr());
     auto vDev = static_cast<uint8_t*>(v.data_ptr());
     auto oDev = static_cast<uint8_t*>(out.data_ptr());
-    auto lseDev = static_cast<uint8_t*>(softmaxlse.data_ptr());
+    // The LSE-disabled kernel never dereferences lseDevice.  Reuse oDev as a
+    // non-null placeholder so GM tensor setup remains valid without allocating LSE.
+    auto lseDev = return_softmax_lse
+        ? static_cast<uint8_t*>(softmaxlse.data_ptr())
+        : oDev;
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
@@ -371,7 +378,7 @@ mha_fwd(at::Tensor q,
         (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256) && (innerPrec == 0u);
 
     const aclError err = fai_host::LaunchFAI(
-        kernelKey, enableDN,
+        kernelKey, enableDN, return_softmax_lse,
         blockDim, aclStream,
         qDev, kDev, vDev, maskDev, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,

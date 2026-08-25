@@ -14,6 +14,7 @@
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/epilogue/dispatch_policy.hpp"
+#include "kernel_common.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "tla/tensor.hpp"
@@ -159,11 +160,17 @@ public:
     __aicore__ inline
     void operator()(TensorP &l1PTensorTla, GemmCoord actualBlockShape,
         uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
-         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag)
-    {   
-        uint32_t mCopyOffset = RoundUp(actualBlockShape.m(), 8) / 2;
-        uint32_t m = actualBlockShape.m() < mCopyOffset ? actualBlockShape.m() : mCopyOffset;
-        m = subBlockIdx_ == 0 ? m : actualBlockShape.m() - m;
+         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
+         uint32_t qSBlockSize, uint32_t qNBlockSize)
+    {
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        uint32_t totalRows = qSBlockSize * qNBlockSize;
+        uint32_t splitRows = (totalRows + 8U - 1U) / 8U * 8U / subBlockNum;
+        uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
+        uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
+        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows :
+            (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (m == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -221,7 +228,7 @@ public:
         auto ubPTensorTlaTile = GetTile(ubPTensorTla,
                 tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(subBlockIdx_ * mCopyOffset, 0), tla::MakeShape(m, n));
+                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);
@@ -239,11 +246,17 @@ public:
     __aicore__ inline
     void operator()(TensorP &l1PTensorTla, GemmCoord actualBlockShape,
         uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
-         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag, bool enableDn)
-    {   
-        uint32_t nCopyOffset = RoundUp(actualBlockShape.m(), 32) / 2;
-        uint32_t n = actualBlockShape.m() < nCopyOffset ? actualBlockShape.m() : nCopyOffset;
-        n = subBlockIdx_ == 0 ? n : actualBlockShape.m() - n;
+         Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag, bool enableDn,
+         uint32_t qSBlockSize, uint32_t qNBlockSize)
+    {
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        uint32_t totalRows = qSBlockSize * qNBlockSize;
+        uint32_t splitRows = (totalRows + 32U - 1U) / 32U * 32U / subBlockNum;
+        uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
+        uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
+        uint32_t n = subBlockIdx == 0U ? firstSubBlockRows :
+            (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (n == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -336,7 +349,7 @@ public:
         auto ubPTensorTlaTile = GetTile(ubPTensorTla,
                 tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(subBlockIdx_ * nCopyOffset, 0), tla::MakeShape(m, n));
+                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
         
         AscendC::DataCopyParams dataCopyParams;
@@ -344,9 +357,9 @@ public:
         dataCopyParams.blockLen = mRound / 2;
         dataCopyParams.srcStride = 1;
         dataCopyParams.dstStride = mRound / 2;
-        DataCopy(l1PTensorTla.data()[subBlockIdx_ * mRound * nCopyOffset], 
+        DataCopy(l1PTensorTla.data()[mRound * rowStart],
             lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM], dataCopyParams);
-        DataCopy(l1PTensorTla.data()[mRound * 8 + subBlockIdx_ * mRound * nCopyOffset],
+        DataCopy(l1PTensorTla.data()[mRound * 8 + mRound * rowStart],
             lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM + blockStride * 64], dataCopyParams);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(ubSBufId + 2);
@@ -360,11 +373,17 @@ public:
         uint32_t isFirstKvSTile, uint32_t ubSBufId, uint32_t l1PBufId,
          Arch::CrossCoreFlag qkReadyFlag, Arch::CrossCoreFlag softmaxReadyFlag,
          int64_t triUp,  uint32_t triDown, uint32_t globalWindowSize,  uint32_t localWindowSize,
-         uint32_t kvSStartIdx, uint32_t kvSEndIdx, uint32_t maskType)
+         uint32_t kvSStartIdx, uint32_t kvSEndIdx, uint32_t maskType,
+         uint32_t qSBlockSize, uint32_t qNBlockSize)
     {
-        uint32_t mCopyOffset = RoundUp(actualBlockShape.m(), 8) / 2;
-        uint32_t m = actualBlockShape.m() < mCopyOffset ? actualBlockShape.m() : mCopyOffset;
-        m = subBlockIdx_ == 0 ? m : actualBlockShape.m() - m;
+        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
+        uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        uint32_t totalRows = qSBlockSize * qNBlockSize;
+        uint32_t splitRows = (totalRows + 8U - 1U) / 8U * 8U / subBlockNum;
+        uint32_t firstSubBlockRows = splitRows < totalRows ? splitRows : totalRows;
+        uint32_t rowStart = subBlockIdx == 0U ? 0U : firstSubBlockRows;
+        uint32_t m = subBlockIdx == 0U ? firstSubBlockRows :
+            (totalRows > splitRows ? totalRows - splitRows : 0U);
         if (m == 0) {
             WaitCrossCoreSync<4, PIPE_V>(qkReadyFlag);
             SetCrossCoreSync<4, PIPE_V>(qkReadyFlag);
@@ -411,13 +430,9 @@ public:
         }
 
         uint32_t maskColumnRound = RoundUp(maskColumn, 128);
-        auto gMaskTensorTlaTile = GetTile(gmMaskTensorTla,
-                        tla::MakeCoord(gmOffsetMaskRow + subBlockIdx_ * mCopyOffset, gmOffsetMaskColumn), tla::MakeShape(m, maskColumnRound));
         CopyGmToUbMask copyGmToUbMask;
         auto ubMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(m, maskColumnRound);
         auto ubMaskTensorTla = tla::MakeTensor(maskUbTensor, ubMaskLayoutTla, Arch::PositionUB{});
-        auto ubMaskTensorTlaTile = GetTile(ubMaskTensorTla,
-                tla::MakeCoord(0, 0), tla::MakeShape(m, maskColumnRound));
 
         __ubuf__ ElementOutput *pAddr = (__ubuf__ ElementOutput*) lpUbTensor[ubSBufId * MAX_UB_P_ELEM_NUM].GetPhyAddr();
         __ubuf__ ElementInput *sAddr = (__ubuf__ ElementInput*) lsUbTensor[ubSBufId * MAX_UB_S_ELEM_NUM].GetPhyAddr();
@@ -431,7 +446,23 @@ public:
         __ubuf__ ElementMask *maskUbAddr = (__ubuf__ ElementMask *)maskUbTensor.GetPhyAddr();
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(4);
-        copyGmToUbMask(ubMaskTensorTlaTile, gMaskTensorTlaTile);
+        uint32_t groupRow = rowStart;
+        uint32_t ubRowOffset = 0U;
+        uint32_t remainingRows = m;
+        while (remainingRows > 0U) {
+            uint32_t localS = groupRow % qSBlockSize;
+            uint32_t rowsThisHead = qSBlockSize - localS;
+            rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+            auto gmMaskTile = GetTile(gmMaskTensorTla,
+                tla::MakeCoord(gmOffsetMaskRow + localS, gmOffsetMaskColumn),
+                tla::MakeShape(rowsThisHead, maskColumnRound));
+            auto ubMaskTile = GetTile(ubMaskTensorTla,
+                tla::MakeCoord(ubRowOffset, 0), tla::MakeShape(rowsThisHead, maskColumnRound));
+            copyGmToUbMask(ubMaskTile, gmMaskTile);
+            groupRow += rowsThisHead;
+            ubRowOffset += rowsThisHead;
+            remainingRows -= rowsThisHead;
+        }
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(4);
 
         // wait QK Fixpipe finsh
@@ -467,7 +498,7 @@ public:
         auto ubPTensorTlaTile = GetTile(ubPTensorTla,
                 tla::MakeCoord(0, 0), tla::MakeShape(m, n));
         auto l1PTensorTlaTile = GetTile(l1PTensorTla,
-                tla::MakeCoord(subBlockIdx_ * mCopyOffset, 0), tla::MakeShape(m, n));
+                tla::MakeCoord(rowStart, 0), tla::MakeShape(m, n));
         WaitCrossCoreSync<4, PIPE_MTE3>(softmaxReadyFlag);
 
         CopyPUbToPL1(l1PTensorTlaTile, ubPTensorTlaTile, m);

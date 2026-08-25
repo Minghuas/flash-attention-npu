@@ -76,6 +76,7 @@ def _flash_attn_forward(
     num_splits: int,
     pack_gqa: Optional[bool],
     sm_margin: int,
+    return_softmax_lse: bool,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = (_maybe_contiguous(x) for x in (q, k, k_new, v_new))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -109,6 +110,7 @@ def _flash_attn_forward(
         num_splits,
         pack_gqa,
         sm_margin,
+        return_softmax_lse,
     )
 
     if out_accum is None:
@@ -131,7 +133,7 @@ def _flash_attn_forward_fake(
     softmax_scale, causal,
     window_size_left, window_size_right,
     attention_chunk, softcap, rotary_interleaved,
-    scheduler_metadata, num_splits, pack_gqa, sm_margin,
+    scheduler_metadata, num_splits, pack_gqa, sm_margin, return_softmax_lse,
 ):
     is_varlen_q = cu_seqlens_q is not None
     out_dtype = q.dtype
@@ -141,11 +143,13 @@ def _flash_attn_forward_fake(
         total_q = q.size(0)
         num_heads = q.size(1)
         out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
-        softmax_lse = torch.empty((total_q, num_heads), dtype=torch.float32, device=q.device)
+        softmax_lse = (torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device)
+                       if return_softmax_lse else torch.empty((0,), dtype=torch.float32, device=q.device))
     else:
         batch_size, seqlen_q, num_heads, _ = q.shape
         out = torch.empty((batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
-        softmax_lse = torch.empty((batch_size, seqlen_q, num_heads), dtype=torch.float32, device=q.device)
+        softmax_lse = (torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device)
+                       if return_softmax_lse else torch.empty((0,), dtype=torch.float32, device=q.device))
 
     out_accum = torch.tensor([], device=q.device)
     softmax_lse_accum = torch.tensor([], device=q.device)
@@ -313,5 +317,6 @@ def flash_attn_with_kvcache(
         num_splits=num_splits,
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
+        return_softmax_lse=return_softmax_lse,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out

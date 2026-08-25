@@ -213,24 +213,50 @@ public:
     __aicore__ inline
     ~BlockMmadTla() {}
 
+    __aicore__ inline
+    auto MakeCustomLayout(uint32_t rowNum, uint32_t embedPhysical, uint32_t qSBlockSize)
+    {
+        uint32_t rowFractalCount = CeilDiv(rowNum, tla::Int<C0_ELEMS>{});
+        uint32_t embedFractalCount = CeilDiv(embedPhysical, tla::Int<C0_ELEMS>{});
+        auto rowFractalShape = tla::MakeShape(tla::Int<C0_ELEMS>{}, rowFractalCount);
+        auto embedFractalShape = tla::MakeShape(tla::Int<C0_ELEMS>{}, embedFractalCount);
+
+        auto rowInnerStride = tla::MakeStride(
+            qSBlockSize * C0_ELEMS, tla::Int<C0_ELEMS * C0_ELEMS>{});
+        auto paddedRowCount = RoundUp(static_cast<int64_t>(rowNum), tla::Int<C0_ELEMS>{});
+        auto embedInnerStride = tla::MakeStride(
+            tla::Int<1>{}, paddedRowCount * C0_ELEMS);
+
+        auto l1AShape = tla::MakeShape(rowFractalShape, embedFractalShape);
+        auto l1AStride = tla::MakeStride(rowInnerStride, embedInnerStride);
+        auto l1AOriginShape = tla::MakeShape(rowNum, embedPhysical);
+        return tla::MakeLayout(l1AShape, l1AStride, l1AOriginShape);
+    }
+
     template <class TensorA>
     __aicore__ inline
-    void loadQGM(TensorA &gATensor, GemmCoord actualOriShape)
+    void loadQGM(TensorA &gATensor, GemmCoord actualOriShape,
+                 uint32_t qSBlockSize, uint32_t qNBlockSize)
     {
         using CopyGmToL1A = typename TileCopy_::template CopyGmToL1A<TensorA>;
         CopyGmToL1A copyGmToL1A;
-        uint32_t rowNum = actualOriShape[0];
         uint32_t embed = actualOriShape[1];
         uint32_t embedPhysical = RoundUp(embed, C0_ELEMS);
-        auto l1ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(rowNum, embedPhysical);
+        uint32_t rowNum = actualOriShape[0];
+        auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
-        auto l1ATensorTlaTile = GetTile(l1ATensorTla,
-                tla::MakeCoord(0, 0), tla::MakeShape(rowNum, embed));
-        auto gATensorTlaTile = GetTile(gATensor,
-            tla::MakeCoord(0, 0), tla::MakeShape(rowNum, embed));
+
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-        copyGmToL1A(l1ATensorTlaTile, gATensorTlaTile);
-        
+        auto gmQLayoutTla = tla::MakeLayout(
+            tla::MakeShape(qNBlockSize, embed),
+            tla::MakeStride(embed, tla::Int<1>{}));
+        auto gmQTensorTla = tla::MakeTensor(
+            gATensor.data(), gmQLayoutTla, Arch::PositionGM{});
+        auto l1QTile = GetTile(l1ATensorTla,
+            tla::MakeCoord(0, 0), tla::MakeShape(qNBlockSize, embed));
+        copyGmToL1A(l1QTile, gmQTensorTla,
+            qSBlockSize, tla::get<0>(gATensor.stride()), C0_ELEMS);
+
         AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
     }
@@ -295,6 +321,7 @@ public:
                     uint32_t kvSTileIdx, uint32_t kvSeqlenTriDown, uint32_t kvHeads,
                     uint32_t kvNumTokens, uint32_t kvSBaseTile, uint32_t isShrink, 
                     uint32_t globalWindowSize, uint32_t localWindowSize,
+                    uint32_t qSBlockSize, uint32_t qNBlockSize,
                     Arch::CrossCoreFlag qkReadyFlag,
                     uint64_t prefixSumL0AStages, uint64_t prefixSumL0BStages)
     {
@@ -312,7 +339,9 @@ public:
         uint32_t l1BBufId = kvSTileIdx % l1BBufNum;
         uint32_t l1BEventId = l1BBufId + 1;
 
-        auto l1ALayoutTla = tla::MakeLayout<ElementA, LayoutTagL1A>(rowNum, embedPhysical);
+        // Must match loadQGM: the multi-ND copy stores adjacent Q heads
+        // qSBlockSize rows apart in L1.
+        auto l1ALayoutTla = MakeCustomLayout(rowNum, embedPhysical, qSBlockSize);
         auto l1ATensorTla = tla::MakeTensor(l1ATensor[0], l1ALayoutTla, Arch::PositionL1{});
 
         // P full base tile already on L1

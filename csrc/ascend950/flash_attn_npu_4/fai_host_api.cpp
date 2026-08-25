@@ -26,8 +26,7 @@ namespace fai_host
         key |= (dataType == "half" ? 0u : 1u) << 1;
         key |= (maskType == 1u ? 1u : 0u) << 2;
         key |= (maskType == 4u ? 1u : 0u) << 3;
-        const uint32_t ipBit = (dataType == "half") ? ((innerPrec == 1u) ? 1u : 0u) : 0u;
-        key |= ipBit << 4;
+        (void)innerPrec; // v3 supports FP32 QK scores only; kernel-key bit 4 stays clear.
         key |= (layout == Format::TND ? 0u : 1u) << 5;
         key |= (cacheMode == CacheMode::pagedCache ? 1u : 0u) << 6;
         const uint32_t psBit = (cacheMode == CacheMode::pagedCache)
@@ -37,7 +36,7 @@ namespace fai_host
         return key;
     }
 
-    aclError LaunchFAI(uint32_t kernelKey, bool enableDN,
+    aclError LaunchFAI(uint32_t kernelKey, bool enableDN, bool lseMode,
                        uint32_t blockDim, aclrtStream stream,
                        uint8_t *qDevice, uint8_t *kDevice, uint8_t *vDevice,
                        uint8_t *maskDevice, uint8_t *blockTableDevice,
@@ -55,24 +54,24 @@ namespace fai_host
         const bool is_bsnd = (kernelKey >> 5) & 1u;
         if (is_bf16) {
             if (is_bsnd) {
-                return launch_fai_dispatch<bfloat16_t, false>(kernelKey, enableDN,
+                return launch_fai_dispatch<bfloat16_t, false>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);
             } else {
-                return launch_fai_dispatch<bfloat16_t, true>(kernelKey, enableDN,
+                return launch_fai_dispatch<bfloat16_t, true>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);
             }
         } else {
             if (is_bsnd) {
-                return launch_fai_dispatch<half, false>(kernelKey, enableDN,
+                return launch_fai_dispatch<half, false>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);
             } else {
-                return launch_fai_dispatch<half, true>(kernelKey, enableDN,
+                return launch_fai_dispatch<half, true>(kernelKey, enableDN, lseMode,
                     blockDim, stream, qDevice, kDevice, vDevice, maskDevice,
                     blockTableDevice, oDevice, lseDevice, qSeqDevice, kvSeqDevice,
                     workspaceDevice, tilingDevice);

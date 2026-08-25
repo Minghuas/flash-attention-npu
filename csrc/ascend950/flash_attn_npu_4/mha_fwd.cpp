@@ -58,7 +58,8 @@ mha_fwd(at::Tensor q,
         float                     softcap,
         int64_t                   num_splits,
         std::optional<bool>       pack_gqa_,
-        std::optional<at::Tensor> learnable_sink_)
+        std::optional<at::Tensor> learnable_sink_,
+        bool                      return_lse)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -256,8 +257,8 @@ mha_fwd(at::Tensor q,
         batch_size, seqlen_q, num_heads, num_heads_k,
         head_size_q, head_size_v,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
-        /* lse_flag= */ true,
-        /* layout_str= */ is_varlen_q ? "TND" : "BSND");
+        return_lse,
+        is_varlen_q ? "TND" : "BSND");
 
     FAInferTilingData tilingData{};
     {
@@ -279,16 +280,17 @@ mha_fwd(at::Tensor q,
         {static_cast<int64_t>(tilingData.workSpaceSize)},
         at::device(at::kPrivateUse1).dtype(at::kByte));
 
-    at::Tensor softmaxlse;
-    if (is_varlen_q) {
-        // Match v4's varlen lse shape: {total_q, num_heads}
-        softmaxlse = at::empty({sizes[0], num_heads},
+    at::Tensor softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
+    if (return_lse && is_varlen_q) {
+        softmaxlse = at::empty({num_heads, sizes[0]},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
-    } else {
-        softmaxlse = at::empty({batch_size, seqlen_q, num_heads},
+    } else if (return_lse) {
+        softmaxlse = at::empty({batch_size, num_heads, seqlen_q},
                                at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
-    softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    if (return_lse) {
+        softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    }
 
     // ============================================================
     // 9. Tiling host→device (CPU byte tensor + .to(kPrivateUse1) —
@@ -323,7 +325,7 @@ mha_fwd(at::Tensor q,
     auto kDev = static_cast<uint8_t*>(k.data_ptr());
     auto vDev = static_cast<uint8_t*>(v.data_ptr());
     auto oDev = static_cast<uint8_t*>(out.data_ptr());
-    auto lseDev = static_cast<uint8_t*>(softmaxlse.data_ptr());
+    auto lseDev = return_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
@@ -369,7 +371,7 @@ mha_fwd(at::Tensor q,
         (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256) && (innerPrec == 0u);
 
     const aclError err = fai_host::LaunchFAI(
-        kernelKey, enableDN,
+        kernelKey, enableDN, return_lse,
         blockDim, aclStream,
         qDev, kDev, vDev, maskDev, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
