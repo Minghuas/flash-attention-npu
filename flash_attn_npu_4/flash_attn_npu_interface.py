@@ -34,13 +34,26 @@ def round_multiple(x, m):
 _HEADDIM_BWD_ALIGN = 64
 
 
-def _pad_bwd_headdim(dout, q, k, v, out):
-    """Pad headdim to a multiple of 64 for the FAG bwd kernel."""
-    head_size_og = dout.size(-1)
-    target = round_multiple(
-        max(t.size(-1) for t in (dout, q, k, v, out)),
-        _HEADDIM_BWD_ALIGN,
-    )
+def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
+    """Pad headdim to a multiple of 64 for the FAG bwd kernel.
+    """
+    if dout.size(-1) != head_size_og:
+        raise ValueError(
+            f"dout headdim ({dout.size(-1)}) must equal original q/k/v "
+            f"headdim ({head_size_og})"
+        )
+    qkv_out_headdims = [t.size(-1) for t in (q, k, v, out)]
+    if len(set(qkv_out_headdims)) != 1:
+        raise ValueError(
+            f"q/k/v/out must share the same headdim, got {qkv_out_headdims} "
+            "(unequal headdim is not supported)"
+        )
+    ctx_headdim = qkv_out_headdims[0]
+    if ctx_headdim <= 0 or ctx_headdim > 256:
+        raise ValueError(
+            f"headdim must be in (0, 256], got {ctx_headdim} "
+        )
+    target = round_multiple(ctx_headdim, _HEADDIM_BWD_ALIGN)
 
     def _pad(t):
         cur = t.size(-1)
@@ -379,6 +392,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.block_sparse_tensors = block_sparse_tensors
         ctx.aux_tensors = aux_tensors
         ctx.aux_scalars = aux_scalars
+        ctx.head_size_og = q.size(-1)
         return (out, softmax_lse) if return_lse else out
 
     @staticmethod
@@ -396,7 +410,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if win_r is not None and win_r < 0:
             win_r = None
 
-        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(dout, q, k, v, out)
+        dout, q, k, v, out, head_size_og = _pad_bwd_headdim(
+            dout, q, k, v, out, ctx.head_size_og
+        )
         dq, dk, dv = _flash_attn_backward(
             q,
             k,
