@@ -16,10 +16,9 @@ on:
         options:
           - ALL
           - test_flash_attn_npu_v2.py
+          - test_flash_attn_npu_v2_metadata.py
           - test_flash_attn_npu_v3.py
           - test_flash_attn_npu_v4.py
-          - test_flash_attn_npu_v2_bwd.py
-          - test_flash_attn_npu_v3_bwd.py
           - test_flash_attn_npu_v3_metadata.py
           - test_flash_attn_npu_v3_graph.py
       test_filter:
