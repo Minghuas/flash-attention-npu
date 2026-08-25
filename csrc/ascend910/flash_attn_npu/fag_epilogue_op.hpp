@@ -69,7 +69,7 @@ public:
     uint32_t vecBlockNum;
 
     GlobalTensor<T1> keyGm, valueGm, dxGm, queryGm, forwardResGm;
-    GlobalTensor<uint8_t> maskWorkSpaceGm, attenMaskU8Gm, dropMaskGm;
+    GlobalTensor<uint8_t> attenMaskU8Gm, dropMaskGm;
     GlobalTensor<float> softmaxLseGm;
 
     GlobalTensor<float> dqWorkSpaceGm, dkWorkSpaceGm, dvWorkSpaceGm, sfmgWorkspaceGm;
@@ -112,7 +112,6 @@ public:
     int64_t s2Token;
     int64_t actualCalcS1Token;
     int64_t actualCalcS2Token;
-    bool dropBitMode;
 
     int64_t b;
     int64_t n2;
@@ -176,6 +175,7 @@ public:
     constexpr static uint32_t T2BlockBegin = 58 * 1024;
     constexpr static uint32_t U8Begin = 66 * 1024;
     constexpr static uint32_t DbBegin = 74 * 1024;
+    constexpr static uint32_t DROP_MASK_UB_ROW_STRIDE = 32;
 
     constexpr static uint32_t DTYPE_FACTOR = sizeof(T2) / sizeof(T1);
     constexpr static uint32_t cal_block_num = 32 / sizeof(T2);
@@ -191,7 +191,8 @@ public:
     constexpr static int64_t GM_DOUBLE_BUFFER = 2;
     constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
-    constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
+    // Dropout Select UB conflict with original SFMG, move to 140KB
+    constexpr static int64_t SFMG_UB_OFFSET = 140 * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
     constexpr static int64_t SFMG_UB_SIZE = 8 * 1024;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
@@ -288,10 +289,8 @@ public:
 
         actual_seq_qlen_addr = actual_seq_qlen;
         actual_seq_kvlen_addr = actual_seq_kvlen;
-        dropBitMode = tilingData->dropoutIsDivisibleBy8 != 0;
         if constexpr (IS_DROP == ENABLE) {
-            __gm__ uint8_t *dropMaskAddr = dropBitMode ? drop_mask : workspace + tilingData->dropBeginAddr;
-            dropMaskGm.SetGlobalBuffer((__gm__ uint8_t *)dropMaskAddr);
+            dropMaskGm.SetGlobalBuffer((__gm__ uint8_t *)drop_mask);
         }
         keepProb = tilingData->keepProb;
         scaleValue = tilingData->scaleValue;
@@ -300,13 +299,6 @@ public:
 
         int64_t sfmgOutputSize = b * n2 * g * s1 * 8;
         if constexpr (INPUT_LAYOUT == TND) {
-            int64_t seqS2Len = 0;
-            seqS2Len = ((__gm__ int32_t *)actual_seq_kvlen)[0];
-            dropBitMode = (seqS2Len % 8 == 0);
-            for (int64_t i = 0; i + 1 < b; i++) {
-                seqS2Len = ((__gm__ int32_t *)actual_seq_kvlen)[i + 1] - ((__gm__ int32_t *)actual_seq_kvlen)[i];
-                dropBitMode = (dropBitMode && (seqS2Len % 8 == 0));
-            }
             sfmgOutputSize = ((__gm__ int32_t*)actual_seq_qlen)[b - 1] * n2 * g * 8;
         }
 
@@ -567,38 +559,23 @@ public:
     }
 
     CATLASS_DEVICE
-    void DropOutCopy(LocalTensor<uint8_t> &vecInDropBuffer, int64_t curS1Idx, int64_t s2VBegin)
-    {
-    }
-
-        CATLASS_DEVICE
     int64_t GetDropMaskOffset(const DBParams &dbParam, int64_t curS1Idx, uint32_t s2VBegin, uint32_t dropMaskS2Stride)
     {
+        // Drop mask layout: bit-packed (bit 1 = keep), ceil(max_seqlen_k/8)
+        // bytes per row, rows indexed per (batch, head) block padded to
+        // max_seqlen_q rows (s1 = max_seqlen_q; s1Pos is the row within the
+        // batch for both BSND and TND). s2VBegin is always a multiple of 8
+        // (s2CvInner/s2VecSize are 16-aligned, s2CvExtend is 8-aligned).
         int64_t qHeadNumLocal = n2 * g;
         int64_t headIdx = dbParam.n2Idx * g + dbParam.gIdx;
         int64_t s1Pos = dbParam.s1oIdx * s1CvInner + curS1Idx * s1VecSize;
-        if constexpr (INPUT_LAYOUT == TND) {
-            int64_t batchS1S2Prefix = 0;
-            for (int64_t bi = 0; bi < dbParam.bIdx; ++bi) {
-                int32_t as1 = (bi == 0) ? ((__gm__ int32_t *)actual_seq_qlen_addr)[0] :
-                    ((__gm__ int32_t *)actual_seq_qlen_addr)[bi] -
-                    ((__gm__ int32_t *)actual_seq_qlen_addr)[bi - 1];
-                int32_t as2 = (bi == 0) ? ((__gm__ int32_t *)actual_seq_kvlen_addr)[0] :
-                    ((__gm__ int32_t *)actual_seq_kvlen_addr)[bi] -
-                    ((__gm__ int32_t *)actual_seq_kvlen_addr)[bi - 1];
-                batchS1S2Prefix += as1 * as2;
-            }
-            return batchS1S2Prefix * qHeadNumLocal +
-                headIdx * dbParam.actualS1Len * static_cast<int64_t>(dropMaskS2Stride) +
-                s1Pos * static_cast<int64_t>(dropMaskS2Stride) + static_cast<int64_t>(s2VBegin);
-        }
         return ((dbParam.bIdx * qHeadNumLocal + headIdx) * s1 + s1Pos) *
-            static_cast<int64_t>(dropMaskS2Stride) + static_cast<int64_t>(s2VBegin);
+            static_cast<int64_t>(dropMaskS2Stride) + static_cast<int64_t>(s2VBegin / 8);
     }
 
     CATLASS_DEVICE
     void SubGrapA(int64_t curIdx, int64_t curS1Idx, int64_t curS2Idx, DBParams& dbParam,
-                                event_t mte2WaitMte3A)
+                                event_t mte2WaitMte3A, event_t dropMte2WaitV)
     {
         pingpongIdx = dbParam.taskId % 2;
         s2Extend = (curS2Idx == s2VecLoop - 1) ? (dbParam.s2CvExtend - (s2VecLoop - 1) * s2VecSize) : s2VecSize;
@@ -647,9 +624,6 @@ public:
                 CopyInAttenMaskBool(attenMaskUbuint8, attenMaskOffsetPre, s1ExtendSubGraph, s2Extend);
             }
         }
-
-        LocalTensor<uint8_t> vecInDropBuffer =
-            unifiedBuffer.GetWithOffset<uint8_t>(8 * 1024 / sizeof(uint8_t), ubBufferOffset + U8Begin);
 
         LocalTensor<float> vecClc2Buffer =
             unifiedBuffer.GetWithOffset<float>(32 * 1024 / sizeof(float), ubBufferOffset + T2Begin);
@@ -721,58 +695,53 @@ public:
         LocalTensor<T2> vecDropBuffer = simpleSoftmaxResBuf;
 
         if constexpr (IS_DROP == ENABLE) {
-            uint32_t totalElems = s1ExtendSubGraph * s2ExtendAlign;
-            uint32_t maskRowStride = (s2ExtendAlign + 31) / 32 * 32;
-            uint32_t dropMaskS2Stride;
-            if constexpr (INPUT_LAYOUT == TND) {
-                dropMaskS2Stride = static_cast<uint32_t>(dbParam.actualS2Len);
-            } else {
-                dropMaskS2Stride = dropBitMode ? (static_cast<uint32_t>(s2) + 31) / 32 * 32 :
-                    static_cast<uint32_t>(s2);
-            }
+            // Read the bit-packed dropout mask into U8Begin. The mask stays in
+            // UB (U8Begin) for SubGrapB of the same iteration.
+            //
+            // The transfer granularity is a 32B block:
+            // rows with blockLen < 32B land in per-row r*32B slots, so every
+            // Select mask row start is 32B aligned (mirror of the forward's
+            // CopyDropMaskToUb / ApplyDropoutStd). When s2Extend == 256 the
+            // rows fill the 32B slots contiguously, allowing a single
+            // full-tile Select; smaller rows go through the per-row loop.
+            uint32_t maskRowBytes = CeilDiv(s2Extend, 8);
+            uint32_t dropMaskS2Stride = CeilDiv(s2, 8);
             int64_t dropMaskOffset = GetDropMaskOffset(dbParam, curS1Idx, s2VBegin, dropMaskS2Stride);
             LocalTensor<uint8_t> dropMaskU8 =
                 unifiedBuffer.GetWithOffset<uint8_t>(8 * 1024 / sizeof(uint8_t), ubBufferOffset + U8Begin);
-            LocalTensor<uint16_t> dropMaskU16 = dropMaskU8.template ReinterpretCast<uint16_t>();
-            AscendC::Duplicate<uint16_t>(dropMaskU16, static_cast<uint16_t>(0),
-                                         s1ExtendSubGraph * maskRowStride / 2);
-            event_t v2Mte2A = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(v2Mte2A);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(v2Mte2A);
             AscendC::DataCopyExtParams dropCopyParams;
             dropCopyParams.blockCount = static_cast<uint16_t>(s1ExtendSubGraph);
-            uint32_t dropReadLen = s2Extend;
-            if constexpr (INPUT_LAYOUT == TND) {
-                if (s2Extend > dropMaskS2Stride) {
-                    dropReadLen = dropMaskS2Stride;
-                }
-            }
-            dropCopyParams.blockLen = static_cast<uint32_t>(dropReadLen * sizeof(uint8_t));
-            dropCopyParams.srcStride = static_cast<uint32_t>((dropMaskS2Stride - dropReadLen) * sizeof(uint8_t));
+            dropCopyParams.blockLen = maskRowBytes;
+            dropCopyParams.srcStride = dropMaskS2Stride - maskRowBytes;
             dropCopyParams.dstStride = 0;
             dropCopyParams.rsv = 0;
-            AscendC::DataCopyPad(dropMaskU8, dropMaskGm[dropMaskOffset], dropCopyParams,
-                                 {false, 0, 0, 0});
-            event_t dropMte2WaitV = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(dropMte2WaitV);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(dropMte2WaitV);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
+            AscendC::DataCopyPad(dropMaskU8, dropMaskGm[dropMaskOffset], dropCopyParams, {false, 0, 0, 0});
+
+            event_t dropVWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::MTE2_V));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(dropVWaitMte2);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(dropVWaitMte2);
+            // The pre-dropout P in simpleSoftmaxResBuf (DbBegin) is left
+            // untouched for SubGrapB.
             vecDropBuffer = unifiedBuffer.GetWithOffset<T2>(TMP_UB_SIZE / sizeof(T2), TMP_UB_OFFSET);
-            AscendC::Muls(vecDropBuffer, simpleSoftmaxResBuf,
-                          static_cast<float>(1.0f / keepProb), totalElems);
+            AscendC::Muls(
+                vecDropBuffer, simpleSoftmaxResBuf, static_cast<float>(1.0f / keepProb),
+                s1ExtendSubGraph * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
-            LocalTensor<uint8_t> selScratch = unifiedBuffer.GetWithOffset<uint8_t>(
-                17 * 1024 / sizeof(uint8_t), ubBufferOffset + T1Begin);
-            AscendC::SelectWithBytesMaskShapeInfo selInfo;
-            selInfo.firstAxis = s1ExtendSubGraph;
-            selInfo.srcLastAxis = s2ExtendAlign;
-            selInfo.maskLastAxis = maskRowStride;
-            vecDropBuffer.SetSize(s1ExtendSubGraph * s2ExtendAlign);
-            dropMaskU8.SetSize(s1ExtendSubGraph * maskRowStride);
-            AscendC::SelectWithBytesMask(vecDropBuffer,
-                                         static_cast<float>(0.0f), vecDropBuffer,
-                                         dropMaskU8, selScratch, selInfo);
-            AscendC::PipeBarrier<PIPE_V>();
+            if (s2Extend == 256) {
+                AscendC::Select(
+                    vecDropBuffer, dropMaskU8, vecDropBuffer, static_cast<T2>(0.0f),
+                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s1ExtendSubGraph * s2ExtendAlign);
+            } else {
+                for (uint32_t r = 0; r < s1ExtendSubGraph; r++) {
+                    AscendC::Select(
+                        vecDropBuffer[r * s2ExtendAlign], dropMaskU8[r * DROP_MASK_UB_ROW_STRIDE],
+                        vecDropBuffer[r * s2ExtendAlign], static_cast<T2>(0.0f),
+                        AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s2ExtendAlign);
+                }
+            }
         }
+
         LocalTensor<T1> vecCopyOutBuffer = vecDropBuffer.template ReinterpretCast<T1>();
         if constexpr (!AscendC::IsSameType<T1, float>::value) {
             vecCopyOutBuffer = unifiedBuffer.GetWithOffset<T1>(17 * 1024 / sizeof(T1), ubBufferOffset + T1Begin);
@@ -801,7 +770,8 @@ public:
 
     CATLASS_DEVICE
     void SubGrapB(int64_t curIdx, int64_t s1VecLoop, int64_t s2VecLoop,
-                                 int64_t curS1Idx, int64_t curS2Idx, DBParams& dbParam, event_t mte2WaitMte3B)
+                                 int64_t curS1Idx, int64_t curS2Idx, DBParams& dbParam, 
+                                 event_t mte2WaitMte3B, event_t dropMte2WaitV)
     {
         pingpongIdx = dbParam.taskId % 2;
         uint32_t ubBufferOffset = DbBegin;
@@ -821,50 +791,17 @@ public:
             AscendC::DataCopy(savedS, srcS, s1ExtendSubGraph * s2ExtendAlign);
         }
 
+        LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
         if (preS1Idx != curS1Idx) {
             preS1Idx = curS1Idx;
-            LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
             AscendC::DataCopy(sfmgClc3, sfmgWorkspaceGm[sfmgOffset + curS1Idx * s1VecSize * 8], s1ExtendSubGraph * 8);
         }
 
-        LocalTensor<uint8_t> vecInDropBuffer =
-            unifiedBuffer.GetWithOffset<uint8_t>(8 * 1024 / sizeof(uint8_t), ubBufferOffset + U8Begin);
+        LocalTensor<uint8_t> dropMaskU8 =
+            unifiedBuffer.GetWithOffset<uint8_t>(8 * 1024 / sizeof(uint8_t), U8Begin);
 
         LocalTensor<T2> vecClc1Buffer = unifiedBuffer.GetWithOffset<T2>(33 * 1024 / sizeof(T2), ubBufferOffset + T1Begin);
         LocalTensor<T2> dyvBuffer = unifiedBuffer.GetWithOffset<T2>(33 * 1024 / sizeof(T2), TMP_UB_OFFSET);
-        uint32_t maskRowStrideB = (s2ExtendAlign + 31) / 32 * 32;
-        if constexpr (IS_DROP == ENABLE) {
-            LocalTensor<uint16_t> vecInDropBufferU16 = vecInDropBuffer.template ReinterpretCast<uint16_t>();
-            AscendC::Duplicate<uint16_t>(vecInDropBufferU16, static_cast<uint16_t>(0),
-                                         s1ExtendSubGraph * maskRowStrideB / 2);
-            AscendC::PipeBarrier<PIPE_V>();
-            int64_t s2VBegin = dbParam.s2oIdx * s2CvInner + curS2Idx * s2VecSize;
-            uint32_t dropMaskS2StrideB;
-            if constexpr (INPUT_LAYOUT == TND) {
-                dropMaskS2StrideB = static_cast<uint32_t>(dbParam.actualS2Len);
-            } else {
-                dropMaskS2StrideB = dropBitMode ? (static_cast<uint32_t>(s2) + 31) / 32 * 32 :
-                    static_cast<uint32_t>(s2);
-            }
-            int64_t dropMaskOffsetB = GetDropMaskOffset(dbParam, curS1Idx, s2VBegin, dropMaskS2StrideB);
-            event_t v2Mte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_MTE2));
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(v2Mte2);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(v2Mte2);
-            AscendC::DataCopyExtParams dropCopyParams;
-            dropCopyParams.blockCount = static_cast<uint16_t>(s1ExtendSubGraph);
-            uint32_t dropReadLenB = s2Extend;
-            if constexpr (INPUT_LAYOUT == TND) {
-                if (s2Extend > dropMaskS2StrideB) {
-                    dropReadLenB = dropMaskS2StrideB;
-                }
-            }
-            dropCopyParams.blockLen = static_cast<uint32_t>(dropReadLenB * sizeof(uint8_t));
-            dropCopyParams.srcStride = static_cast<uint32_t>((dropMaskS2StrideB - dropReadLenB) * sizeof(uint8_t));
-            dropCopyParams.dstStride = 0;
-            dropCopyParams.rsv = 0;
-            AscendC::DataCopyPad(vecInDropBuffer, dropMaskGm[dropMaskOffsetB], dropCopyParams,
-                                 {false, 0, 0, 0});
-        }
         if (s2VecLoop == 1) {
             AscendC::DataCopy(vecClc1Buffer, mm1WorkspaceGm[pingpongIdx * cubeBaseMN + curS1Idx * s1VecSize * s2ExtendAlign],
                         s1ExtendSubGraph * s2ExtendAlign);
@@ -879,27 +816,26 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(vWaitMte2);
 
-        AscendC::PipeBarrier<PIPE_V>();
         if constexpr (IS_DROP == ENABLE) {
-            uint32_t totalElems = s1ExtendSubGraph * s2ExtendAlign;
-            AscendC::Muls(vecClc1Buffer, vecClc1Buffer, static_cast<float>(1.0f / keepProb), totalElems);
+            if (s2Extend == 256) {
+                AscendC::Select(
+                    vecClc1Buffer, dropMaskU8, vecClc1Buffer, static_cast<T2>(0.0f),
+                    AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s1ExtendSubGraph * s2ExtendAlign);
+            } else {
+                for (uint32_t r = 0; r < s1ExtendSubGraph; r++) {
+                    AscendC::Select(
+                        vecClc1Buffer[r * s2ExtendAlign], dropMaskU8[r * DROP_MASK_UB_ROW_STRIDE],
+                        vecClc1Buffer[r * s2ExtendAlign], static_cast<T2>(0.0f),
+                        AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, s2ExtendAlign);
+                }
+            }
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
             AscendC::PipeBarrier<PIPE_V>();
-            LocalTensor<uint8_t> selScratchB = unifiedBuffer.GetWithOffset<uint8_t>(
-                TMP_UB_SIZE / sizeof(uint8_t), TMP_UB_OFFSET);
-            AscendC::SelectWithBytesMaskShapeInfo selInfoB;
-            selInfoB.firstAxis = s1ExtendSubGraph;
-            selInfoB.srcLastAxis = s2ExtendAlign;
-            selInfoB.maskLastAxis = maskRowStrideB;
-            vecClc1Buffer.SetSize(s1ExtendSubGraph * s2ExtendAlign);
-            vecInDropBuffer.SetSize(s1ExtendSubGraph * maskRowStrideB);
-            AscendC::SelectWithBytesMask(vecClc1Buffer,
-                                         static_cast<float>(0.0f), vecClc1Buffer,
-                                         vecInDropBuffer, selScratchB, selInfoB);
-            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Muls(
+                vecClc1Buffer, vecClc1Buffer, static_cast<float>(1.0f / keepProb), s1ExtendSubGraph * s2ExtendAlign);
         }
-        uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
-        LocalTensor<float> sfmgClc3 = unifiedBuffer.GetWithOffset<float>(SFMG_UB_SIZE / sizeof(float), SFMG_UB_OFFSET);
 
+        uint32_t sub_block_cout = (s2ExtendAlign + cal_repeat_num - 1) / cal_repeat_num;
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t subIdx = 0; subIdx < sub_block_cout; subIdx++) {
             uint32_t subMaskCout =
@@ -1025,11 +961,16 @@ public:
 
             event_t mte2WaitMte3A = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
             event_t mte2WaitMte3B = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::MTE3_MTE2>());
-            SubGrapA(loopCnt, curS1Idx, curS2Idx, dbParam, mte2WaitMte3A);
-            SubGrapB(loopCnt, s1VecLoop, s2VecLoop, curS1Idx, curS2Idx, dbParam, mte2WaitMte3B);
+            event_t dropMte2WaitV = static_cast<event_t>(GetTPipePtr()->AllocEventID<AscendC::HardEvent::V_MTE2>());
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
 
+            SubGrapA(loopCnt, curS1Idx, curS2Idx, dbParam, mte2WaitMte3A, dropMte2WaitV);
+            SubGrapB(loopCnt, s1VecLoop, s2VecLoop, curS1Idx, curS2Idx, dbParam, mte2WaitMte3B, dropMte2WaitV);
+
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
             GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3A);
             GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::MTE3_MTE2>(mte2WaitMte3B);
+            GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::V_MTE2>(dropMte2WaitV);
         }
     }
 };
@@ -1087,7 +1028,8 @@ public:
     constexpr static uint32_t DbBegin = 74 * 1024;
     constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
-    constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
+    // Dropout Select UB (last 8 KB) conflict with original SFMG, move SFMG UB to 140KB
+    constexpr static int64_t SFMG_UB_OFFSET = 140 * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
     constexpr static int64_t SFMG_UB_SIZE = 8 * 1024;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;

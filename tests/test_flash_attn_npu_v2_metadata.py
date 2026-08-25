@@ -226,8 +226,9 @@ def metadata_spy(monkeypatch):
     original = interface.get_scheduler_metadata
 
     def _spy(*args, **kwargs):
-        calls.append((args, kwargs))
-        return original(*args, **kwargs)
+        result = original(*args, **kwargs)
+        calls.append((args, kwargs, result))
+        return result
 
     monkeypatch.setattr(interface, "get_scheduler_metadata", _spy)
     return calls
@@ -498,6 +499,106 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
     )
 
 
+@pytest.mark.parametrize("dropout_p", [0.1, 0.5])
+def test_flash_attn_func_metadata_dropout(dropout_p, metadata_spy):
+    batch_size, num_heads, kv_heads = 2, 4, 2
+    q_seqlen, kv_seqlen, head_size = 256, 256, 128
+    data_type = torch.bfloat16
+    query = _rand_npu((batch_size, q_seqlen, num_heads, head_size), data_type, WIDE_RANGE)
+    key = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
+    value = _rand_npu((batch_size, kv_seqlen, kv_heads, head_size), data_type, WIDE_RANGE)
+    scale = 1.0 / (head_size ** 0.5)
+
+    output_npu, softmax_lse_npu, s_dmask = flash_attn_func(
+        query,
+        key,
+        value,
+        dropout_p=dropout_p,
+        softmax_scale=scale,
+        causal=False,
+        window_size=WINDOW_SIZE,
+        return_attn_probs=True,
+    )
+    torch.npu.synchronize()
+    assert len(metadata_spy) == 1
+    meta = metadata_spy[0][2]
+
+    # AICPU tiling 的 dropout 字段已被 host 补写（scheduler-metadata 路径）
+    tiling = _tiling_from_metadata(meta, has_mask=False)
+    expected_keep = 1.0 / (1.0 - dropout_p)
+    assert abs(tiling.dropoutValue - expected_keep) < 1e-4, \
+        f"dropoutValue={tiling.dropoutValue} 期望 {expected_keep}"
+    assert tiling.dropMaskDevice != 0, "dropMaskDevice 未被补写（nullptr）"
+    assert tiling.pDevice != 0, "pDevice 未被补写（return_attn_probs 时应非空）"
+
+    # 输出正确性：drop_mask 从 S_dmask 恢复，与 ref 参考一致
+    drop_mask = (s_dmask > 0).to(torch.float32).cpu()
+    golden = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lse = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    query_cpu, key_cpu, value_cpu = query.cpu(), key.cpu(), value.cpu()
+    for i in range(batch_size):
+        gout, glse = ref_flash_attention(
+            query_cpu[i], key_cpu[i], value_cpu[i], scale, None, data_type, 0.0,
+            drop_mask=drop_mask[i], dropout_p=dropout_p)
+        golden[i] = gout.reshape(q_seqlen, num_heads, head_size)
+        golden_lse[i] = glse.reshape(num_heads, q_seqlen)
+    torch.testing.assert_close(output_npu.cpu(), golden, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(softmax_lse_npu.cpu(), golden_lse, rtol=RTOL, atol=ATOL)
+
+
+def test_flash_attn_varlen_func_metadata_dropout(metadata_spy):
+    num_heads, kv_heads, head_size = 4, 1, 128
+    max_q, max_k = 512, 1024
+    data_type = torch.bfloat16
+    q_offsets = [0, 512, 812, 940]
+    kv_offsets = [0, 1024, 1536, 1792]
+    dropout_p = 0.3
+    query = _rand_npu((q_offsets[-1], num_heads, head_size), data_type, WIDE_RANGE)
+    key = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
+    value = _rand_npu((kv_offsets[-1], kv_heads, head_size), data_type, WIDE_RANGE)
+    scale = 1.0 / (head_size ** 0.5)
+
+    output_npu, lse_npu, s_dmask = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        _int32_npu(q_offsets),
+        _int32_npu(kv_offsets),
+        max_q,
+        max_k,
+        dropout_p=dropout_p,
+        softmax_scale=scale,
+        causal=False,
+        window_size=WINDOW_SIZE,
+        return_attn_probs=True,
+    )
+    torch.npu.synchronize()
+    assert len(metadata_spy) == 1
+    meta = metadata_spy[0][2]
+
+    tiling = _tiling_from_metadata(meta, has_mask=False)
+    expected_keep = 1.0 / (1.0 - dropout_p)
+    assert abs(tiling.dropoutValue - expected_keep) < 1e-4, \
+        f"dropoutValue={tiling.dropoutValue} 期望 {expected_keep}"
+    assert tiling.dropMaskDevice != 0, "dropMaskDevice 未被补写（nullptr）"
+    assert tiling.pDevice != 0, "pDevice 未被补写（return_attn_probs 时应非空）"
+
+    drop_mask = (s_dmask > 0).to(torch.float32).cpu()
+    golden = torch.empty((q_offsets[-1], num_heads, head_size), dtype=data_type)
+    golden_lse = torch.empty((num_heads, q_offsets[-1]), dtype=torch.float32)
+    query_cpu, key_cpu, value_cpu = query.cpu(), key.cpu(), value.cpu()
+    for i in range(len(q_offsets) - 1):
+        qs, qe = q_offsets[i], q_offsets[i + 1]
+        ks, ke = kv_offsets[i], kv_offsets[i + 1]
+        gout, glse = ref_flash_attention(
+            query_cpu[qs:qe], key_cpu[ks:ke], value_cpu[ks:ke], scale, None, data_type, 0.0,
+            drop_mask=drop_mask[i][:, : qe - qs, : ke - ks], dropout_p=dropout_p)
+        golden[qs:qe] = gout.reshape(qe - qs, num_heads, head_size)
+        golden_lse[:, qs:qe] = glse.reshape(num_heads, qe - qs)
+    torch.testing.assert_close(output_npu.cpu(), golden, rtol=RTOL, atol=ATOL)
+    torch.testing.assert_close(lse_npu.cpu(), golden_lse, rtol=RTOL, atol=ATOL)
+
+
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, block_size, is_causal, window_size, softcap",
     KV_CACHE_BSND_CASES,
@@ -606,6 +707,7 @@ class _FAInferTilingData(ctypes.Structure):
         ("mm2OutSize", ctypes.c_uint64), ("UpdateSize", ctypes.c_uint64),
         ("workSpaceSize", ctypes.c_uint64),
         ("scaleValue", ctypes.c_float), ("softcapValue", ctypes.c_float),
+        ("dropoutValue", ctypes.c_float),
         ("padding1", ctypes.c_uint64), ("padding2", ctypes.c_uint64),
         ("padding3", ctypes.c_uint32),
         ("windowSizeLeft", ctypes.c_int64), ("windowSizeRight", ctypes.c_int64),
@@ -614,6 +716,8 @@ class _FAInferTilingData(ctypes.Structure):
         ("flashDecodeFlag", ctypes.c_uint32),
         ("coreInfo", _CoreNode * 25),
         ("splitInfo", _SplitNode * 25),
+        ("pDevice", ctypes.c_uint64),
+        ("dropMaskDevice", ctypes.c_uint64),
     ]
 
 

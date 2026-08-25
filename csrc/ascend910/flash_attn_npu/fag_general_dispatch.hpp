@@ -33,6 +33,8 @@ struct FagGeneralLaunchArgs {
     bool is_causal;
     bool deterministic;
     bool is_softcap;
+    bool has_dropout = false;
+    uint8_t *dropMaskDevice = nullptr;
     uint32_t qk_headdim_kernel; // 64 / 128 / 192 / 256
     uint8_t *dOutDevice;
     uint8_t *qDevice;

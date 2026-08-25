@@ -402,19 +402,11 @@ int64_t GetFAGTilingParam(const FAGInfo &fagInfo, uint32_t aicNum, uint32_t aivN
     fagTilingData.s2CvTail = s2CvTailTmp == 0 ? fagTilingData.s2CvInner : s2CvTailTmp;
     fagTilingData.sfmgNormalAxisSize = fagTilingData.batch * fagTilingData.kvHeadNum * fagTilingData.g * fagTilingData.qSeqlen;
 
+    // Dropout is always handled in bit mode: the mask is the bit-packed output
+    // of aclnnDropoutGenMask (ceil(seqlen/8) bytes per row, bit 1 = keep), the
+    // same layout the forward kernel consumes. The legacy bool-mode workspace
+    // path (dropMaskSize / dropBeginAddr) is therefore never allocated.
     fagTilingData.dropoutIsDivisibleBy8 = 1;
-    if (fagTilingData.keepProb < 1) {
-        if (isTnd) {
-            for (int64_t i = 0; i < fagTilingData.batch; i++) {
-                if (fagTilingData.actualSeqKvlen[i] % BIT_NUMS != 0) {
-                    fagTilingData.dropoutIsDivisibleBy8 = 0;
-                    break;
-                }
-            }
-        } else if (fagTilingData.kvSeqlen % BIT_NUMS != 0) {
-            fagTilingData.dropoutIsDivisibleBy8 = 0;
-        }
-    }
 
     // 目前仅支持fp16/bf16
     fagTilingData.dataTypeSize = FP16_BYTES;
