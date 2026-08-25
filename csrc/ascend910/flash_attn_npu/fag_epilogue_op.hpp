@@ -191,7 +191,8 @@ public:
     constexpr static int64_t GM_DOUBLE_BUFFER = 2;
     constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
-    constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
+    // Dropout Select UB conflict with original SFMG, move to 140KB
+    constexpr static int64_t SFMG_UB_OFFSET = 140 * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
     constexpr static int64_t SFMG_UB_SIZE = 8 * 1024;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
@@ -1024,7 +1025,8 @@ public:
     constexpr static uint32_t DbBegin = 74 * 1024;
     constexpr static int64_t SOFTCAP_UB_OFFSET = 32 * 1024;
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
-    constexpr static int64_t SFMG_UB_OFFSET = (148 + 33) * 1024;
+    // Dropout Select UB (last 8 KB) conflict with original SFMG, move SFMG UB to 140KB
+    constexpr static int64_t SFMG_UB_OFFSET = 140 * 1024;
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
     constexpr static int64_t SFMG_UB_SIZE = 8 * 1024;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
