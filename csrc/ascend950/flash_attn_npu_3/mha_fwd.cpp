@@ -5,15 +5,16 @@
  *
  *   ✅ FP16 / BF16
  *   ✅ Causal mask
+ *   ✅ SWA / window_size (host normalize + MASK_SWA dispatch; kernel Phase 2/3)
  *   ✅ Paged KV (page_table)
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
  *   ✅ return_softmax_lse
- *   ❌ SWA / window_size != (-1, -1)
  *   ❌ num_splits > 1 (FlashDecode)
  *   ❌ pack_gqa, scheduler_metadata, leftpad_k
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -109,8 +110,6 @@ mha_fwd(at::Tensor q,
                 && !v_descale_.has_value(),
                 "950 backend (v3) does not support FP8 descales");
     TORCH_CHECK(softcap == 0.0f, "950 backend (v3) does not support softcap");
-    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
-                "950 backend (v3) does not support SWA");
     TORCH_CHECK(attention_chunk == 0,
                 "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(!scheduler_metadata_.has_value(),
@@ -255,6 +254,37 @@ mha_fwd(at::Tensor q,
     at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
 
     // ============================================================
+    // 6b. SWA / causal host normalize
+    // ============================================================
+    int32_t max_kv_seqlen = 0;
+    {
+        const int32_t* seqlens_k_ptr = seqlens_k_cpu.data_ptr<int32_t>();
+        for (int i = 0; i < batch_size; ++i) {
+            max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_ptr[i]);
+        }
+    }
+    if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
+        window_size_left = -1;
+    }
+    if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = (window_size_left < 0 && window_size_right == 0);
+    const bool is_local =
+        (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    if (is_local) {
+        if (window_size_left < 0) {
+            window_size_left = max_kv_seqlen;
+        }
+        if (window_size_right < 0) {
+            window_size_right = max_kv_seqlen;
+        }
+    }
+
+    // ============================================================
     // 7. Build FAInferContext + run host-side tiling
     // ============================================================
     SeqlenScratch scratch;
@@ -265,7 +295,11 @@ mha_fwd(at::Tensor q,
         is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
         &seqlens_k_cpu,
         paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
-        is_causal, is_varlen_q, is_bf16,
+        is_causal,
+        is_local,
+        /* window_size_left= */ is_local ? window_size_left : 0,
+        /* window_size_right= */ is_local ? window_size_right : 0,
+        is_varlen_q, is_bf16,
         batch_size, seqlen_q, num_heads, num_heads_k,
         head_size_q, head_size_v,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
@@ -324,7 +358,7 @@ mha_fwd(at::Tensor q,
                                            : CacheMode::normalCache;
     const PageShape pageShape = paged_KV ? PageShape::BnBsND
                                            : PageShape::normalShape;
-    const uint32_t maskTypeKey = is_causal ? 1u : 0u;
+    const uint32_t maskTypeKey = is_local ? 4u : (is_causal ? 1u : 0u);
     const uint32_t innerPrec = 0u; // FP32 accum
     const std::string dataType = is_bf16 ? "bf16" : "half";
     const std::string cacheLayout = "nd"; // nd only
@@ -367,7 +401,7 @@ mha_fwd(at::Tensor q,
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
     at::Tensor mask_cpu_tensor;
-    if (is_causal) {
+    if (is_causal || is_local) {
         mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -375,7 +409,8 @@ mha_fwd(at::Tensor q,
     }
 
     const bool enableDN =
-        (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256) && (innerPrec == 0u);
+        (!is_causal) && (!is_local) && (head_size_q <= 256) && (head_size_v <= 256)
+        && (innerPrec == 0u);
 
     const aclError err = fai_host::LaunchFAI(
         kernelKey, enableDN, return_softmax_lse,
