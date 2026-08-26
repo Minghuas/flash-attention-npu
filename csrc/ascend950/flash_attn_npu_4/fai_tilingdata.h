@@ -12,8 +12,6 @@
 #ifndef FLASH_ATTENTION_REGULAR_H
 #define FLASH_ATTENTION_REGULAR_H
 
-#include <string>
-
 struct coreNode {
     int startBIdx;
     int startN1Idx;
@@ -66,7 +64,6 @@ struct FAInferTilingData {
     int32_t sparseMode = 0;
     uint32_t globalWindowSize = 4;
     uint32_t localWindowSize = 0;
-    std::string cacheLayout = "nd";
     uint64_t splitLseTotalSize;
     uint64_t splitOTotalSize;
     uint32_t totalSplitNodeNum;
@@ -147,7 +144,6 @@ struct FAInferTilingData {
     void set_sparseMode(int32_t value) { sparseMode = value; }
     void set_globalWindowSize(uint32_t value) { globalWindowSize = value; }
     void set_localWindowSize(uint32_t value) { localWindowSize = value; }
-    void set_cacheLayout(std::string value) { cacheLayout = value; }
     void set_preToken(int64_t value) { preToken = value; }
     void set_nextToken(int64_t value) { nextToken = value; }
     void set_splitLseTotalSize(uint64_t value) { splitLseTotalSize = value; }
