@@ -1,5 +1,6 @@
 # Copyright (c) 2026, Minghua Shen.
 
+import os
 import torch
 import torch_npu
 import pytest
@@ -8,7 +9,7 @@ if "Ascend950" in (torch_npu.npu.get_device_name() if torch_npu.npu.device_count
     pytest.skip("flash_attn_npu (v2) not supported on Ascend950", allow_module_level=True)
 
 from flash_attn_npu import flash_attn_with_kvcache, flash_attn_func, flash_attn_varlen_func
-from tests.common.attention_ref import ref_flash_attention_pair
+from tests.common.attention_ref import cached_autograd_grads, ref_flash_attention_pair
 from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv,
@@ -467,16 +468,19 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
             softmax_lse, golden_lseL_ref, golden_lseL_pt, softcap=softcap, name="softmax_lse"
         )
     dq_ag, dk_ag, dv_ag = torch.autograd.grad(out_out, (query, key_cache, value_cache), dout)
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-        golden_out_ref,
+    dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+        os.environ.get("GOLDEN_CACHE_NODEID", "v2"),
+        (golden_out_ref, golden_out_pt),
         (query_ref, key_ref, value_ref),
-        dout.detach().cpu(),
-        retain_graph=True,
-    )
-    dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-        golden_out_pt,
-        (query_ref, key_ref, value_ref),
-        dout.detach().cpu(),
+        dout,
+        metadata={"version": 2, "kind": "bsnd", "dropout_p": dropout_p},
+        inputs={
+            "query": query_ref,
+            "key": key_ref,
+            "value": value_ref,
+            "dout": dout,
+            "drop_mask": drop_mask,
+        },
     )
     assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
     assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
@@ -675,16 +679,19 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     if cache_mode == 0:
         dout = make_random_tensor(output_npu.shape, output_npu.dtype, low=-0.5, high=0.5, device="npu")
         dq_ag, dk_ag, dv_ag = torch.autograd.grad(output_npu, (query, key, value), dout)
-        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-            golden_out_ref,
+        dq_ref, dk_ref, dv_ref, dq_pt, dk_pt, dv_pt = cached_autograd_grads(
+            os.environ.get("GOLDEN_CACHE_NODEID", "v2-varlen"),
+            (golden_out_ref, golden_out_pt),
             (query_ref, key_ref, value_ref),
-            dout.detach().cpu(),
-            retain_graph=True,
-        )
-        dq_pt, dk_pt, dv_pt = torch.autograd.grad(
-            golden_out_pt,
-            (query_ref, key_ref, value_ref),
-            dout.detach().cpu(),
+            dout,
+            metadata={"version": 2, "kind": "varlen", "dropout_p": dropout_p},
+            inputs={
+                "query": query_ref,
+                "key": key_ref,
+                "value": value_ref,
+                "dout": dout,
+                "drop_mask": drop_mask,
+            },
         )
         assert_fa_close(dq_ag, dq_ref, dq_pt, softcap=softcap, name="dQ")
         assert_fa_close(dk_ag, dk_ref, dk_pt, softcap=softcap, name="dK")
