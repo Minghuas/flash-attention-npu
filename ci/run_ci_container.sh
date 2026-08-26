@@ -33,9 +33,10 @@ CI_DOCKER_PRIVILEGED="${CI_DOCKER_PRIVILEGED:-true}"
 CI_DOCKER_IMAGE="${CI_DOCKER_IMAGE:-fa-npu-ci:910b-cann9.1-torch2.9}"
 CI_SKIP_BUILD="${CI_SKIP_BUILD:-false}"
 CI_CONTAINER_SCOPE="${CI_CONTAINER_SCOPE:-local-$(id -u)-$$}"
-# 宿主机日志目录: 挂载进容器, 容器内写的日志直接落到宿主机, 避免 --rm 删除容器后日志丢失。
-# 同时让 workflow 的 upload-artifact (path: /tmp/ci_test_logs) 能读到日志。
-CI_TEST_LOG_DIR_HOST="${CI_TEST_LOG_DIR_HOST:-/tmp/ci_test_logs}"
+# 宿主机日志目录: 按当前 CI scope 隔离, 避免同一 runner 上的并行 job 互相覆盖。
+# 容器内仍固定使用 /tmp/ci_test_logs, workflow 上传对应的宿主机子目录。
+CI_LOG_SCOPE="${CI_CONTAINER_SCOPE//[^A-Za-z0-9_.-]/_}"
+CI_TEST_LOG_DIR_HOST="${CI_TEST_LOG_DIR_HOST:-/tmp/ci_test_logs/$CI_LOG_SCOPE}"
 
 log() { printf '[CI] %s\n' "$*"; }
 die() { printf '[CI][ERROR] %s\n' "$*" >&2; exit 1; }
