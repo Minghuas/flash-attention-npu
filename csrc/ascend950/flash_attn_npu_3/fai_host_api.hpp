@@ -7,55 +7,56 @@
 #define FAI_HOST_API_HPP
 
 #include <cstdint>
-#include <string>
-
 #include "acl/acl.h"
 #include "kernel_common.hpp"  // Format / CacheMode / PageShape / MaskCategory / CacheLayout
 
-namespace fai_host {
+struct FwdLaunchArgs {
+    bool is_bf16;
+    Format layout;            // BSND or TND
+    MaskCategory mask_category;
+    bool paged_kv;
+    bool enable_dn;           // use the FAInferDn fast path
+    bool lse_mode;            // return softmax LSE
+    uint32_t block_dim;
+    aclrtStream stream;
+    uint8_t *q_device;
+    uint8_t *k_device;
+    uint8_t *v_device;
+    uint8_t *mask_device;          // may be nullptr when not masked
+    uint8_t *block_table_device;   // may be nullptr when !paged_kv
+    uint8_t *o_device;
+    uint8_t *lse_device;
+    uint8_t *q_seq_device;
+    uint8_t *kv_seq_device;
+    uint8_t *workspace_device;
+    uint8_t *tiling_device;
+};
 
-//   bit 0: cacheLayout  (0=nd, 1=nz)
-//   bit 1: dataType     (0=half, 1=bf16)
-//   bit 2: maskType     (1 if causal mask)
-//   bit 3: maskType     (1 if SWA mask)
-//   bit 4: reserved (always 0; v3 supports FP32 QK scores only)
-//   bit 5: layout       (0=TND, 1=BSND)
-//   bit 6: cacheMode    (0=normalCache, 1=pagedCache)
-//   bit 7: pageShape    (0=BnBsND, 1=BnNBsD) — only when cacheMode=paged
-uint32_t BuildKernelKey(const std::string& dataType,     // "half" | "bf16"
-                        const std::string& cacheLayout,  // "nd" | "nz"
-                        uint32_t maskType,               // 0 | 1 | 4
-                        uint32_t innerPrec,              // retained for ABI; ignored (must be FP32)
-                        Format layout,
-                        CacheMode cacheMode,
-                        PageShape pageShape);
-
-aclError LaunchFAI(uint32_t kernelKey, bool enableDN, bool lseMode,
-                   uint32_t blockDim, aclrtStream stream,
-                   uint8_t* qDevice, uint8_t* kDevice, uint8_t* vDevice,
-                   uint8_t* maskDevice, uint8_t* blockTableDevice,
-                   uint8_t* oDevice, uint8_t* lseDevice,
-                   uint8_t* qSeqDevice, uint8_t* kvSeqDevice,
-                   uint8_t* workspaceDevice, uint8_t* tilingDevice);
-
-// Per-(dtype, layout) forward dispatch, a primary template. The top-level
-// LaunchFAI() extracts the dtype (bit 1) and layout (bit 5) bits from kernelKey
-// and routes to the matching instantiation. Each <DType, IS_TND> pair is
-// explicitly instantiated in its own autogen translation unit
-// (autogen/fai_dispatch_<dtype>_<layout>.cpp) so the FAInfer / FAInferDn
-// template instantiations compile in parallel; the generic body (which selects
-// the per-(dtype, layout) case set with if constexpr) lives in
-// fai_host_api_impl.hpp. Returns ACL_SUCCESS on a registered case, or falls
-// through (returns ACL_ERROR_INVALID_PARAM) if kernelKey has no matching case.
+// Per-(dtype, layout) implementation, defined in fai_host_api_impl.hpp and
+// explicitly instantiated per (dtype, IS_TND) in
+// autogen/fai_dispatch_<dtype>_<layout>.cpp. IS_TND is true for TND (varlen)
+// layout, false for BSND.
 template <typename DType, bool IS_TND>
-aclError launch_fai_dispatch(uint32_t kernelKey, bool enableDN, bool lseMode,
-                         uint32_t blockDim, aclrtStream stream,
-                         uint8_t* qDevice, uint8_t* kDevice, uint8_t* vDevice,
-                         uint8_t* maskDevice, uint8_t* blockTableDevice,
-                         uint8_t* oDevice, uint8_t* lseDevice,
-                         uint8_t* qSeqDevice, uint8_t* kvSeqDevice,
-                         uint8_t* workspaceDevice, uint8_t* tilingDevice);
+void launch_fai_dispatch(const FwdLaunchArgs &a);
 
-}  // namespace fai_host
+// Runtime entry: IS_TND is picked from a.layout at runtime, then the matching
+// dtype's launcher is selected. launch_fai_dispatch is explicitly instantiated
+// per (dtype, IS_TND) in the autogen TUs.
+inline void launch_fai(const FwdLaunchArgs &a) {
+    const bool is_bsnd = (a.layout == Format::BSND);
+    if (a.is_bf16) {
+        if (is_bsnd) {
+            launch_fai_dispatch<bfloat16_t, false>(a);
+        } else {
+            launch_fai_dispatch<bfloat16_t, true>(a);
+        }
+    } else {
+        if (is_bsnd) {
+            launch_fai_dispatch<half, false>(a);
+        } else {
+            launch_fai_dispatch<half, true>(a);
+        }
+    }
+}
 
 #endif  // FAI_HOST_API_HPP

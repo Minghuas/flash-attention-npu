@@ -52,16 +52,8 @@ def fai_kernel(dtype_key: str, layout: tuple) -> Kernel:
         "// kernel templates compile in parallel across cores; head_dim is a runtime\n"
         "// tiling axis (not a template parameter), so it is not a generation axis.\n\n"
         + '#include "../fai_host_api_impl.hpp"\n\n'
-        + "namespace fai_host {\n"
-        + f"template aclError launch_fai_dispatch<{ctype}, {is_tnd}>(\n"
-        "    uint32_t kernelKey, bool enableDN,\n"
-        "    uint32_t blockDim, aclrtStream stream,\n"
-        "    uint8_t *qDevice, uint8_t *kDevice, uint8_t *vDevice,\n"
-        "    uint8_t *maskDevice, uint8_t *blockTableDevice,\n"
-        "    uint8_t *oDevice, uint8_t *lseDevice,\n"
-        "    uint8_t *qSeqDevice, uint8_t *kvSeqDevice,\n"
-        "    uint8_t *workspaceDevice, uint8_t *tilingDevice);\n"
-        + "}  // namespace fai_host\n"
+        + f"template void launch_fai_dispatch<{ctype}, {is_tnd}>(\n"
+        "    const FwdLaunchArgs &a);\n"
     )
     return Kernel(
         dtype=dtype_key,
