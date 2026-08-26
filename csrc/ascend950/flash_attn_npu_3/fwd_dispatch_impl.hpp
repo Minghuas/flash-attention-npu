@@ -3,21 +3,21 @@
  * Modified by Minghua Shen, 2026.
  */
 
-#ifndef FAI_HOST_API_IMPL_HPP
-#define FAI_HOST_API_IMPL_HPP
+#ifndef FWD_DISPATCH_IMPL_HPP
+#define FWD_DISPATCH_IMPL_HPP
 
 #include <torch/extension.h>
 
-#include "fai_host_api.hpp"
-#include "fai_kernel.cpp"
+#include "fwd_dispatch.hpp"
+#include "fwd_kernel.cpp"
 
 // ─── SWITCH / LAUNCH macros ───────────────────────────────────────
 // Three flat macros; none of them expands another. They are composed only at
-// the use site in launch_fai_dispatch(), mirroring the BOOL_SWITCH /
+// the use site in launch_fwd_impl(), mirroring the BOOL_SWITCH /
 // MASK_SWITCH / LAUNCH style used elsewhere in this repo.
 
 // Convert a runtime bool into a named compile-time flag.
-#define FAI_BOOL_SWITCH(COND, CONST_NAME, ...)             \
+#define FWD_BOOL_SWITCH(COND, CONST_NAME, ...)             \
     do {                                                   \
         if (COND) {                                        \
             constexpr bool CONST_NAME = true;              \
@@ -30,7 +30,7 @@
 
 // Convert the runtime mask_category into a named compile-time constant.
 // The three MaskCategory values are enumerated explicitly.
-#define FAI_MASK_SWITCH(MASK_CATEGORY, MASK_CAT, ...)                          \
+#define FWD_MASK_SWITCH(MASK_CATEGORY, MASK_CAT, ...)                          \
     do {                                                                       \
         if (MASK_CATEGORY == MaskCategory::NO_MASK) {                          \
             constexpr auto MASK_CAT = MaskCategory::NO_MASK;                   \
@@ -44,7 +44,7 @@
         }                                                                      \
     } while (0)
 
-#define FAI_LAUNCH_KERNEL(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE)  \
+#define FWD_KERNEL_LAUNCH(KERNEL, MASK_CAT, CACHE_MODE_V, PAGE_SHAPE_V, LSE_MODE)  \
     KERNEL<DType, float, kFormat, kFormat, CACHE_MODE_V, PAGE_SHAPE_V,             \
            MASK_CAT, kCacheLayout, LSE_MODE>                                       \
         <<<a.block_dim, nullptr, a.stream>>>(                                      \
@@ -53,17 +53,17 @@
             a.kv_seq_device, a.workspace_device, a.tiling_device)
 
 template <typename DType, bool IS_TND>
-void launch_fai_dispatch(const FwdLaunchArgs &a) {
+void launch_fwd_impl(const FwdLaunchArgs &a) {
     constexpr Format kFormat = IS_TND ? Format::TND : Format::BSND;
     // The 950 host path only ever feeds ND-layout KV caches; the kernel
     // observes this as a compile-time template parameter, so no runtime
     // field is needed in the tiling data.
     constexpr CacheLayout kCacheLayout = CacheLayout::nd;
 
-    FAI_MASK_SWITCH(a.mask_category, MaskCat, {
-        FAI_BOOL_SWITCH(a.lse_mode, LseMode, {
-            FAI_BOOL_SWITCH(a.enable_dn, IsDN, {
-                FAI_BOOL_SWITCH(a.paged_kv, IsPaged, {
+    FWD_MASK_SWITCH(a.mask_category, MaskCat, {
+        FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
+            FWD_BOOL_SWITCH(a.enable_dn, IsDN, {
+                FWD_BOOL_SWITCH(a.paged_kv, IsPaged, {
                     constexpr auto CacheModeV =
                         IsPaged ? CacheMode::pagedCache : CacheMode::normalCache;
                     constexpr auto PageShapeV =
@@ -75,10 +75,10 @@ void launch_fai_dispatch(const FwdLaunchArgs &a) {
                     constexpr bool kUseDnFastPath =
                         (MaskCat == MaskCategory::NO_MASK) && IsDN;
                     if constexpr (kUseDnFastPath) {
-                        FAI_LAUNCH_KERNEL(FAInferDn, MaskCat,
+                        FWD_KERNEL_LAUNCH(FAInferDn, MaskCat,
                                           CacheModeV, PageShapeV, LseMode);
                     } else {
-                        FAI_LAUNCH_KERNEL(FAInfer, MaskCat,
+                        FWD_KERNEL_LAUNCH(FAInfer, MaskCat,
                                           CacheModeV, PageShapeV, LseMode);
                     }
                 });
@@ -87,8 +87,8 @@ void launch_fai_dispatch(const FwdLaunchArgs &a) {
     });
 }
 
-#undef FAI_LAUNCH_KERNEL
-#undef FAI_MASK_SWITCH
-#undef FAI_BOOL_SWITCH
+#undef FWD_KERNEL_LAUNCH
+#undef FWD_MASK_SWITCH
+#undef FWD_BOOL_SWITCH
 
-#endif  // FAI_HOST_API_IMPL_HPP
+#endif  // FWD_DISPATCH_IMPL_HPP

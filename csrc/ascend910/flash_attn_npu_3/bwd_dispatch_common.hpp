@@ -19,7 +19,7 @@
 #include "bwd_dispatch.hpp"
 
 // fag_kernel.cpp (and the CATLASS/FAG headers it pulls in, e.g.
-// kernel_common_fag.hpp) assume these standard headers are already visible.
+// fag_kernel_common.hpp) assume these standard headers are already visible.
 // In the original single-TU layout they were supplied transitively by
 // fag_tiling.cpp, which is no longer included ahead of fag_kernel.cpp here.
 #include <algorithm>
@@ -40,7 +40,7 @@
 
 // fag_kernel.cpp provides the FAGGeneral template, the DTemplateType enum,
 // the FlashAttentionScoreGrad kernel class and the unqualified BSND/TND layout
-// constants (0/1, from kernel_common_fag.hpp). Each dtype TU includes it once.
+// constants (0/1, from fag_kernel_common.hpp). Each dtype TU includes it once.
 #include "fag_kernel.cpp"
 
 // All 17 FAGGeneral launch arguments are identical across every instantiation;

@@ -3,8 +3,8 @@
  * Modified by Minghua Shen, 2026.
  */
 
-#ifndef FAI_HOST_API_HPP
-#define FAI_HOST_API_HPP
+#ifndef FWD_DISPATCH_HPP
+#define FWD_DISPATCH_HPP
 
 #include <cstdint>
 #include "acl/acl.h"
@@ -32,31 +32,31 @@ struct FwdLaunchArgs {
     uint8_t *tiling_device;
 };
 
-// Per-(dtype, layout) implementation, defined in fai_host_api_impl.hpp and
+// Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and
 // explicitly instantiated per (dtype, IS_TND) in
-// autogen/fai_dispatch_<dtype>_<layout>.cpp. IS_TND is true for TND (varlen)
+// autogen/fwd_dispatch_<dtype>_<layout>.cpp. IS_TND is true for TND (varlen)
 // layout, false for BSND.
 template <typename DType, bool IS_TND>
-void launch_fai_dispatch(const FwdLaunchArgs &a);
+void launch_fwd_impl(const FwdLaunchArgs &a);
 
 // Runtime entry: IS_TND is picked from a.layout at runtime, then the matching
-// dtype's launcher is selected. launch_fai_dispatch is explicitly instantiated
+// dtype's launcher is selected. launch_fwd_impl is explicitly instantiated
 // per (dtype, IS_TND) in the autogen TUs.
-inline void launch_fai(const FwdLaunchArgs &a) {
+inline void launch_fwd(const FwdLaunchArgs &a) {
     const bool is_bsnd = (a.layout == Format::BSND);
     if (a.is_bf16) {
         if (is_bsnd) {
-            launch_fai_dispatch<bfloat16_t, false>(a);
+            launch_fwd_impl<bfloat16_t, false>(a);
         } else {
-            launch_fai_dispatch<bfloat16_t, true>(a);
+            launch_fwd_impl<bfloat16_t, true>(a);
         }
     } else {
         if (is_bsnd) {
-            launch_fai_dispatch<half, false>(a);
+            launch_fwd_impl<half, false>(a);
         } else {
-            launch_fai_dispatch<half, true>(a);
+            launch_fwd_impl<half, true>(a);
         }
     }
 }
 
-#endif  // FAI_HOST_API_HPP
+#endif  // FWD_DISPATCH_HPP

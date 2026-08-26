@@ -17,7 +17,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <vector>
-#include "fai_tilingdata.h"
+#include "tilingdata.h"
 
 namespace optiling{
     const uint32_t SIZE_OF_16BIT = 2;

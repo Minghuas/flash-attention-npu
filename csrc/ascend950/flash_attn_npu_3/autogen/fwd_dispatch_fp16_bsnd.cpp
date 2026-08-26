@@ -7,7 +7,7 @@
 // kernel templates compile in parallel across cores; head_dim is a runtime
 // tiling axis (not a template parameter), so it is not a generation axis.
 
-#include "../fai_host_api_impl.hpp"
+#include "../fwd_dispatch_impl.hpp"
 
-template void launch_fai_dispatch<half, false>(
+template void launch_fwd_impl<half, false>(
     const FwdLaunchArgs &a);

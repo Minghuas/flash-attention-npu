@@ -45,7 +45,7 @@
 
 // fag_kernel.cpp provides the ::FAGGeneral kernel template, the DTemplateType
 // enum, and the unqualified BSND/TND layout constants (0/1, from
-// kernel_common_fag.hpp which it includes). It self-includes fag_tiling.h for
+// fag_kernel_common.hpp which it includes). It self-includes fag_tiling.h for
 // the FAGTilingData type. Each dtype TU includes it once.
 #include "../flash_attn_npu_3/fag_kernel.cpp"
 

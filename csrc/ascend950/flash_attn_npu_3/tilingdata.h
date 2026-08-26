@@ -9,8 +9,8 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  */
 
-#ifndef FLASH_ATTENTION_REGULAR_H
-#define FLASH_ATTENTION_REGULAR_H
+#ifndef TILINGDATA_H
+#define TILINGDATA_H
 
 struct coreNode {
     int startBIdx;

@@ -23,9 +23,9 @@
 #include <torch/extension.h>
 
 #include "acl/acl.h"
-#include "fai_host_api.hpp"
-#include "fai_tiling.cpp"
-#include "fai_tilingdata.h"
+#include "fwd_dispatch.hpp"
+#include "tiling.cpp"
+#include "tilingdata.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "tiling/platform/platform_ascendc.h"
 #include "tiling_from_tensors.hpp"
@@ -351,7 +351,7 @@ mha_fwd(at::Tensor q,
     at::Tensor tiling_dev = tiling_cpu.to(at::Device(at::kPrivateUse1));
 
     // ============================================================
-    // 10. Launch via launch_fai
+    // 10. Launch via launch_fwd
     // ============================================================
     const Format fmt = is_varlen_q ? Format::TND : Format::BSND;
     const MaskCategory mask_category =
@@ -410,11 +410,11 @@ mha_fwd(at::Tensor q,
         qDev, kDev, vDev, maskDev, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
         wsDev, tilDev};
-    launch_fai(fwdArgs);
+    launch_fwd(fwdArgs);
 
     const aclError sync_err = aclrtSynchronizeStream(aclStream);
     TORCH_CHECK(sync_err == ACL_SUCCESS,
-                "950 backend (v3): aclrtSynchronizeStream failed after launch_fai, err=",
+                "950 backend (v3): aclrtSynchronizeStream failed after launch_fwd, err=",
                 sync_err);
 
     at::Tensor empty_accum = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
