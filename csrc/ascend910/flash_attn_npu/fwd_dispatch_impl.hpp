@@ -22,7 +22,7 @@
         <<<blockDim, nullptr, aclStream>>>(                                                  \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,               \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                              \
-            workspaceDevice, tilingDevice)
+            workspaceDevice, tilingDevice, kNewDevice, vNewDevice);
 
 // BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
 // branch fixes the runtime bool as a named constexpr flag, so the dispatch
@@ -75,6 +75,8 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     uint8_t *qDevice = a.qDevice;
     uint8_t *kDevice = a.kDevice;
     uint8_t *vDevice = a.vDevice;
+    uint8_t *kNewDevice = a.kNewDevice;
+    uint8_t *vNewDevice = a.vNewDevice;
     uint8_t *maskDevice = a.maskDevice;
     uint8_t *blockTableDevice = a.blockTableDevice;
     uint8_t *oDevice = a.oDevice;
