@@ -19,6 +19,8 @@
 namespace {
 constexpr uint32_t Q_TILE_CEIL = 128;
 constexpr uint32_t N_SPLIT_HELPER = 2;
+// Keep in sync with FaiKenel::MaskType::MASK_BAND.
+constexpr uint32_t MASK_TYPE_BAND = 2;
 
 inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 {
@@ -110,13 +112,15 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args)
 
     {
         // v2 flash-decode is a BSND-only heuristic: paged KV cache, tiny Q,
-        // long KV (mha_fwd_kvcache); the varlen (TND) path never splits.
+        // long KV (mha_fwd_kvcache); the varlen (TND) and local/SWA paths never
+        // split. Head dimension is governed by the common <= 256 API check.
         const uint32_t bd = metaArgs->blockDim;
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
         const uint32_t maxQ = metaArgs->maxQSeqlen;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
         const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen == 0) &&
+            (metaArgs->maskType != MASK_TYPE_BAND) &&
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
             (maxKvSeqlen >= 1024u) && (maxQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;

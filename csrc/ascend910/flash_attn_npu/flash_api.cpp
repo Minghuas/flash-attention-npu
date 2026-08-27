@@ -394,7 +394,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         int64_t wsSplit = 0;
         // The AICPU may trigger flash-decode split-KV on device; reserve the
         // split workspace upper bound since the host no longer knows it.
-        if (paged_KV && seqlen_q * (num_heads / num_heads_k) <= 128 && seqlen_q <= 16) {
+        if (paged_KV && !is_local && seqlen_q * (num_heads / num_heads_k) <= 128 && seqlen_q <= 16) {
             int64_t kvSegUpper = kvSeqlenBound / 512 + 1;
             int64_t lseTasksUpper = static_cast<int64_t>(batch_size) * num_heads * seqlen_q * kvSegUpper * 2;
             wsSplit = lseTasksUpper * 4 + lseTasksUpper * head_size_og * 4;
@@ -485,7 +485,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
             (max_kv_seqlen >= static_cast<int32_t>(blockDim) * 512);
         bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
             (max_kv_seqlen >= 1024);
-        flashDecodeFlag = paged_KV && head_size_og <= 128 &&
+        flashDecodeFlag = paged_KV && !is_local &&
             (seqlen_q * groupSize <= 128) && (seqlen_q <= 16) &&
             (max_kv_seqlen >= 1024) && (seqlen_q > 0) && (isLongSeq || isShortSeq);
         tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
