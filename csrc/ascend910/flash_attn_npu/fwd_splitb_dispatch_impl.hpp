@@ -14,6 +14,7 @@
 // 标准头（kernel 文件假定可见，与 fwd_dispatch_impl.hpp 同款注释）
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 
 // SplitB::FAInferSplitB kernel 模板 + FaiKenel::MaskType + KernelCommon 常量
@@ -24,7 +25,10 @@ template <typename DType>
 void launch_fwd_splitb_impl(const FwdLaunchArgs &a) {
     const uint32_t blockDim = a.blockDim;
     const aclrtStream aclStream = a.aclStream;
-    printf("3001 [splitb-dispatch] impl entered, blockDim=%u\n", blockDim); fflush(stdout);
+    const bool dbgEnv = getenv("FLASH_ATTN_SPLITB_DEBUG") != nullptr;  // #44.45 同款总开关
+    if (dbgEnv) {
+        printf("3001 [splitb-dispatch] impl entered, blockDim=%u\n", blockDim); fflush(stdout);
+    }
     const bool has_softcap = a.has_softcap;
     // SplitB v1：无 paged / FD / TND 轴（触发条件天然排除；dropout 在 host 侧拦截）
     (void)a.paged_KV;
@@ -61,12 +65,16 @@ void launch_fwd_splitb_impl(const FwdLaunchArgs &a) {
                     a.fftsAddr, a.qDevice, a.kDevice, a.vDevice, a.maskDevice, a.oDevice,
                     a.softmaxLseDevice, a.workspaceDevice, a.tilingDevice);
         } else {
-            printf("3002 [splitb-dispatch] branch NO_MASK, launching <<<%u>>>...\n", blockDim); fflush(stdout);
+            if (dbgEnv) {
+                printf("3002 [splitb-dispatch] branch NO_MASK, launching <<<%u>>>...\n", blockDim); fflush(stdout);
+            }
             SplitB::FAInferSplitB<DType, FaiKenel::MaskType::NO_MASK, false>
                 <<<blockDim, nullptr, aclStream>>>(
                     a.fftsAddr, a.qDevice, a.kDevice, a.vDevice, a.maskDevice, a.oDevice,
                     a.softmaxLseDevice, a.workspaceDevice, a.tilingDevice);
-            printf("3003 [splitb-dispatch] launch returned\n"); fflush(stdout);
+            if (dbgEnv) {
+                printf("3003 [splitb-dispatch] launch returned\n"); fflush(stdout);
+            }
         }
     }
 }

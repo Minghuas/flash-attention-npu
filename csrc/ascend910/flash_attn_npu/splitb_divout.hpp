@@ -45,6 +45,14 @@ public:
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;
     static constexpr uint32_t UB_UINT8_VECTOR_SIZE = 1024;
     static constexpr uint32_t ROW_NUM_MAX = 128;   // = Q_TILE_CEIL；stats 行距（与 host 公式一致）
+    // ⑤ LSE 广播区在 tvUb 内的基址偏移（devlog #44.49 根因修复）：
+    // ② 除数广播占 tv[0, 每AIV行数×8)，每 AIV 行数 ≤ ROW_NUM_MAX/2=64 → 上限 512 float；
+    // ⑤ 原偏移仅 FLOAT_VECTOR_SIZE=64 → 与 ② 区在 [64,512) 重叠——下一 tile 的 ② Brcb
+    // 覆写重叠行，多头 tile 的 LSE gather（仅多头分支读 tv）读到被污染值 → LSE 错
+    //（实证：坏行上边界恰落在重叠边界，G=2 时 s0-23 / Sq=48 时 s0-39；B≥3 才触发
+    //   = b+2 同 ping-pong 槽的流水窗口；--dump 会改变时序掩盖）。偏移取 ② 区上限
+    //   512 即彻底不相交（tv 区 [160KB,170KB) 共 2560 float，余量充足）。
+    static constexpr uint32_t LSE_TV_FLOAT_OFFSET = (ROW_NUM_MAX / 2) * FLOAT_BLOCK_SIZE;
 
     __aicore__ inline SplitBDivOut() {}
 
@@ -257,11 +265,13 @@ public:
             // V→MTE2 自配对：Ln/Add 写 lseUb 完成后 Brcb 才读（跨 pipe RAW，devlog #44.6）
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evId);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evId);
-            // LSE 广播用独立目标区（tvUb 偏移 FLOAT_VECTOR_SIZE）：与 ② Div 的除数
-            // 广播区分离，消除 ②/⑤ 对 tvUb[0..) 的 WAR/RAW 竞争（devlog #44.6：
-            // -O2 下 ⑤ Brcb 曾覆盖 ② 的除数 → h7 除数为 LSE 值 15.472 的实证）
+            // LSE 广播用独立目标区（tvUb 偏移 LSE_TV_FLOAT_OFFSET）：与 ② Div 的除数
+            // 广播区 tv[0,512) 彻底不相交。原偏移 FLOAT_VECTOR_SIZE(64) 时两区在
+            // [64,512) 重叠——下一 tile 的 ② Brcb 覆写重叠行污染 ⑤ 的 gather 源
+            //（devlog #44.49 GQA LSE 根因；#44.6 的 WAR 修复经验延续：分区不相交
+            //   优于靠事件链排序）
             AscendC::Brcb(
-                tvUbTensor[FLOAT_VECTOR_SIZE].ReinterpretCast<uint32_t>(),
+                tvUbTensor[LSE_TV_FLOAT_OFFSET].ReinterpretCast<uint32_t>(),
                 lseUbTensor.ReinterpretCast<uint32_t>(),
                 CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                 AscendC::BrcbRepeatParams(1, 8));
@@ -275,12 +285,13 @@ public:
                     gLse, lseUbTensor,
                     AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
             } else {
-                // 多头 tile：逐 token 跨头 gather + 头主序 scatter（参数照抄 FAInfer）
+                // 多头 tile：逐 token 跨头 gather + 头主序 scatter（参数照抄 FAInfer；
+                        // 源偏移与上方 Brcb dst 成对 = LSE_TV_FLOAT_OFFSET）
                 const uint32_t lseHeadStrideGm = layoutLse.stride(0);
                 for (uint32_t sIdx = 0; sIdx < qSBlockSize; sIdx++) {
                     AscendC::DataCopyPad(
                         gLse[sIdx],
-                        tvUbTensor[sIdx * FLOAT_BLOCK_SIZE + FLOAT_VECTOR_SIZE],
+                        tvUbTensor[sIdx * FLOAT_BLOCK_SIZE + LSE_TV_FLOAT_OFFSET],
                         AscendC::DataCopyExtParams(
                             qNThisSubBlock, sizeof(float),
                             qSBlockSize - 1,
@@ -312,8 +323,12 @@ public:
         const uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
         const uint32_t qNThisSubBlock = (qNBlockSize == 1U) ? 0U :
             ((subBlockIdx == 1U) ? (qNBlockSize - qNSplitSubBlock) : qNSplitSubBlock);
-        const uint32_t inRowSplitSubBlock = (qNBlockSize == 1U) ?
+        // Bug③a 修复（devlog #44.52，与 SplitBSoftmax 成对）：分摊边界对齐 8——
+        // LoadStats 的 GM 读起点同样以 32B 块为单位，非对齐 split（Sq=31 → 15）会
+        // 非对齐读；与 softmax 侧同公式保持写/读分摊一致。
+        const uint32_t inRowSplitRaw = (qNBlockSize == 1U) ?
             (qSBlockSizeTile / subBlockNum) : (qSBlockSizeTile * qNSplitSubBlock);
+        const uint32_t inRowSplitSubBlock = RoundDown(inRowSplitRaw, FLOAT_BLOCK_SIZE);
         const uint32_t inRowActualThisSubBlock = (subBlockIdx == 1U) ?
             (rowNum - inRowSplitSubBlock) : inRowSplitSubBlock;
         const uint32_t inRowOffsetThisSubBlock = subBlockIdx * inRowSplitSubBlock;

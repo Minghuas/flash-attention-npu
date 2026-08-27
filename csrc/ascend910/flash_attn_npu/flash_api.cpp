@@ -30,7 +30,7 @@
 using namespace Catlass;
 using namespace KernelCommon;
 
-#include "splitb_host.hpp"  // SplitB 大B小S 快路径（perf 项目，默认 env 门控关闭）
+#include "splitb_host.hpp"  // SplitB 大B小S 快路径（perf 项目；闸门+env 开关见此头文件）
 
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
 
@@ -479,8 +479,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     int32_t max_kv_seqlen = 0;
+    int32_t min_kv_seqlen = std::numeric_limits<int32_t>::max();
     for (int32_t i = 0; i < batch_size; i++) {
         max_kv_seqlen = std::max(max_kv_seqlen, seqlens_k_cpu[i]);
+        min_kv_seqlen = std::min(min_kv_seqlen, seqlens_k_cpu[i]);
     }
     tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
 
@@ -506,6 +508,30 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         if (window_size_right < 0) {
             window_size_right = max_kv_seqlen;
         }
+    }
+
+    // SplitB 快路径（大 Batch 小 SeqLen）：仅 dense 场景——非 paged、无增量 k/v、
+    // 无 cache_batch_idx 间接索引、各 batch kv 等长（本 kernel 按均匀 s2Size 迭代），
+    // 且实际 kv 长度 == cache 容量（mha_fwd_splitb 以 kcache.size(1) 为 Sk，容量大于
+    // 实际长度时会读到 stale 列——混合长度场景落旧路径，待 host 传显式长度后再放开）。
+    // varlen 接口不路由（TND 布局，本 kernel 仅支持 BSHD）。闸门详见 splitb_host.hpp。
+    if (!paged_KV && !k_.has_value() && !v_.has_value() && !cache_batch_idx_.has_value() &&
+        q.is_contiguous() && kcache.is_contiguous() && vcache.is_contiguous() &&
+        min_kv_seqlen == max_kv_seqlen && min_kv_seqlen > 0 &&
+        static_cast<int64_t>(max_kv_seqlen) == kcache.size(1) &&
+        SplitB::route_splitb(seqlen_q, max_kv_seqlen, num_heads, head_size_og,
+                             q.element_size(), 0.0f /*p_dropout*/,
+                             false /*return_softmax*/, is_causal, is_local, softcap)) {
+        if (getenv("FLASH_ATTN_SPLITB_DEBUG") != nullptr) {
+            printf("111 [flash_api] >>> entering SplitB path (fwd_kvcache dense)\n"); fflush(stdout);
+        }
+        at::Tensor softmaxlse = at::empty({batch_size, num_heads, seqlen_q},
+            at::device(at::kPrivateUse1).dtype(at::kFloat));
+        softmaxlse.fill_(std::numeric_limits<float>::infinity());
+        at::Tensor no_mask;   // 闸门已排除 causal/local（S4 前 kernel 无 mask 计算体）
+        SplitB::mha_fwd_splitb(q, kcache, vcache, out, softmaxlse, no_mask, softmax_scale,
+                               is_causal, is_local, window_size_left, window_size_right, softcap);
+        return {out, softmaxlse};
     }
 
     uint32_t totalTaskNum = 0;
@@ -732,13 +758,14 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
     auto softmaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmaxlse.data_ptr()));
 
-    // SplitB 快路径（大 Batch 小 SeqLen）：触发条件照搬 CANN TilingB::IsCapable，
-    // 默认 env 门控关闭（P3 步 1 骨架；步 2 kernel 完成后翻默认开）。
-    // FLASH_ATTN_DISABLE_SPLITB=1 强制关；FLASH_ATTN_FORCE_SPLITB=1 强制开（测试用）。
-    if (SplitB::should_use(seqlen_q, seqlen_k, num_heads, q.element_size(), p_dropout, return_softmax) &&
-        SplitB::env_enabled()) {
+    // SplitB 快路径（大 Batch 小 SeqLen）：闸门 = 功能支持面 ∩ 形状闸门
+    // （照搬 CANN TilingB::IsCapable + 本 kernel 验证边界，详见 splitb_host.hpp）。
+    // 默认启用；FLASH_ATTN_DISABLE_SPLITB 关闭，FLASH_ATTN_FORCE_SPLITB 绕过形状闸门。
+    if (q.is_contiguous() && k.is_contiguous() && v.is_contiguous() &&
+        SplitB::route_splitb(seqlen_q, seqlen_k, num_heads, head_size, q.element_size(),
+                             p_dropout, return_softmax, is_causal, is_local, softcap)) {
         if (getenv("FLASH_ATTN_SPLITB_DEBUG") != nullptr) {
-            printf("111 [flash_api] >>> entering SplitB path\n"); fflush(stdout);
+            printf("111 [flash_api] >>> entering SplitB path (fwd)\n"); fflush(stdout);
         }
         SplitB::mha_fwd_splitb(q, k, v, out, softmaxlse, mask_gpu_tensor, softmax_scale,
                                is_causal, is_local, window_size_left, window_size_right, softcap);
@@ -1094,6 +1121,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     auto softmaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmaxlse.data_ptr()));
 
     // TND forward (IS_TND=true); no flash-decode in the varlen path.
+    // SplitB 不在此路由：varlen 为 TND 布局 + 逐 batch 变长（cu_seqlens 迭代），而
+    // SplitB kernel v1 按 BSHD 稠密均匀布局迭代（strideQ/boIdx 直接寻址）——待后续
+    // 版本支持变长后再引入。
     FwdLaunchArgs fwd_args;
     fwd_args.blockDim = blockDim;
     fwd_args.aclStream = aclStream;

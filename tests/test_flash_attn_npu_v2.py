@@ -693,3 +693,173 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     rtol = 1e-2
     atol = 1e-2
     torch.testing.assert_close(output_npu.cpu(), golden_out.cpu(), rtol=rtol, atol=atol)
+
+
+# =========================================================================
+# SplitB 快路径（大 Batch 小 SeqLen）样例 —— 触发进入 SplitB kernel 的规范测试
+#
+# 触发闸门（csrc/ascend910/flash_attn_npu/splitb_host.hpp 的 route_splitb，
+# 照搬 CANN FlashAttentionScoreTilingB::IsCapable + 本 kernel 验证边界）：
+#   - 主条件 max(q_seqlen, kv_seqlen) <= 128（Q/KV 均单 tile）
+#   - N2×G×align16(Sq)×align16(Sk)×dtypeBytes <= 128KB（参考 blockBSizeLimit_，
+#     Sq=Sk=128 时须 num_heads <= 4）
+#   - head_size <= 128
+#   - 功能面（S4 完成前回退旧路径）：causal/SWA、softcap、dropout、
+#     return_attn_probs（C++ return_softmax）均不路由
+# 接口覆盖：flash_attn_func（mha_fwd）与 flash_attn_with_kvcache（mha_fwd_kvcache
+# 的 dense 非 paged 均长路径）。varlen 接口不路由（TND 布局，kernel 仅支持 BSHD）。
+# 新增形状请对照上述闸门自检，否则会静默落旧路径而失去 SplitB 覆盖。
+# =========================================================================
+
+def splitb_golden(query, key, value, scale, data_type):
+    """无 mask、无 softcap 的逐 batch CPU 参考实现（与触发闸门功能面一致）。"""
+    batch_size, q_seqlen, num_heads, head_size = query.shape
+    golden_out = torch.empty((batch_size, q_seqlen, num_heads, head_size), dtype=data_type)
+    golden_lseL = torch.empty((batch_size, num_heads, q_seqlen), dtype=torch.float32)
+    query_cpu = query.detach().cpu()
+    key_cpu = key.detach().cpu()
+    value_cpu = value.detach().cpu()
+    for i in range(batch_size):
+        output, golden_lse = ref_flash_attention(
+            query_cpu[i], key_cpu[i], value_cpu[i], scale, None, data_type, 0.0)
+        golden_out[i:i + 1] = output.reshape(q_seqlen, num_heads, head_size)
+        golden_lseL[i:i + 1] = golden_lse.reshape(num_heads, q_seqlen)
+    return golden_out, golden_lseL
+
+
+splitb_fwd_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size)
+    # 基线形状（对齐 t60 已验证矩阵：fp16、H=Hkv、D=64）
+    (torch.float16, 4, 2, 2, 32, 32, 64),
+    (torch.float16, 64, 1, 1, 64, 64, 64),      # 单头
+    (torch.float16, 128, 8, 8, 64, 64, 64),     # 中等 batch
+    (torch.float16, 1024, 8, 8, 32, 32, 64),    # 目标负载 B=1024（t60 多核已验，此处单核回归）
+    # Sq=Sk=128 满 tile（blockB 上限 ⇒ num_heads <= 4）
+    (torch.float16, 64, 4, 4, 128, 128, 64),
+    (torch.float16, 64, 4, 1, 128, 128, 64),    # 满 tile + GQA（G=4）
+    # Sk≠Sq / 非 16 对齐（列 pad / 尾块路径）
+    (torch.float16, 64, 8, 8, 64, 48, 64),
+    (torch.float16, 64, 8, 8, 32, 96, 64),
+    (torch.float16, 64, 8, 8, 33, 47, 64),      # 非 2 幂且非 16 倍
+    # GQA 多头 tile 打包（qNBlockTile > 1：divout 双 AIV 行劈 + 多头 LSE scatter 首测）
+    (torch.float16, 64, 8, 4, 32, 32, 64),      # G=2 -> qNBlockTile=2
+    (torch.float16, 64, 8, 1, 32, 32, 64),      # G=8 -> qNBlockTile=4
+    (torch.float16, 64, 8, 2, 16, 16, 64),      # G=4, Sq=16 -> qNBlockTile=4
+    # D=128（workspace OTmp 区设计上限，首测）
+    (torch.float16, 64, 8, 8, 64, 64, 128),
+    (torch.float16, 32, 8, 4, 32, 32, 128),     # GQA + D=128
+    # bf16（dispatch 模板已实例化，本组为首次上板验证）
+    (torch.bfloat16, 64, 8, 8, 64, 64, 64),
+    (torch.bfloat16, 128, 8, 4, 32, 32, 64),
+]
+
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size", splitb_fwd_cases)
+def test_fa_splitb_fwd(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size):
+    query = (-5.0 + 10.0 * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key = (-5.0 + 10.0 * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value = (-5.0 + 10.0 * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    scale = 1.0 / (head_size ** 0.5)
+
+    out_out, softmax_lse, _ = flash_attn_func(
+        query,
+        key,
+        value,
+        0.0,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        return_attn_probs=True,
+    )
+
+    golden_out, golden_lseL = splitb_golden(query, key, value, scale, data_type)
+    torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=1e-2, atol=1e-2)
+
+
+splitb_kvcache_cases = [
+    # (data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size)
+    # dense（非 paged、无增量 k/v）、cache_seqlens 均长 —— mha_fwd_kvcache 的 SplitB 路由条件
+    (torch.float16, 4, 2, 2, 32, 32, 64),
+    (torch.float16, 128, 8, 8, 64, 64, 64),
+    (torch.float16, 64, 8, 4, 32, 32, 64),      # GQA（G=2）
+    (torch.float16, 64, 4, 4, 128, 128, 64),    # 满 tile
+    (torch.bfloat16, 64, 8, 8, 64, 64, 64),
+]
+
+
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size", splitb_kvcache_cases)
+def test_fa_splitb_kvcache_dense(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size):
+    query = (-5.0 + 10.0 * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(data_type).npu()
+    key_cache = (-5.0 + 10.0 * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    value_cache = (-5.0 + 10.0 * torch.rand(batch_size, kv_seqlen, kv_heads, head_size)).to(data_type).npu()
+    cache_seqlens = torch.full((batch_size,), kv_seqlen, dtype=torch.int32).npu()
+    scale = 1.0 / (head_size ** 0.5)
+
+    out_out, softmax_lse = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        None,
+        None,
+        cache_seqlens=cache_seqlens,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        return_softmax_lse=True,
+    )
+
+    golden_out, golden_lseL = splitb_golden(query, key_cache, value_cache, scale, data_type)
+    torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=1e-2, atol=1e-2)
+
+
+def test_fa_splitb_multi_core(monkeypatch):
+    """多核分发回归（FLASH_ATTN_SPLITB_MULTI_CORE，host 每次调用即时读取 env）。"""
+    monkeypatch.setenv("FLASH_ATTN_SPLITB_MULTI_CORE", "1")
+    batch_size, num_heads, q_seqlen, head_size = 128, 8, 64, 64
+    query = (-5.0 + 10.0 * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(torch.float16).npu()
+    key = (-5.0 + 10.0 * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(torch.float16).npu()
+    value = (-5.0 + 10.0 * torch.rand(batch_size, q_seqlen, num_heads, head_size)).to(torch.float16).npu()
+    scale = 1.0 / (head_size ** 0.5)
+
+    out_out, softmax_lse, _ = flash_attn_func(
+        query, key, value, 0.0, causal=False, window_size=(-1, -1), softcap=0.0,
+        alibi_slopes=None, return_attn_probs=True)
+
+    golden_out, golden_lseL = splitb_golden(query, key, value, scale, torch.float16)
+    torch.testing.assert_close(out_out.cpu(), golden_out.cpu(), rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(softmax_lse.cpu(), golden_lseL.cpu(), rtol=1e-2, atol=1e-2)
+
+
+def test_fa_splitb_routing_gate(monkeypatch, capfd):
+    """闸门路由确认：触发形状进入 SplitB；越界形状（Sk>128）必须回退旧路径。"""
+    monkeypatch.setenv("FLASH_ATTN_SPLITB_DEBUG", "1")
+
+    def run(q_seqlen, kv_seqlen):
+        query = (-5.0 + 10.0 * torch.rand(4, q_seqlen, 2, 64)).to(torch.float16).npu()
+        key = (-5.0 + 10.0 * torch.rand(4, kv_seqlen, 2, 64)).to(torch.float16).npu()
+        value = (-5.0 + 10.0 * torch.rand(4, kv_seqlen, 2, 64)).to(torch.float16).npu()
+        capfd.readouterr()  # 排掉此前积压
+        flash_attn_func(query, key, value, 0.0, causal=False, window_size=(-1, -1))
+        torch.npu.synchronize()
+        return capfd.readouterr().out
+
+    # 触发形状：host 侧打印 SplitB 进入标记
+    out = run(32, 32)
+    assert "entering SplitB path (fwd)" in out
+    # Sk=256 > 128：形状闸门拒绝，不得进入 SplitB
+    out = run(32, 256)
+    assert "entering SplitB path" not in out
+    # dense kvcache：fwd_kvcache 路由标记
+    query = (-5.0 + 10.0 * torch.rand(4, 32, 2, 64)).to(torch.float16).npu()
+    key_cache = (-5.0 + 10.0 * torch.rand(4, 32, 2, 64)).to(torch.float16).npu()
+    value_cache = (-5.0 + 10.0 * torch.rand(4, 32, 2, 64)).to(torch.float16).npu()
+    cache_seqlens = torch.full((4,), 32, dtype=torch.int32).npu()
+    capfd.readouterr()
+    flash_attn_with_kvcache(query, key_cache, value_cache, None, None,
+                            cache_seqlens=cache_seqlens, causal=False, window_size=(-1, -1))
+    torch.npu.synchronize()
+    out = capfd.readouterr().out
+    assert "entering SplitB path (fwd_kvcache dense)" in out

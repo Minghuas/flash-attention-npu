@@ -75,21 +75,26 @@ def make_ref():
     init_geom()
     import torch
     q = torch.zeros(B, Sq, H, D)
-    k = torch.zeros(B, Sk, H, D)
-    v = torch.zeros(B, Sk, H, D)
+    k = torch.zeros(B, Sk, Hkv, D)
+    v = torch.zeros(B, Sk, Hkv, D)
     qden = float(max(1, B * H * Sq))   # 归一化：任意 shape 下 Q∈(0, 2]、S_raw≤Sk
     for b in range(B):
         for s in range(Sq):
             for h in range(H):
                 q[b, s, h, :] = (b + 1) * (h + 1) * (s + 1) / qden
     dv = torch.arange(1, D + 1, dtype=torch.float32) / float(max(1, D))  # 通道斜坡 (d+1)/D
+    # K/V 按 kv 头平移（devlog #44.49）：GQA 下若 kernel 读错 kv 头，S/OTmp 将错位可检
+    # （修复前 bug：k/v 曾用 H 建 tensor —— Hkv 恒等于 H，GQA 从未被真正测过）
     for j in range(Sk):
-        k[:, j, :, :] = (j + 1) / float(max(1, Sk))
-        v[:, j, :, :] = (j + 1) + dv
+        for h in range(Hkv):
+            k[:, j, h, :] = (j + 1 + h) / float(max(1, Sk))
+            v[:, j, h, :] = (j + 1 + h) + dv
     q16 = q.half().float()
-    k16 = k.half().float()
-    v16 = v.half().float()
-    s_raw = torch.matmul(q16.transpose(1, 2), k16.transpose(1, 2).transpose(-1, -2))  # [B,H,Sq,Sk]
+    # GQA 金标展开：kernel 输入保持 Hkv 头（ref["k"]/["v"] 原形状），仅基准数学用
+    # repeat_interleave 按组扩展到 H 头（devlog #44.49；否则 H≠Hkv 时 matmul 崩）
+    ke16 = k.half().float().repeat_interleave(G, dim=2)
+    ve16 = v.half().float().repeat_interleave(G, dim=2)
+    s_raw = torch.matmul(q16.transpose(1, 2), ke16.transpose(1, 2).transpose(-1, -2))  # [B,H,Sq,Sk]
     # DBG（2026-08-21 用户要求，临时禁用 ScaleS）：kernel 已注释 ScaleS，此处同样不乘。
     # 数值健全性：S_raw≤64 不溢出；max=64；P=exp(S−64)∈(0,1]；sum≈2-3；O≈30-32。
     s_sc = s_raw * SCALE   # 恢复 scale（devlog #44.42；调试期曾用 s_raw 对齐禁用的 ScaleS）
@@ -97,7 +102,7 @@ def make_ref():
     p32 = torch.exp(s_sc - mx)
     p16 = p32.half().float()
     sumv = p32.sum(dim=-1)                                        # [B,H,Sq]
-    otmp = torch.matmul(p16, v16.transpose(1, 2))                 # [B,H,Sq,D]
+    otmp = torch.matmul(p16, ve16.transpose(1, 2))                # [B,H,Sq,D]
     o32 = otmp / sumv.unsqueeze(-1)                               # [B,H,Sq,D]
     o16 = o32.transpose(1, 2).half().float()                      # [B,Sq,H,D] 与 kernel out 同形态
     lse = torch.log(sumv) + mx.squeeze(-1)                        # [B,H,Sq]
@@ -413,18 +418,27 @@ def run_kernel(iters, softmax_only=False, multi_core=False, debug=False, dump=Fa
     k = ref["k"].half().npu()
     v = ref["v"].half().npu()
     o16 = ref["o16"]
+    lse_ref = ref["lse"]          # [B,H,Sq] 头主序（devlog #44.49：pytest GQA LSE-only 错，加张量级校验）
     for it in range(iters):
         print("[RUN] iter=%d begin" % it, flush=True)
-        out = flash_attn_func(q, k, v, 0.0, SCALE, False)
+        out, lse, _ = flash_attn_func(q, k, v, 0.0, SCALE, False, return_attn_probs=True)
         torch.npu.synchronize()
+        err = (lse.float().cpu() - lse_ref).abs()
+        mx = err.max().item()
+        am = torch.unravel_index(err.argmax(), err.shape)
+        nbad = int((err > 1e-2).sum())
+        print("[LSE] iter=%d max_err=%.4f nbad=%d/%d argmax=(b=%d h=%d s=%d) %s"
+              % (it, mx, nbad, err.numel(), am[0], am[1], am[2],
+                 "PASS" if mx < 1e-2 else "FAIL"), flush=True)
         if softmax_only:
             print("[OUT] iter=%d softmax-only：O 未计算，判定以 P/stats 比对为准" % it, flush=True)
             continue
         err = (out.float().cpu() - o16).abs()
+        nbad = int((err > 1e-2).sum())
         mx = err.max().item()
         am = torch.unravel_index(err.argmax(), err.shape)
-        print("[OUT] iter=%d max_err=%.4f argmax=(b=%d s=%d h=%d d=%d) %s"
-              % (it, mx, am[0], am[1], am[2], am[3], "PASS" if mx < 5e-2 else "FAIL"), flush=True)
+        print("[OUT] iter=%d max_err=%.4f nbad=%d/%d argmax=(b=%d s=%d h=%d d=%d) %s"
+              % (it, mx, nbad, err.numel(), am[0], am[1], am[2], am[3], "PASS" if mx < 1e-2 else "FAIL"), flush=True)  # NOTE: 错误容忍度改为1e-2
 
 
 def main():

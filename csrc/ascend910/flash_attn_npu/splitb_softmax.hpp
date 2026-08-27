@@ -460,8 +460,17 @@ public:
 
         // 双 AIV 行分摊（FAInfer 精确公式：多头 tile 按头对半；单头 tile 按 qSBlockSize/2 行对半）
         const uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        const uint32_t rowSplitSubBlock = (qNBlockSize == 1) ?
+        // Bug③a 修复（devlog #44.52）：分摊边界对齐 8（FLOAT_BLOCK_SIZE）。stats 区行距
+        // 1 float，CopyStatsToGm 的 blockLen 以 32B 块为单位——不对齐时：①AIV0 的块长
+        // 取整多写的 1 行是 UB 中从未装载的 rounding 行（t11 dump 实测 max=2.6e11/
+        // sum=inf），恰好落进 AIV1 首行 gStats[split] → 双写竞争；②AIV1 写起点
+        // （如 Sq=31 → split=15 → +60B）非 32B 对齐，非对齐 MTE3 写抹脏邻块 → 受害行
+        // 在 8-14 / 15 间随时序漂移。对齐后 AIV0 写 [0,8k) 恰好整块无垃圾尾行，AIV1
+        // 起点对齐、垃圾尾行 ≥Sq 不被 divout 读取。FAInfer 原版 qSBlockSize 恒 2 的幂
+        // （split 天然对齐）故未暴露；RoundDown 到 0 时走既有 0 行子核路径。
+        const uint32_t rowSplitRaw = (qNBlockSize == 1) ?
             (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
+        const uint32_t rowSplitSubBlock = RoundDown(rowSplitRaw, FLOAT_BLOCK_SIZE);
         const uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ?
             (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
         const uint32_t rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;

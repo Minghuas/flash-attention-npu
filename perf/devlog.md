@@ -797,6 +797,129 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.51**｜**【重大战果】l1A 跨 tile 覆写竞争 = Bug②③b④ 统一根因；一行守卫修复三 bug；Bug③a 签名规律化（2026-08-26）**：
+**取证（t8 新 .so dump + debug/analyze_t6_sk40.py）**：先推翻"divout 有罪"（#44.50 尾注的
+误判——当时把 scaled 域 max 当真值已更正，但 O/LSE 错误归因 divout 是错的）：Sk=40 坏行
+的 stats/OTmp 也坏 → 逐级回溯到 **段1 S 本身错**。错误模式数值上极其干净：
+**S(t) = Q(t+k)·K(t)，k∈{1,2}，K 恒为本头**——受害 tile 的全部行精确等于"Q 取自
+t+1/t+2 头"（b0 t5: ref×7/6 精确 0.0000；b1 t5: ref×8/6；b1 t6: ref×8/7）；受害 tile
+集合随时序漂移（t6 旧 .so: b0{6}b1{5,6}；t8 新 .so: b0{5,6}b1{5,6}）。
+**根因**：BlockMmadQK 的 l1A 无跨调用保护——loadQGM 的 MTE2 写 l1A 与上一 tile 的
+copyL1ToL0A（MTE1 读 l1A）之间零事件。FAInfer 原版安全是**侥幸**：loadQGM 与上次 L1A
+读取隔整个 KV 长循环（数百条指令的天然时序隔离，且 qk_matmul.hpp 与 v3 原版逐字节
+一致——隐患是继承的）。SplitB 的 tile 循环把两者紧挨 → MTE2 越序提前覆写 l1A，Mmad
+消费到未来 tile 的 Q。L0 侧乒乓与 l1B（K）侧守卫矩阵完整推演无恙（l1B 有
+Wait<MTE1_MTE2>→copy→Set<MTE2_MTE1> 完整惯例，qk_matmul.hpp:264）。
+**修复（mha_fwd_splitb.cpp 段1 循环，loadQGM 前）**：仿 l1B 惯例补
+`Set/Wait<MTE1_MTE2>(EVENT_ID5)`（预置块已含 → 首次即时；Set/Wait 相邻自配对；与
+QK/PV 的 l1KvPingPongFlag{0,1} 无生命周期交叠）。**用户重编后战果（iters=2）**：
+- **Bug③b（Sk=40/80/112）**：Sk=40 4096 错→**0 错**；Sk=48 对照不受扰；Sk=80 大幅
+  缩小（残余：4/5 轮 5 个确定性 ULP + 1/5 轮 69 错 max 0.44 罕见竞争，b1 s0 h6，待查）；
+  Sk=112 LSE 全对、O 残 10 个确定性 0.0625（=2 ULP，两轮逐位同，量化语义类）。
+- **Bug④（B128 Sq64 H8）**：单核与多核**逐位一致**：LSE 0 错、O 640 错全部 =1 fp16
+  ULP(0.0312) 确定性残差（ref 一次取整 vs kernel fp16 中间量化；测试阈值 1e-2 对量级
+  ~40 的 fp16 过严）。用户前一晚观察的"多核大败(1148+76718, max 3.75) vs 单核近净"
+  = 同一竞争的 20 核放大，就此统一销案。
+- **Bug②（H4/H8 Hkv1 128×128，原 41% 确定性）**：LSE 全对，O 残 17-34 个 1-2 ULP
+  确定性（0.03%）。#44.49 记的"b1 tile2 dump≈ref×7/6"正是同款签名（当时未识破）。
+- **Bug③a（奇数 Sq）不受此修复影响**，但行直方图探针（/tmp/probe_sq31.py 思路）把
+  签名完全规律化：**每个 AIV 行范围 R 的非整 8 尾块 [8⌊R/8⌋, R) 整块损坏**（O/LSE 同坏
+  →stats 级）：Sq=31 AIV0(15 行) 坏 s8-14；Sq=33 AIV1(17) 坏 s32；Sq=17 AIV1(9) 坏
+  s16；Sq%16=0 全净。确定性逻辑 bug（softmax/行尾块路径），另加罕见满块内散点错
+  （Sq=33 的 s12/24/26、Sk=80 的 1/5 轮）疑残余竞争，待查。
+**遗留**：① Bug③a 尾块逻辑（下一目标）；② 确定性 ULP 残差三处（640/10/17-34 个）——
+疑 divout Cast fp16 用 CAST_NONE 而非 RINT 的取整语义差（bf16 分支用 RINT，fp16 用
+CAST_NONE），待对照 FAInfer 原版定夺；③ Sk=80 罕见竞争。教训：**"上游逐级验证只看了
+b0 tile0"是本次绕路主因——受害 tile 与验证 tile 不重合时，"阶段正确"结论不可外推**；
+数值取证脚本（analyze_t6_sk40.py 的候选假设对拍法）值得保留为 debug 常备。
+
+**#44.50**｜**【t2 排障续】Bug① 修复验证通过；Bug④=纯时序竞争（~40%/launch）定性；"case1 毒化"证伪（2026-08-25）**：
+用户重编后 t2（pytest 8 败/15 过）+ `--batch 64 --heads 8 --kv-heads 4` [LSE] PASS×3
+——**Bug①（tv 重叠）修复验证通过**：GQA 组 6 例全转绿。
+**t2 剩余 8 败分类**：Bug②③ 5 例（case5/7/8、kvc3 已知确定性）+ **Bug④ 4 例**
+（case2/mc/kvc4/case12——ramp 干净、单进程随机数据多轮也净的"玄学失败"）。
+**Bug④ 排查（否定实验链）**：新进程随机 2 seeds×4 形状全净；8MB 金丝雀哨兵无损伤
+（无野 OOB 写）；串联两形状 kernel/直连两测试函数全过；pytest case1+case2 复现败、
+case0+case2 过（一度判"case1 毒化"）；**同进程同形状 8 连跑 3/8 败 → 毒化证伪**；
+12 连跑（先建后释放=恒新块）全过 vs 测试函数 3/6 败 + **empty_cache 变体 2/6 败**
+→ 与内存内容无关，**纯时序**（分配模式只改时序）。错误形态：O 随机行垃圾
+（max≈9.8 未归一化量级、~0.9% 元素）+ 少量 LSE 错 = 个别行读到陈旧 stats/OTmp；
+--dump 掩盖（观察者效应，同 #44.34）。批间协议静态复查无硬伤（flag 固定 ID =
+FAInfer 同款；slot 复用 b→b+2 的 MTE2 in-order 论证均"安全"）——真根因待查
+（疑 -O2 Scalar 与 V/MTE 跨管道发射乱序类，#44.6/#44.10 同族）。
+**经验**：①"同形状一过一败"+ramp 净 ≠ 污染，先量化失败率（n≥8）再下结论；
+②empty_cache 可判别内容依赖 vs 时序依赖；③mc/case12/kvc4 与 Bug④ 同源概率大。
+
+**#44.49**｜**【t1 排障】三个独立 bug 定位：①多头 LSE tv 重叠（已修）②Sk>64 QK 错 ③列尾 QK 错位；附带发现调试脚本 GQA 假测（2026-08-25）**：
+t1（pytest splitb 37 例 15 败）逐组复现排查（FA2 conda 环境 + 修后脚本）：
+**脚本假测事故（先修工具）**：test_splitb_stage_full.py 的 make_ref 曾用 **H 而非 Hkv**
+建 k/v（Hkv 恒=H、G 恒 1）——**GQA 从未被真正测过**（t60 全绿只覆盖 G=1！）。host 666
+行实证（Hkv=8 传入）。已修：k/v 用 Hkv + K/V 按 kv 头平移可区分错头 + 金标
+repeat_interleave 展开（H≠Hkv 时 matmul 崩）+ run_kernel 补 [LSE] 张量级校验。
+**Bug①（已修）多头 tile LSE 错**（pytest GQA 组 6 例：O 全对 LSE 12-34% 错）：
+- 签名：ramp 复现 B=64 G=2 → 仅 h6/h7（末 tile）× s0-23 错、O 精确、B=2 干净、
+  **--dump 即掩盖**（时序敏感）；B=3/4/5/8 递进 → 除末 batch 外全中 → 污染窗口
+  = b+2（同 ping-pong 槽）。
+- 变形状探针三连实证 tv 重叠理论：Sq=48(G=2) 坏行上边界 s39/40 = ②除数区
+  tv[0,384) 与 ⑤LSE区 tv[64,448) 的重叠边界；qnbt=4 时 h_local1 坏数恰为
+  h_local0 一半（仅 s0-7 落重叠区）。
+- 根因：divout ② Div 除数广播占 tv[0, R×8)（R=每AIV行数≤64→512 float），
+  ⑤ LSE Brcb/gather 区仅偏移 FLOAT_VECTOR_SIZE=64 → **两区在 [64,512) 重叠**；
+  下一 tile 的 ② Brcb 覆写重叠行污染 ⑤ gather 源（#44.6 修 WAR 时偏移不足）。
+- 修复：LSE_TV_FLOAT_OFFSET = (ROW_NUM_MAX/2)×8 = 512，⑤ 两个用点（Brcb dst +
+  gather src）成对平移——**分区彻底不相交**，不依赖事件链排序（tv 区 2560 float
+  余量充足）。待编译验证。
+**Bug② Sk>64 段1 QK 错（未修）**：Sk=96（12.5% O 错）/Sk=128+Hkv=1（42%）复现；
+Sk≤64、Sk=48 全净；Sq 无关。七项 dump（t5_sk96.log）：**S 本身错**——部分 tile
+全零、部分值错（b1 tile2 dump≈ref×7/6）。疑点：QK 的 K 列 L1 切分（kDynNum/
+maxQKPL1Size 公式，mha_fwd_splitb.cpp:186-192）或 L1Tile N 覆盖。
+**Bug③ 列尾 QK 错位（未修）**：Sq=33 Sk=47 复现（O 33% + NaN 末行 s32 + LSE 35）；
+Sk=47 单独也错（31%）、Sq=33 单独也错、Sq/Sk=16/32/48 全净。dump（t5_odd.log）：
+**S 列错位一列**（dump s1j1 = ref s1j0）+ b1 首行全零——QK 尾列（非 8 对齐）与
+尾行（奇数行）的 operand 装载问题。
+**未复现（疑 Bug① 同源或数据依赖，修复后复测）**：case2（B128 64×64，ramp 净）、
+case12（D=128，ramp 净）、kvc3/kvc4（同形状 fwd 过 kvc 败）。
+pytest 失败 → bug 映射：GQA 组→①；case5/7/8→②③；case2/12/13/15/kvc/mc→待①修
+后复测（①的污染值会写进 LSE GM，可解释部分跨例残留）。
+另：pytest 默认**单核**（usedCoreNum=1，仅 test_fa_splitb_multi_core 设 MULTI_CORE）。
+
+**#44.48**｜**【官方测试接入】闸门规范化 + 默认启用 + fwd_kvcache 路由 + pytest 样例（2026-08-25）**：
+用户指令：在 tests/test_flash_attn_npu_v2.py 为几个前向接口补 SplitB 样例、触发进入
+kernel（规范测试模式）；完善 flash_api（此前仅 fwd 一个接口路由）；回顾触发条件
+（主条件 max(sq,sk)≤128，参照标准实现补附加条件）。通宵完成，**待用户编译+跑测**。
+1. **闸门重构（splitb_host.hpp）**：拆成三层——
+   - `features_supported`（硬约束，FORCE 也不绕过——未实现分支进入即静默错数）：
+     无 causal/SWA（kernel 仅 NO_MASK 分支有计算体）、无 softcap（ApplySoftcap 已照抄
+     但未上板验证）、dropout=0、无 return_softmax；
+   - `shape_supported`：主条件 **max(Sq,Sk)≤128**（参考 alignedS2≤128 的收紧版，同时
+     覆盖 alignedS1=Q_TILE_CEIL 单 tile 边界）+ **D≤128**（OTmp 区设计上限）+ 照搬
+     TilingB::IsCapable 两条件（alignedS2≤128、N2×G×alignedS1×alignedS2×dtypeB≤128KB，
+     tiling_general.cpp:3137-3150）；
+   - `route_splitb`（flash_api 调用）：DISABLE→false；FORCE→绕形状闸门（功能面不绕）；
+     否则 shape_supported。**默认启用**（S3 完成+#44.47 多核全绿，取代骨架期默认关）。
+   顺带修正：旧 env_enabled 的 FORCE 实际不绕过 should_use（文档宣称"无视条件强制开启"
+     但实现是 && 关系）——route_splitb 落实文档语义。
+2. **flash_api 扩展**：`mha_fwd_kvcache` 增加 SplitB 路由（fwd 接口已有）——条件：
+   非 paged、无增量 k/v、无 cache_batch_idx、q/k/v 全连续、各 batch kv 等长（min==max，
+   本 kernel 按均匀 s2Size 迭代）+ 闸门通过；分支内自建 softmaxlse [B,H,Sq]，不耗旧路径
+   workspace。varlen 不路由（TND 布局，代码内注释说明）。触达接口：fwd、fwd_kvcache。
+3. **dispatch printf 收敛（fwd_splitb_dispatch_impl.hpp）**：3001/3002/3003 裸 printf
+   补 FLASH_ATTN_SPLITB_DEBUG 门（默认启用后每次调用 3 行噪音，#44.45 漏网）。
+4. **pytest 样例（tests/test_flash_attn_npu_v2.py 末尾新增 4 个测试）**：
+   - `test_fa_splitb_fwd`×16：基线/单头/B=1024/满 tile(H≤4，blockB 上限)/Sk≠Sq/
+     非 16 对齐(33,47)/GQA G=2,4,8（多头 tile 首测）/D=128/bf16（首测）；
+   - `test_fa_splitb_kvcache_dense`×5：dense 非 paged 均长（fwd_kvcache 路由）；
+   - `test_fa_splitb_multi_core`：monkeypatch MULTI_CORE（host 逐次读 env，非静态）；
+   - `test_fa_splitb_routing_gate`：capfd 断言 host 标记——触发形状必现
+     "entering SplitB path (fwd)"/"(fwd_kvcache dense)"、Sk=256 必不出现（路由确认入测）。
+   闸门自检脚本 22/22 通过（21 正例路由+1 负例回退）；py_compile 通过。
+   复用 ref_flash_attention 对拍 O+LSE（return_attn_probs=True 时 wrapper 端
+   return_softmax=probs and dropout>0 恒 False，不触 C++ 拦截，LSE 可取）。
+5. **既有套件回归安全**：默认启用不扰动存量用例——全部存量 fwd/kvcache 用例 Sk≥512
+   （>128）或 paged 或 causal，闸门全部回退旧路径；仅新增样例触达 SplitB。
+   **待办**：用户编译（改动=2 头文件+flash_api.cpp+dispatch impl+tests，无新 TU）→
+   `pytest tests/test_flash_attn_npu_v2.py -k splitb` → 全套件回归。
+
 **#44.47**｜**【多核首测全通过】B=4→1024 × 20 核全 pass；B=128 挂死销案（2026-08-24）**：
 t60 系列（用户跑，`--multi-core --debug`，无 dump）：B=4（×5 重复）/10/30/60/100/128/
 512/1024 全部 `[OUT] max_err=… PASS`。证据：host 打印 coreNum=20 splitF=52（20 核 ×
@@ -1272,6 +1395,18 @@ MTE3 的 LSE gather 可能读 Brcb 写入前的旧 tvUb → LSE 错。已修（�
 SetFlag 之间**（FAInfer 的屏障常散落在函数中间，逐行对照才能发现）。
 
 ---
+**#28**｜**工具 bug（bench2.py）：fwd 多传一个尾参 → 全量 ERR，且错误信息被吞**
+现象：bench2.py 全部 36 配置 fa 列 ERR、baseline 正常。
+根因：`.so` 的 fwd 恰好 **13** 个位置参数（对照 flash_attn_npu_interface.py wrapper 的
+调用逐字段核实）；bench2.py 传了 **14**（尾部多一个 None）→ 每次调用 TypeError
+被 try/except 吞成 ERR。且脚本把错误存进 fa_v2_error 字段却**从不打印**——
+错误不可见导致误判为 kernel 问题。
+修复：① 去掉多余尾参（13 参数，附 wrapper 对照注释防再犯）；② 打印首个错误信息；
+③ _load_fa 改为优先加载**本地构建**（仓库 in-place .so，含 SplitB）——site-packages
+的 arch22_v2 是陈旧安装版，测不到新路径；失败才回退。
+预防：**直接调 .so 的脚本必须与 wrapper 的调用逐参数对齐**（wrapper 是 schema 的
+活文档）；吞异常的 bench 必须打印首个错误，否则 ERR 列零信息。
+
 ## 四、待解决（追踪中）
 
 - **挂死收窄（2026-08-18）**：stage3 单核 ✓ 通过；stage0 全真实 4 核 ✗ 挂。

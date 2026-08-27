@@ -381,7 +381,7 @@ namespace SplitB {
             uint32_t kvSIdx = 0;            // 单 KV 栈（S2 不切分）：栈索引恒 0
             uint32_t kvSLoopNumTotal = 1;   // 栈数恒 1
             // FIXME: 理论而言，进入本kernel的QS不超过128，因此该循环次数最多为1次
-            for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) { // FIXME: 原先基于128的设计应该也考虑到UB的空间限制，但是限制QK计算相对独立，能否增大每次计算的tile大小，以减少循环次数？（128 是 L1/L0 硬件约束而非 UB 约束——L1TileShapeQK::M=Q_TILE_CEIL=128 与 L0A ping-pong 容量决定；要增大 M 需改共享 catlass tile 定义 + L1 预算公式，建议 S5 性能项评估，devlog #38 附记）
+            for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) { // FIXME: 原先基于128的设计应该也考虑到UB的空间限制，但是现在QK计算相对独立，能否增大每次计算的tile大小，以减少循环次数？（128 是 L1/L0 硬件约束而非 UB 约束——L1TileShapeQK::M=Q_TILE_CEIL=128 与 L0A ping-pong 容量决定；要增大 M 需改共享 catlass tile 定义 + L1 预算公式，建议 S5 性能项评估，devlog #38 附记）
                 for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                     const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
                     const uint64_t gmQ = static_cast<uint64_t>(boIdx) * qSeqlen * strideQ +
@@ -396,6 +396,17 @@ namespace SplitB {
                     LayoutS layOutS(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
                     uint32_t singleHead = tg.qNBlockSize;   // loadQGM 引用参数
                     uint32_t qHeadsP = static_cast<uint32_t>(qHeads);
+                    // l1A 跨 tile 覆写保护（Bug③b 根因，devlog #44.51）：BlockMmadQK 对
+                    // l1A 的 MTE2 写（loadQGM）没有跨调用事件——FAInfer 原版 loadQGM 与
+                    // 上一 tile 的 copyL1ToL0A(MTE1 读 l1A) 之间隔整个 KV 长循环（天然
+                    // 时序隔离）；SplitB 的 tile 循环两者紧挨，MTE2 可越序提前覆写 l1A，
+                    // 本 tile 的 Mmad 消费到未来 tile 的 Q（实测 S(t)=Q(t+1~2)·K(t)，
+                    // 受害 tile 随时序漂移）。仿 B 侧 copyGmToL1B 前的 Wait<MTE1_MTE2>
+                    // 惯例（qk_matmul.hpp:264）：先等 MTE1 排空再发 MTE2 写 l1A。
+                    // EV5：预置块已含 MTE1_MTE2(0-7)（首次 Wait 即时通过）；Set/Wait
+                    // 相邻自配对，与 QK/PV 的 l1KvPingPongFlag{0,1} 无生命周期交叠。
+                    AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
                     blockMmadQK.loadQGM(gQ[gmQ], layoutQTemp, tg.rowNum, singleHead, qHeadsP);
                     GemmCoord actualBlockShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
                                                 static_cast<uint32_t>(embed)};
@@ -582,6 +593,18 @@ namespace SplitB {
             // 一个 CUBE 侧（段3 被 continue 跳过）永远不会 set 的 flag 而挂死）
             if (!softmaxOnly) {
                 Arch::CrossCoreWaitFlag(pvReady);   // 每 batch 一次
+                // Bug③a 根因②（devlog #44.52）：本 AIV 的 softmax stats 写（MTE3）与
+                // divout LoadStats（MTE2）间缺 MTE3→MTE2 依赖。softmaxReady 双 AIV 各自
+                // set、CUBE 单次 wait=先到先释：AIV0 先排空即放行整条链，本 AIV（AIV1）
+                // 末 tile stats 尾块可仍未落地 → LoadStats 读到未初始化值（t12 实证：
+                // LSE≈ln(3e29)、O 隐含除数≈74；GM stats 终态正确=写晚到非写错）。P 无此
+                // 问题：PV 按 tile 序消费天然掩蔽；stats 是段首整读且末 tile 写最靠后。
+                // 对齐分摊（同文件 #44.52 根因①）后 stats 写/读分区按 AIV 严格对应，
+                // 本 AIV 自排空（Set 入 MTE3 队列于全部 stats 写之后）即全覆盖。
+                // evId=2×subIdx 与 divout 逐 tile 的 MTE3_MTE2 链同 id：本对自配对
+                //（Set 随后即 Wait），不干扰 tile 间 Set(t)→Wait(t+1) 收支。
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(2 * AscendC::GetSubBlockIdx());
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(2 * AscendC::GetSubBlockIdx());
                 if (debugFlag) {
                     AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 4444444444\n", coreIdx,
                                     AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
@@ -656,7 +679,7 @@ namespace SplitB {
                         uint32_t shapeD[2] = {tgd.rowNum, dPad};
                         AscendC::ShapeInfo infoD(dimD, shapeD);
                         AscendC::DumpTensor(gS[tileBase + sTileElems], descO,
-                                            (tgd.rowNum / 2) * dPad, infoD);
+                                            tgd.rowNum * dPad, infoD);   // 全行（Bug③a 取证：尾行从未被验证，devlog #44.52）
                         AscendC::printf(
                             "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..rows)+sum[128..128+rows) desc=%u\n",
                             coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
