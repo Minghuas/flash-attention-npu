@@ -16,7 +16,7 @@
 #include "catlass/gemm/block/block_mmad.hpp"
 #include "pv_matmul.hpp"
 #include "qk_matmul.hpp"
-#include "CombineScale.hpp"
+#include "combine_scale.hpp"
 #include "catlass/gemm/dispatch_policy.hpp"
 #include "fa_block.h"
 #include "catlass/gemm/gemm_type.hpp"
