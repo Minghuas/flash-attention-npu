@@ -797,6 +797,99 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.53j**｜**t17 定案：l1A 守卫被发射乱序穿透（撕裂首行）；PipeBarrier 补强（2026-08-30）**：
+用户否决栅障方案（FAInfer 同拓扑无栅障且生产可靠——成立，我方时序上混叠亦不可能：
+AIV 发 Set(b+1) 前必经 pvReady(b)→CUBE 已消费 smr(b)；#44.53i 撤回）。转向实现层
+（用户指示：怀疑 softmax/divout 特定 shape）。最小复现 B4-H8（H2/H4/H6 净——≥8
+tile/批，老 Bug④ 同前置）。T17 采数（S/P/OTmp/O/LSE 大 dump 暂关让预算，stats 三
+时刻族全存）：**890（softmax 写出时刻）即错**——目标 (b,h) 的 AIV0 分区前 1-3 行
+max/sum 双错，比值精确 **(h+2)/(h+1)**（h6→8/7、h5→7/6）= S 行首算进 Q(h+1)：
+l1A 撕裂残影（MTE2 覆写开局略领先、MTE1 反超 → 仅前几行新值）。EV5 守卫被穿透的
+机理 = loadQGM 的 DataCopy 发射被 -O2 提到 WaitFlag 前（#44.10 族，softmax
+CopySGmToUb 同款问题的镜像）。修复 = Wait 后补 `PipeBarrier<PIPE_MTE1>`（仓库既有
+惯例，标量硬等 MTE1 排空）。若不愈的备选：L0A 槽 M_MTE1 set 早燃语义。分析器
+debug/analyze_t17.py（注意：890 须按 printf 头 sub/off/n 解析，按出现序猜会误报
+——t17 首版教训）。
+
+**#45.2**｜**t19 dump 裁剪 + desc 撞号修复 + 取证样例纠偏（2026-08-30）**：
+用户压缩样例（B3 H4 Sq32 Sk96 ×3 --dump）两个问题：①dump 族太多（11 族 411 条）无法
+分析，且 S 族丢 8/12 条、逐 desc 期望清单噪声大；②**发现 desc 撞号**：880+10b（段4 入口）
+与 890+10b'（softmax stats）在 b≥1 重叠（集合里 890-893/900-903 双义）。③压缩样例
+3 iter 全 PASS——H4=4 tile/批低于触发前置（≥8 tile/批，#44 系最小复现=B4-H8），
+**取证必须保 H8**。裁剪（kernel 重编译生效）：在役族收敛为 100(S 全行)/200(P 全行)/
+890/930(softmax 写出 stats)/700(段4 入口，880 改号)；关 OTmp@600/stats 终态@330/
+O@400/LSE@450/divout UB 视图@800（`if (false &&` 门 + [T19 精简] 标记，恢复去 false）。
+脚本 test_splitb_stage_full.py --log：紧凑族报告（只列已采集族+缺失合并一行）；
+S/P 改**全行比对**（原只比 AIV0 半区——AIV1 分区坏点一直漏检！）；缺失 tile 双侧
+跳过（原填 0 制造假阳性）；未采集族自动 skip（不再假 ✗）。analyze_t17.py：shape 自
+日志 [splitb host] 行解析（--debug 轮）或 CLI 尾参（B Sq Sk H Hkv D，避免 dump 轮
+被迫开 printf 观测效应）；新增 S@100 撕裂裁决（对 golden s_raw 全 tile，比值打印）。
+推荐取证命令：B4 H8 Sq32 Sk96 --iters 8 --dump（最小复现形状；4 核×~108KB/调用，
+任何预算口径下均安全）。
+
+**#45.1**｜**v2 流水首验证：架构成立（无挂死/经典例全对）；Bug⑥ 存活，#44.53j 判不充分（2026-08-30）**：
+用户首轮测试：①B2 H8 Sq9 Sk47 ×8 全 PASS，printf trace 与设计逐行吻合（哨兵/doReady
+收支全对）——**v2 错位流水机械结构成立**；②B4/B16 Sq9 Sk128 PASS（max_err=0.0625
+nbad=0 逐迭代恒定 = 大量级点 fp16 1-ULP 量化路径差，良性，非 bug）；③B16 H8 Sq32 Sk96
+×8：iter0 过、iter1-7 LSE FAIL（nbad 9-54，argmax h1/h5-h7，s=31/s=2）+ 大误差轮 OUT
+FAIL——**Bug⑥ 残余家族原样存活，PipeBarrier<PIPE_MTE1>（#44.53j）首次受检即证不充分**。
+新判别线索：**Sq9 全净 vs Sq32 必挂**——Sq9 的 rowSplit=RoundDown(9/2,8)=0 ⇒ AIV0 分区
+0 行（softmax/divout 全由 AIV1 干），Sq32 双 AIV 各 16 行。若根因纯 CUBE 侧（QK 内部
+l1A），与 AIV 行分摊无关、Sq9 不该全净 ⇒ **AIV 侧假设升温**。CUBE 侧静态复核（本轮
+重读 qk_matmul.hpp 全舞步）：l1A 单缓冲但调用内 copyL1ToL0A 被 Set/Wait<MTE1_M>(ID0)
+闸死、返回前必完成 ⇒ 跨调用守卫（EV5+PipeBarrier）按序闭合；L0A 槽机制若早燃比值应
+为 (h+3)/(h+1)（隔 2 tile 共槽），与 t17 实测 (h+2)/(h+1)（l1A 边界独有指纹）不符；
+QK/PV 事件 ID 共号（MTE1_MTE2{0,1} 等）经 MTE1 FIFO 论证良性（v1 B128 位同佐证）。
+矛盾待数据裁决：t19 取证（S@100 恢复 dump）——S 撕裂→CUBE 侧（需查文档
+SetFlag<MTE1_MTE2> 置位时机）；S 净+890 错→AIV 侧 softmax 读/算路径。
+
+**#45**｜**【架构转折 v2】批内四段串行 → 批间错位流水（用户点破参考 3 槽设计，2026-08-30）**：
+用户发现底层架构错误：我方 `for (boIdx) runMainLoop(boIdx)` 把四段在**批内**串成死锁式
+握手（QK(b)→qkReady→softmax(b)→softmaxReady→PV(b)→pvReady→divout(b)）——CUBE 算
+QK 时双 AIV 全停、AIV 算 softmax 时 CUBE 全停，每批 3 次全停握手，双单元各空转近半；
+而参考 Process()（bn2gs1s2_b.h:569）保持 **3 个在飞 boIdx**（extraInfo[3]，taskId%3
+轮转）。参考机制拆解：KERNEL_TYPE_MIX_AIC_1_2 下每个 AIV 子核独立跑一份 Process()，
+matmul 高阶 API **发射/等待分离**（IterateBatch 异步发射给共享 AIC，WaitIterateBatch
+才是同步点）——迭代 t 内 BMM1(bo_t)∥Vec1(bo_{t-1})∥BMM2(bo_{t-1})∥Vec2(bo_{t-2})。
+我方 catlass 低阶栈无异步发射 API，但错位结构可用**双程序 + mode2 flag** 直接表达
+（形态更简，本质相同）：
+```
+CUBE 迭代 t：QK(bo_t) → wait sm(bo_{t-1}) → wait do(bo_{t-3}) → PV(bo_{t-1}) → set pv
+VEC  迭代 t：wait qk(bo_{t-1}) → softmax(bo_{t-1}) → set sm → wait pv(bo_{t-2}) → divout(bo_{t-2}) → set do
+```
+稳态重叠：QK(bo_t)∥softmax(bo_{t-1})、PV(bo_{t-1})∥divout(bo_{t-2})。**死锁自由可证**：
+所有跨核等待只指向对方核的上一个迭代（C(t)←V(t-1)、V(t)←C(t-1)），依赖严格递减无环。
+**flag 收支**（每批严格 1:1，跨 launch 无泄漏，#44.53g 教训）：qk(CUBE set→双 AIV wait)、
+sm(双 AIV set→CUBE wait)、pv(CUBE set→双 AIV wait)、**do(双 AIV set→CUBE wait，[#45]
+新增 ID4）**。doReady 的存在理由 = OTmp 槽回收：PV(bo_{t+1}) 覆写 O 槽前必已消费
+do(bo_{t-1})。S/P 槽免新 flag：S 槽由"CUBE 迭代序消费 sm(bo_{t-2})"保护、P 槽由
+"AIV 程序序消费 pv(bo_{t-2})"保护。**哨兵迭代**：CUBE +3 轮（排空 PV 尾 + 补齐 doReady
+尾部 2 消费）、VEC +2 轮（排空 divout 尾）。守卫表：QK[t<n]、smWait[1≤t≤n]、
+doWait[!smOnly∧t≥3]、PV[!smOnly∧1≤t≤n]；SM[1≤t≤n]、DO[!smOnly∧t≥2]。
+**结构重排**：runMainLoop → StageQK/StageSoftmax/StagePV/StageDivOut 四个纯计算段
+（跨核 flag 全部上移流水驱动循环，一屏可见）；GM 布局（#44.44 的 2 槽解耦）与
+host 公式零改动；softmaxOnly 模式收支兼容；Bug⑥ 的 l1A PipeBarrier（#44.53j）原样
+保留于 StageQK；T17 暂关的三处 dump 门恢复。v1 归档于
+csrc/archive/mha_fwd_splitb_archive.cpp。**[需 NPU 验证]**：正确性（pytest splitb 23 例
++ B4/B64 探针 ×8）与性能（bench2 对比 v1 的 1.27-2.19x 基线，预期小 S 再显著提升）。
+若挂死：debug printf 探针已按流水迭代号 t 标注（S1/S2/S3/S4 + before/after wait），
+最后一条输出即定位到下一个 wait。
+
+**#44.53i**｜**Bug⑥ 残余家族机理 = 模式2 计数器跨批混叠；模式1 AIV↔AIV 栅障修复（已撤回，见 #44.53j）（2026-08-29）**：
+挂死全清后残余：pytest 两败（32-96：16551 点 max 9.65；33-47：947 点 max 9.14 @
+s32 h6）+ B64 探针两形状 8/8 全中（32-96 LSE-only 1-26 点 0.016-0.19 / O 净；33-47
+LSE+O 双坏 0.1-1.5 波动）+ B2 偶发（Sq9/Sq31 iter0、Sq33 iter2）。PV l1A 静态排除
+（自带 STAGES 双缓冲 + Wait/Set<MTE1_MTE2> 完整舞步，与 QK 裸单缓冲不同构）。
+**机理（基于官方计数器语义推理）**：双 AIV 间无锁步，快 AIV 的 softmaxReady(b+1)
+Set 可先于慢 AIV 的 Set(b) 落地 → 计数器先到 2 → CUBE Wait(b) 被顶替放行 → PV(b)
+读到慢 AIV 未写完的 P/stats。指纹全吻：b+2 共槽 ⇒ 旧值量级相近 ⇒ LSE 小误差而非
+垃圾；LSE-only = max 旧 sum/O 不变；B64 每轮中/B2 偶发；h5/h6 末 tile 滞后最大；
+iter0 冷启动偏置；Sk=96 softmax 重滞后大、Sq=9 AIV0 零工作狂奔两个极端形状必中。
+qkReady/pvReady 无洞（CUBE 被 softmaxReady 反压，时序不可超前）。
+修复：段2尾 softmaxReady Set 后加 `Arch::CrossCoreBarrier<0x1, PIPE_MTE3>()`（catlass
+包装 → 保留 ID 10 AIV_INTER_SUBBLOCK_BARRIER，双 AIV 各 Set 各 Wait 批内自闭合，
+计数 ≤2 不触 15 上限）。语义依据 = 官方文档模式1 + 仓库先例（新 API 规则首例）。
+
 **#44.53h**｜**官方 API 文档破案（用户提供）+ Sq=9 挂死 = 0 行 stub 死代码首次执行（2026-08-29）**：
 用户提供 CANN CrossCoreSetFlag 官方文档，三决定性语义：①**模式 2 = 双 AIV 计数器**
 （两个 AIV 都 set 后 AIC 的 wait 才放行；AIC set 一次 → 双 AIV wait 都放行）——

@@ -1,32 +1,48 @@
 /**
  * Copyright (c) 2026, perf-shortSeqLargeBatch project.
  *
- * SplitB 前向 kernel（大 Batch 小 SeqLen 场景）——方案 B 重构版（devlog #34）。
+ * SplitB 前向 kernel（大 Batch 小 SeqLen 场景）——批间错位流水版（架构 v2，devlog #45）。
+ *
+ * 【架构 v2：批间错位流水（2026-08-30，用户点破 + 指定参考）】
+ * v1（#34，已归档 csrc/archive/mha_fwd_splitb_archive.cpp）为"批内四段串行握手"：
+ *   for (boIdx) { QK(b) → qkReady → softmax(b) → softmaxReady → PV(b) → pvReady
+ *                 → divout(b) }——CUBE 与 VEC 每批交替全停 3 次，双单元各空转近半。
+ * 参考实现（flash_attention_score_bn2gs1s2_b.h:569 Process()，KERNEL_TYPE_MIX_AIC_1_2）
+ *   为 3 个在飞 boIdx 的软件流水（extraInfo[3] + taskId%3；发射/等待分离）：
+ *   迭代 t 内 BMM1(bo_t) ∥ Vec1(bo_{t-1}) ∥ BMM2(bo_{t-1}) ∥ Vec2(bo_{t-2})。
+ * 我方 catlass 低阶栈无异步发射 API，但其"错位结构"可用双程序（CUBE/VEC 各一条
+ *   指令流）+ mode2 flag 直接表达——本质相同，形态更简：
+ *
+ *   CUBE 迭代 t：QK(bo_t) → wait softmaxReady[sm(bo_{t-1})] → wait doReady[do(bo_{t-3})]
+ *                → PV(bo_{t-1}) → set pvReady
+ *   VEC  迭代 t：wait qkReady[qk(bo_{t-1})] → softmax(bo_{t-1}) → set softmaxReady
+ *                → wait pvReady[pv(bo_{t-2})] → divout(bo_{t-2}) → set doReady
+ *
+ *   稳态重叠：QK(bo_t) ∥ softmax(bo_{t-1})；PV(bo_{t-1}) ∥ divout(bo_{t-2})——
+ *   双单元满载。所有跨核等待都只指向对方核的【上一个】迭代 ⇒ 依赖图严格递减，
+ *   无环（死锁自由可证）。哨兵迭代（CUBE +2 / VEC +1）排空在飞批并补齐 flag 收支。
+ *
+ * 其余（文件形态/算法层/机制层/tile 模型/调试设施）均承袭 v1，见下。
  *
  * 文件形态照抄 FAInfer mha_fwd_kvcache.cpp（用户要求，便于长期扩展）：
  *   namespace SplitB 内定义 SplitBKernel 模板类（空构造 + operator()(FAIKernelParams const&)
- *   + runMainLoop + 成员变量），文件尾部模板入口函数 FAInferSplitB 组装类型并调用。
+ *   + 四个 Stage 函数 + 成员变量），文件尾部模板入口函数 FAInferSplitB 组装类型并调用。
  * 算法层照搬 ops-transformer flash_attention_score_bn2gs1s2_b.h（TilingB）：
- *   核间只切 B 轴；S2 不切分（单遍 softmax、无 rescale 状态机）；每 batch 四段流水：
+ *   核间只切 B 轴；S2 不切分（单遍 softmax、无 rescale 状态机）；每 batch 四段：
  *   QK(整批) → softmax(整批) → PV(整批) → divout(整批)；workspace ping/pong 按 boIdx 奇偶。
  * 机制层用 FAInfer 已验证范式（D7）：catlass BlockMmadQK/PV + __DAV_C220_* 显式双段 +
- *   CrossCoreFlag×3 + fftsAddr；核间 aic 基数。
+ *   CrossCoreFlag×4（qkReady/softmaxReady/pvReady/doReady）+ fftsAddr；核间 aic 基数。
  *
- * tile 模型照抄 FAInfer runMainLoop（mha_fwd_kvcache.cpp:513-541，用户 FIXME #2/#4）：
+ * tile 模型照抄 FAInfer runMainLoop（mha_fwd_kvcache.cpp:513-541）：
  *   每 batch 的任务 = (qSBlockIdx × qNBlockIdx) tile；rowNum = qSBlockSize × qNBlockSize
- *   一次打包多头（如 S1=64 时 2 头×64 行 = 128 行满 L1Tile M 维），blockMmadQK 内部
- *   处理打包行——不再有逐头双层循环。
- * softmax/divout 用 FAInfer 式封装 epilogue（splitb_softmax.hpp / splitb_divout.hpp，
- *   FIXME #5/#6）：operator() 内部按 qNBlockSize/subBlockNum 把行分摊给两个 AIV，
- *   SubCoreCompute 逐行块计算；行 max/sum 走 GM stats（四段批所需，不同于 FAInfer 的 UB 驻留）。
- *
- * 与 FAInfer 主体的映射差异（仅一处结构性）：FAInfer 的 runMainLoop 为单 tile 粒度
- * （任务 = batch×qNBlock×qSBlock 跨核轮转），SplitB 为单 batch 粒度（核间 B 轴切分 +
- * 四段批，devlog #32/#34）；tile 几何因此提为私有成员 GetTileGeom（四段各需一次）。
+ *   一次打包多头，blockMmadQK 内部处理打包行——无逐头双层循环。
+ * softmax/divout 用 FAInfer 式封装 epilogue（splitb_softmax.hpp / splitb_divout.hpp）：
+ *   operator() 内部按 qNBlockSize/subBlockNum 把行分摊给两个 AIV，SubCoreCompute
+ *   逐行块计算；行 max/sum 走 GM stats（四段批所需，不同于 FAInfer 的 UB 驻留）。
  *
  * S3 范围：NO_MASK / fp16 / bf16 / D≤128 / MHA+GQA 数据通路（causal/SWA 为 S4；
  *   softcap 已随 HAS_SOFTCAP 模板穿透 softmax epilogue）。
- * 设计规范：perf/design/splitb_integration.md（v3 §3）；决策记录 perf/devlog.md #34。
+ * 设计规范：perf/design/splitb_integration.md（v3 §3）；决策记录 perf/devlog.md #34/#45。
  */
 
 #ifndef MHA_FWD_SPLITB_CPP_
@@ -284,21 +300,145 @@ namespace SplitB {
                 batchEnd = batchSize;                                 // 末核尾裁剪（B 不整除核数时）
             }
 
-            // ============================ 批次循环 ============================
-            // 照搬参考 Process() 的四段批结构（devlog #32/#34）：
-            //   每次迭代内：CUBE 段1 QK 该 batch 全部 tile（catlass 逐 tile，rowNum 打包多头）
-            //              VEC  段2 softmax 全部 tile（epilogue 内部双 AIV 拆行，stats→GM）
-            //              CUBE 段3 PV 全部 tile（批次级等 softmaxReady 一次；自设满足内部 wait）
-            //              VEC  段4 divout 全部 tile（epilogue 内部双 AIV 拆行，O/LSE 散射）
-            // flag 每 batch 每 stage 一次；ping/pong 按 boIdx 奇偶。
+            // ==================== 批间错位流水（架构 v2，devlog #45） ====================
+            // 照参考 Process()（bn2gs1s2_b.h:569）的 stagger，把 v1 的"批内四段串行握手"
+            // 改为"批间错位"：CUBE 迭代 t = [QK(bo_t); wait sm; wait do; PV(bo_{t-1})]，
+            // VEC 迭代 t = [softmax(bo_{t-1}); divout(bo_{t-2})]。稳态重叠：
+            //   QK(bo_t) ∥ softmax(bo_{t-1})；PV(bo_{t-1}) ∥ divout(bo_{t-2})
+            // （v1 每批 3 次全停握手 → CUBE/VEC 各空转近半；v2 双单元满载）。
+            //
+            // 【同步拓扑】mode 2 双 AIV 计数器（官方文档实证 #44.53h），每批每 flag 收支
+            //   严格 1:1（跨 launch 无泄漏，#44.53g 教训）：
+            //   qkReady      CUBE set(PIPE_FIX，QK 全 tile 落 GM 后) → 双 AIV 各 wait 一次
+            //   softmaxReady 双 AIV 各 set(PIPE_MTE3，P/stats 落 GM 后) → CUBE wait 一次
+            //   pvReady      CUBE set(PIPE_FIX，PV 全 tile 落 GM 后) → 双 AIV 各 wait 一次
+            //   doReady      双 AIV 各 set(PIPE_MTE3，O/LSE 落 GM 后) → CUBE wait 一次 [#45 新增]
+            //
+            // 【槽位保护】2 槽 ping-pong（boIdx%2，#44.44 布局不变），三种中间量的覆写安全：
+            //   S 槽(t%2)：QK(bo_t) 覆写前置 = softmax(bo_{t-2}) 完成 ⇐ CUBE 迭代 t-1 的
+            //              sm wait 已消费 softmaxReady(bo_{t-2})（迭代序保证，无需新 flag）；
+            //   P 槽(t%2)：softmax(bo_t) 覆写前置 = PV(bo_{t-2}) 完成 ⇐ AIV 迭代 t-1 的
+            //              divout(bo_{t-2}) 前 wait pvReady(bo_{t-2})（AIV 程序序保证）；
+            //   OTmp 槽(t%2)：PV(bo_t) 覆写前置 = divout(bo_{t-2}) 完成 ⇐ CUBE 迭代 t+1 的
+            //              doReady wait（消费 do(bo_{t-2})）——doReady 存在的全部理由。
+            //
+            // 【死锁自由】所有跨核等待只指向对方核的上一个迭代（C(t)←V(t-1) 前半、V(t)←
+            //   C(t-1)），依赖严格递减 ⇒ 无环。哨兵迭代：CUBE 循环多 3 轮（排空 PV 尾 +
+            //   补齐 doReady 尾部 2 个消费）、VEC 多 2 轮（排空 divout 尾）。
+            const int64_t nBatches = (batchEnd > batchStart) ? (batchEnd - batchStart) : 0;
             if (debugFlag) {
                 AscendC::printf("[SB] c%u v%u enter: Batch range:(%u, %u) tile_nums=%u BBBBBBBBBBBBBBBBBBBBB\n",
                                 coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)batchStart, (uint32_t)batchEnd,
                                 curQNBlockNum * curQSBlockNum);
             }
-            for (int64_t boIdx = batchStart; boIdx < batchEnd; ++boIdx) {
-                runMainLoop(coreIdx, boIdx, globalTensors);
+
+#ifdef __DAV_C220_CUBE__
+            for (int64_t t = 0; t < nBatches + 3; ++t) {
+                const int64_t boQK = batchStart + t;        // 本迭代 QK 目标批
+                const int64_t boPV = batchStart + t - 1;    // 本迭代 PV 目标批
+                // ① 发射新 QK（先发射后等待——QK(bo_t) ∥ AIV softmax(bo_{t-1}) 是本流水的
+                //    核心重叠；S 槽覆写安全见上方【槽位保护】）
+                if (t < nBatches) {
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S1-QK 1111111111 bo=%u\n",
+                                        coreIdx, (uint32_t)t, (uint32_t)boQK);
+                    }
+                    StageQK(coreIdx, boQK, globalTensors);
+                    Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);   // 每 batch 一次（QK 全 tile 落 GM 后）
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S1-QK 11111EEEEEEE bo=%u\n",
+                                        coreIdx, (uint32_t)t, (uint32_t)boQK);
+                    }
+                }
+                // ② 消费 softmax(bo_{t-1})（PV 的数据依赖；t∈[1,n] 共 n 次，收支守恒）
+                if (t >= 1 && t <= nBatches) {
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333331111 before wait softmaxReady (sm of bo=%u)\n",
+                                        coreIdx, (uint32_t)t, (uint32_t)(boPV));
+                    }
+                    Arch::CrossCoreWaitFlag(softmaxReady);   // 每 batch 一次
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333331111 after wait softmaxReady\n",
+                                        coreIdx, (uint32_t)t);
+                    }
+                }
+                // ③ 消费 divout(bo_{t-3})（OTmp 槽((t-1)%2) 覆写保护；t∈[3,n+2] 共 n 次，
+                //    末 2 个为哨兵迭代——补齐尾部 doReady 消费，防跨 launch 计数泄漏）
+                if (!softmaxOnly && t >= 3) {
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333332222 before wait doReady (do of bo=%u)\n",
+                                        coreIdx, (uint32_t)t, (uint32_t)(boPV - 2));
+                    }
+                    Arch::CrossCoreWaitFlag(doReady);
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333332222 after wait doReady\n",
+                                        coreIdx, (uint32_t)t);
+                    }
+                }
+                // ④ 发射 PV(bo_{t-1})（t∈[1,n]；softmaxOnly 时整段跳过——含 doReady 侧
+                //    的配对消费/置位，#44.27/#44.28 的收支教训在流水版同样成立）
+                if (!softmaxOnly && t >= 1 && t <= nBatches) {
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 3333333333 bo=%u\n",
+                                        coreIdx, (uint32_t)t, (uint32_t)boPV);
+                    }
+                    StagePV(coreIdx, boPV, globalTensors);
+                    Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);   // 每 batch 一次（PV 全 tile 落 GM 后）
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 33333EEEEEEEEEEEE bo=%u\n",
+                                        coreIdx, (uint32_t)t, (uint32_t)boPV);
+                    }
+                }
             }
+#endif
+#ifdef __DAV_C220_VEC__
+            for (int64_t t = 0; t < nBatches + 2; ++t) {
+                const int64_t boSM = batchStart + t - 1;    // 本迭代 softmax 目标批
+                const int64_t boDO = batchStart + t - 2;    // 本迭代 divout 目标批
+                // ① softmax(bo_{t-1})（t∈[1,n]：wait qk → 计算 → set sm，各 n 次）
+                if (t >= 1 && t <= nBatches) {
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u v%u | pipe t=%u S2-SM 222221111 before wait qkReady (qk of bo=%u)\n",
+                                        coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boSM);
+                    }
+                    Arch::CrossCoreWaitFlag(qkReady);   // 每 batch 一次
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u v%u | pipe t=%u S2-SM 222221111 after wait qkReady\n",
+                                        coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t);
+                    }
+                    StageSoftmax(coreIdx, boSM, globalTensors);
+                    // 每 batch 一次（双 AIV 各自执行；FAInfer :849 同款段尾单点）：
+                    // PIPE_MTE3 保证在本分支全部 P/stats 拷贝之后才置位
+                    Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u v%u | pipe t=%u S2-SM END 22222EEEEEEE bo=%u\n",
+                                        coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boSM);
+                    }
+                }
+                // ② divout(bo_{t-2})（t∈[2,n+1]：wait pv → 计算 → set do，各 n 次；末轮
+                //    为哨兵排空，doReady 由 CUBE 的哨兵迭代消费）
+                if (!softmaxOnly && t >= 2) {
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u v%u | pipe t=%u S4-DO 444441111 before wait pvReady (pv of bo=%u)\n",
+                                        coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boDO);
+                    }
+                    Arch::CrossCoreWaitFlag(pvReady);   // 每 batch 一次
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u v%u | pipe t=%u S4-DO 444441111 after wait pvReady\n",
+                                        coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t);
+                    }
+                    StageDivOut(coreIdx, boDO, globalTensors);
+                    // [#45] 新增：OTmp 槽回收信号。PIPE_MTE3 保证 O/LSE 全部落 GM 后才
+                    // 置位——CUBE 下一轮 PV 覆写同槽前必已消费（见 CUBE 侧 ③）。
+                    Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(doReady);
+                    if (debugFlag) {
+                        AscendC::printf("[SB] c%u v%u | pipe t=%u S4-DO 44444EEEEEEEEEEE bo=%u\n",
+                                        coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boDO);
+                    }
+                }
+            }
+#endif
+
             if (debugFlag) {
                 AscendC::printf("[SB] c%u v%u exit: Batch range:(%u, %u) tile_nums=%u EEEEEEEEEEEEEEEEEEEEEE\n",
                                 coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)batchStart, (uint32_t)batchEnd,
@@ -347,41 +487,23 @@ namespace SplitB {
 
         }
 
-        // 单个 batch 的四段计算（QK → Softmax → PV → DivO）。
-        // 段序即文本序、计算序（FAInfer 的段序形态）：CUBE 核依序执行 段1→段3，VEC 核
-        // 依序执行 段2→段4；跨核由 flag 链衔接（全批粒度，参考同款，devlog #39/#40）：
-        //   段1 set qkReady（每批 1 次，广播双 AIV）→ 段2 各 AIV wait；
-        //   段2 全部 tile 完成后 set softmaxReady → 段3 批级 wait 一次（PV 内部逐调用
-        //   等待由 DispatchPolicyPV 的 WAIT_SOFTMAX=false 编译期关闭）；
-        //   段3 set pvReady → 段4 wait。
-        // 调试（devlog #42）：仅 debugFlag（env FLASH_ATTN_SPLITB_DEBUG）时的
-        // AscendC::printf 探针，打印点在段首/同步 wait 之后——最后一条输出即把挂死
-        // 定位到下一个 wait。
-        __aicore__ inline void runMainLoop(
+        // ==================== 段1：QK 全部 tile → S 写批缓冲（CUBE） ====================
+        // 纯计算段：跨核 flag（qkReady set）在流水驱动循环内（operator() 批循环）。
+        __aicore__ inline void StageQK(
             uint32_t coreIdx,
             int64_t boIdx,
             GlobalTensorBundle& globalTensors
         ) {
+#ifdef __DAV_C220_CUBE__
             auto& gQ = globalTensors.gQ;
             auto& gK = globalTensors.gK;
-            auto& gV = globalTensors.gV;
             auto& gS = globalTensors.gS;
-            auto& gP = globalTensors.gP;
-            auto& gOTmp = globalTensors.gOTmp;
-            auto& gStats = globalTensors.gStats;
-            auto& gO = globalTensors.gO;
-            auto& gLse = globalTensors.gLse;
             auto& gBlockTable = globalTensors.gBlockTable;
 
             const uint64_t batchBuf = static_cast<uint64_t>(boIdx) % 2;   // ping/pong 槽（照搬参考）
             // batchBase 相对本核 tile 区首（视图已含 coreWsOffset，devlog #44.44）
             const uint64_t batchBase = batchBuf * perBatchTileElems;
 
-            // ==================== 段1：QK 全部 tile → S 写批缓冲（CUBE） ====================
-#ifdef __DAV_C220_CUBE__
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u | batch=%u S1-QK 1111111111\n", coreIdx, (uint32_t)boIdx);
-            }
             uint32_t kvSIdx = 0;            // 单 KV 栈（S2 不切分）：栈索引恒 0
             uint32_t kvSLoopNumTotal = 1;   // 栈数恒 1
             // FIXME: 理论而言，进入本kernel的QS不超过128，因此该循环次数最多为1次
@@ -409,8 +531,17 @@ namespace SplitB {
                     // 惯例（qk_matmul.hpp:264）：先等 MTE1 排空再发 MTE2 写 l1A。
                     // EV5：预置块已含 MTE1_MTE2(0-7)（首次 Wait 即时通过）；Set/Wait
                     // 相邻自配对，与 QK/PV 的 l1KvPingPongFlag{0,1} 无生命周期交叠。
+                    // [#45 流水注意] QK(bo_t) 现与 AIV softmax(bo_{t-1}) 并行，本守卫
+                    // 只涉及 CUBE 本地 l1A（无跨核语义），保持不动。
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
+                    // [Bug⑥ 残余补强，devlog #44.53j] t17 实证守卫仍被穿透：890 写出时刻
+                    // stats 前几行 = Q(h+1) 撕裂（比值精确 (h+2)/(h+1)，AIV0 分区 s0-2 行
+                    // 首、flaky）——loadQGM 的 MTE2 DataCopy 发射被 -O2 提到 WaitFlag 之前
+                    //（#44.10 实证过的 Scalar/管道发射乱序族）。补 PipeBarrier（仓库既有
+                    // 惯例，如 softmax CopySGmToUb）：标量在此硬等 MTE1 排空，后续 MTE2
+                    // 发射不可能再穿越。
+                    AscendC::PipeBarrier<PIPE_MTE1>();
                     blockMmadQK.loadQGM(gQ[gmQ], layoutQTemp, tg.rowNum, singleHead, qHeadsP);
                     GemmCoord actualBlockShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
                                                 static_cast<uint32_t>(embed)};
@@ -422,7 +553,9 @@ namespace SplitB {
             // ---- 段1 dump（devlog #44.12/#44.15，逐 tile 有效区紧凑版）----
             // 整区方案曾超 1MB 预算（数据全丢只剩最后一条）。有效 S = 每 tile 前
             // rowNum×colsPad（本配置 colsPad=Sk 无 pad），desc = 100 + b*10 + tile。
-            if (dumpFlag) {   // 多核 dump：desc 按全局 boIdx 跨核唯一（#44.46）
+            // [T17 取证] 曾暂关让位 stats 族预算；#45 流水重构时恢复（S 槽在本 dump
+            // 与 softmax 读之间不会被覆写——QK(bo_{t+2}) 被 CUBE 迭代序挡住）。
+            if (dumpFlag) {
                 AscendC::PipeBarrier<PIPE_FIX>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
@@ -441,52 +574,24 @@ namespace SplitB {
                     }
                 }
             }
-            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);   // 每 batch 一次
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u | batch=%u S1-QK 11111EEEEEEE\n", coreIdx, (uint32_t)boIdx);
-            }            
 #endif
+        }
 
-            // ==================== 段2：softmax 全部 tile（VEC；每 tile 双 AIV 拆行） ====================
+        // ==================== 段2：softmax 全部 tile（VEC；每 tile 双 AIV 拆行） ====================
+        // 纯计算段：跨核 flag（qkReady wait / softmaxReady set）在流水驱动循环内。
+        __aicore__ inline void StageSoftmax(
+            uint32_t coreIdx,
+            int64_t boIdx,
+            GlobalTensorBundle& globalTensors
+        ) {
 #ifdef __DAV_C220_VEC__
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 222221111 before qkReady\n", coreIdx,
-                                AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
-            }              
-            Arch::CrossCoreWaitFlag(qkReady);   // 每 batch 一次
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 222221111 before qkReady\n", coreIdx,
-                                AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
-            }           
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u v%u | batch=%u S2-SM 2222222222\n", coreIdx,
-                                AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
-            }
-            // ---- DBG 探针（devlog #44.35）：SM 消费前的 S 快照（desc=860+b*10+tile）----
-            // 目的：指纹自洽（坏行 = "S≈0 输入"的正确 softmax 输出）→ 疑点在 SM 读到的
-            // S 本身。P/S 解耦后 S 永不被覆写，此处即"SM 将要读到的 S"的直接观测：
-            //   860 系坏（b1 t0 s8-15 ≈0/垃圾）→ S 在 [QK Fixpipe 完成, 本 dump] 窗口被写坏
-            //   860 系对而 P@200 仍坏        → GM 的 S 没问题，错在 SM 的 GM→UB 搬运/事件链
-            // 注意观测者效应：此处 dump 改变流水时序；若加探针后 P@200 变全对，本身即
-            // "读侧时序竞争"的证据（devlog #44.34 三点一致 → 排除 PV/DO 追加写）。
-            // if (dumpFlag && coreIdx == 0 && AscendC::GetSubBlockIdx() == 0) {
-            //     for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
-            //         for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
-            //             const TileGeom tgd = GetTileGeom(qSb, qNb);
-            //             const uint32_t descS = 860 + static_cast<uint32_t>(boIdx) * 10
-            //                 + static_cast<uint32_t>(tgd.tileIdx);
-            //             AscendC::printf(
-            //                 "[SB-DUMP] stage=PRE(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
-            //                 coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-            //                 tgd.qNStartIdx, tgd.rowNum, colsPad, descS);
-            //             const uint8_t dimS = 2;
-            //             uint32_t shapeS[2] = {tgd.rowNum, colsPad};
-            //             AscendC::ShapeInfo infoS(dimS, shapeS);
-            //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileElems],
-            //                                 descS, tgd.rowNum * colsPad, infoS);
-            //         }
-            //     }
-            // }
+            auto& gS = globalTensors.gS;
+            auto& gP = globalTensors.gP;
+            auto& gStats = globalTensors.gStats;
+
+            const uint64_t batchBuf = static_cast<uint64_t>(boIdx) % 2;
+            const uint64_t batchBase = batchBuf * perBatchTileElems;
+
             if constexpr (MASK_TYPE == FaiKenel::MaskType::NO_MASK) {
                 // FIXME: 理论而言，进入本kernel的QS不超过128，因此该循环次数最多为1次
                 for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
@@ -512,7 +617,8 @@ namespace SplitB {
             }
             // ---- 段2 dump（devlog #44.12/#44.15）：逐 tile 有效 P（half 紧凑）----
             // P 独立区（#44.35）有效数据 = 每 tile 前 rowNum×colsPad half。desc = 200 + b*10 + tile。
-            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // AIV0-only 防双份；全核 dump（#44.46）
+            // [T17 取证] 曾暂关；#45 恢复（P 槽在 dump 与 PV 读之间不会被覆写）。
+            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
@@ -564,195 +670,158 @@ namespace SplitB {
                     }
                 }
             }
-            // 每 batch 一次（双 AIV 各自执行；FAInfer :849 同款段尾单点）：
-            // PIPE_MTE3 保证在本分支全部 P/stats 拷贝之后才置位
-            Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);  // NOTE: 这里有个PIPE_MTE3，作用应该是等阶段2的P写回GM后，才启动PV阶段
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u v%u | batch=%u S2-SM END 22222EEEEEEE\n", coreIdx,
-                                AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
+            // [softmaxOnly 剥离模式 #44.26] 段4 不运行：stats 是唯一产物，此处代 dump
+            //（330 家族；与段4 尾的整块 dump 同 desc，保持分析器兼容）
+            if (softmaxOnly && dumpFlag && AscendC::GetSubBlockIdx() == 0) {
+                AscendC::PipeBarrier<PIPE_MTE3>();
+                for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
+                    for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
+                        const TileGeom tgd = GetTileGeom(qSb, qNb);
+                        const uint64_t statBase = batchBase + tgd.tileIdx * perTileElems
+                            + sTileElems + oTmpTileElems;
+                        const uint32_t descS = 330 + static_cast<uint32_t>(boIdx) * 10
+                            + static_cast<uint32_t>(tgd.tileIdx);
+                        const uint8_t dimS2 = 2;
+                        uint32_t shapeS2[2] = {1, static_cast<uint32_t>(statsPerTask)};
+                        AscendC::ShapeInfo infoS2(dimS2, shapeS2);
+                        AscendC::printf(
+                            "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..128)+sum[128..256) desc=%u\n",
+                            coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
+                            tgd.qNStartIdx, tgd.rowNum, descS);
+                        AscendC::DumpTensor(gS[statBase], descS,
+                                            static_cast<uint32_t>(statsPerTask), infoS2);
+                    }
+                }
             }
 #endif
+        }
 
-            // ==================== 段3：PV 全部 tile（CUBE） ====================
+        // ==================== 段3：PV 全部 tile（CUBE） ====================
+        // 纯计算段：跨核 flag（softmaxReady wait / pvReady set）在流水驱动循环内。
+        // softmaxFlag 的逐调用等待由 DispatchPolicyPV 的 WAIT_SOFTMAX=false 编译期
+        // 关闭（批级 Wait 已在流水驱动循环承担同步，#39/#40/#45）。
+        __aicore__ inline void StagePV(
+            uint32_t coreIdx,
+            int64_t boIdx,
+            GlobalTensorBundle& globalTensors
+        ) {
 #ifdef __DAV_C220_CUBE__
-            // softmaxOnly：整段跳过（含批级 wait/set——原循环条件写法漏掉循环外的
-            // CrossCoreWaitFlag(softmaxReady) 与 CrossCoreSetFlag(pvReady)，会在
-            // PV 不执行时仍消费/置位 flag，靠错位 set/wait 互相抵消才未挂死，#44.27）
-            if (debugFlag) {
-                    AscendC::printf("[SB] c%u | batch=%u S3-PV 333331111  before wait softmaxReady\n", coreIdx, (uint32_t)boIdx);
-            }
-            Arch::CrossCoreWaitFlag(softmaxReady);   // 批次级一次：等本批全部 softmax 完成
-            if (debugFlag) {
-                    AscendC::printf("[SB] c%u | batch=%u S3-PV 333331111  after wait softmaxReady\n", coreIdx, (uint32_t)boIdx);
-            }
+            (void)coreIdx;
+            auto& gV = globalTensors.gV;
+            auto& gP = globalTensors.gP;
+            auto& gOTmp = globalTensors.gOTmp;
+            auto& gBlockTable = globalTensors.gBlockTable;
 
-            //（消费 softmaxReady 后 continue——用户方案，flag 收支优于我方"不消费累积"
-            // 设计：每批 set 数=wait 数，任意 B 安全，#44.28。双 flag A/B 拆分曾致挂死，
-            // 已回退，2026-08-27）
-            if (!softmaxOnly) {
-                if (debugFlag) {
-                    AscendC::printf("[SB] c%u | batch=%u S3-PV 3333333333\n", coreIdx, (uint32_t)boIdx);
+            const uint64_t batchBuf = static_cast<uint64_t>(boIdx) % 2;
+            const uint64_t batchBase = batchBuf * perBatchTileElems;
+
+            uint32_t kvSIdx = 0;
+            uint32_t kvSLoopNumTotal = 1;
+            for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
+                for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
+                    const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
+                    const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                    const uint64_t oOff = sOff + sTileElems;
+                    // P 槽 half 偏移（与 gS 同款就地计算；pSlotElems float 计 ×2 → half）
+                    const uint64_t pOff = (batchBuf * tileNumPerBatch + tg.tileIdx) * pSlotElems * 2;
+                    const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
+                        static_cast<uint64_t>(tg.kvNIdx) * embed;
+
+                    LayoutP layoutPTemp(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
+                    LayoutV layoutVTemp(static_cast<uint32_t>(kvSeqlen), strideV);
+                    LayoutOTmp layoutOTmpT(tg.rowNum, static_cast<uint32_t>(embed), dPad);
+                    GemmCoord actualBlockShapePV{tg.rowNum, static_cast<uint32_t>(embed),
+                                                static_cast<uint32_t>(kvSeqlen)};
+                    blockMmadPV(gP[pOff], gV[gmV], gOTmp[oOff], gBlockTable,
+                            layoutPTemp, layoutVTemp, layoutOTmpT, actualBlockShapePV,
+                            kvSIdx, kvSLoopNumTotal, pagedBlockSize,
+                            static_cast<uint32_t>(kvSeqlen), strideV,
+                            blockStackNum, softmaxReady);
                 }
+            }
+#endif
+        }
+
+        // ==================== 段4：divout 全部 tile（VEC；每 tile 双 AIV 拆行） ====================
+        // 纯计算段：跨核 flag（pvReady wait / doReady set）在流水驱动循环内。
+        __aicore__ inline void StageDivOut(
+            uint32_t coreIdx,
+            int64_t boIdx,
+            GlobalTensorBundle& globalTensors
+        ) {
+#ifdef __DAV_C220_VEC__
+            auto& gS = globalTensors.gS;
+            auto& gOTmp = globalTensors.gOTmp;
+            auto& gStats = globalTensors.gStats;
+            auto& gO = globalTensors.gO;
+            auto& gLse = globalTensors.gLse;
+
+            const uint64_t batchBuf = static_cast<uint64_t>(boIdx) % 2;
+            const uint64_t batchBase = batchBuf * perBatchTileElems;
+
+            // [取证 #44.53d] 段4 入口（divout 读前一刻）的 GM stats 整块快照。
+            // desc=880+b*10+tile（max[0..128)+sum[128..256) 整块 statsPerTask），
+            // AIV0-only 防双份。与 890/930（段2 写完时刻）对照 → 「divout 将读时
+            // GM 是否仍等于段2 刚写的」＝写晚到/被改写 vs 读路径问题的分水岭。
+            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {
+                AscendC::PipeBarrier<PIPE_MTE2>();
+                for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
+                    for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
+                        const TileGeom tgd = GetTileGeom(qSb, qNb);
+                        const uint64_t statBase = batchBase + tgd.tileIdx * perTileElems
+                            + sTileElems + oTmpTileElems;
+                        const uint32_t dAll = 880 + static_cast<uint32_t>(boIdx) * 10
+                            + static_cast<uint32_t>(tgd.tileIdx);
+                        const uint8_t dimT = 2;
+                        uint32_t shapeT[2] = {1, static_cast<uint32_t>(statsPerTask)};
+                        AscendC::ShapeInfo infoT(dimT, shapeT);
+                        AscendC::printf(
+                            "[SB-DUMP] stage=STATS_GM_DO_ENTRY b=%u tile=%u desc=%u\n",
+                            (uint32_t)boIdx, (uint32_t)tgd.tileIdx, dAll);
+                        AscendC::DumpTensor(gS[statBase], dAll,
+                                            static_cast<uint32_t>(statsPerTask), infoT);
+                    }
+                }
+            }
+            if constexpr (MASK_TYPE == FaiKenel::MaskType::NO_MASK) {
                 for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                     for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                         const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
                         const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
                         const uint64_t oOff = sOff + sTileElems;
-                        // P 槽 half 偏移（与 gS 同款就地计算；pSlotElems float 计 ×2 → half）
-                        const uint64_t pOff = (batchBuf * tileNumPerBatch + tg.tileIdx) * pSlotElems * 2;
-                        const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
-                            static_cast<uint64_t>(tg.kvNIdx) * embed;
-
-                        LayoutP layoutPTemp(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
-                        LayoutV layoutVTemp(static_cast<uint32_t>(kvSeqlen), strideV);
+                        const uint64_t statOff = sOff + sTileElems + oTmpTileElems;
+                        const uint64_t gmO = static_cast<uint64_t>(boIdx) * qSeqlen * strideO +
+                            static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile * strideO +
+                            static_cast<uint64_t>(tg.qNStartIdx) * embed;
+                        const uint64_t gmLse = static_cast<uint64_t>(boIdx) * qHeads * qSeqlen +
+                            static_cast<uint64_t>(tg.qNStartIdx) * qSeqlen +
+                            static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile;
+                        LayoutO layoutO(static_cast<uint32_t>(qSeqlen),
+                                        static_cast<uint32_t>(embed * qHeads));
                         LayoutOTmp layoutOTmpT(tg.rowNum, static_cast<uint32_t>(embed), dPad);
+                        LayoutLse layoutLse(static_cast<uint32_t>(qHeads),
+                                            static_cast<uint32_t>(qSeqlen));
                         GemmCoord actualBlockShapePV{tg.rowNum, static_cast<uint32_t>(embed),
                                                     static_cast<uint32_t>(kvSeqlen)};
-                        // softmaxFlag 的等待由 DispatchPolicyPV 的 WAIT_SOFTMAX=false 编译期
-                        // 关闭（上方批级 Wait 已承担同步，#39/#40）
-                        blockMmadPV(gP[pOff], gV[gmV], gOTmp[oOff], gBlockTable,
-                                layoutPTemp, layoutVTemp, layoutOTmpT, actualBlockShapePV,
-                                kvSIdx, kvSLoopNumTotal, pagedBlockSize,
-                                static_cast<uint32_t>(kvSeqlen), strideV,
-                                blockStackNum, softmaxReady);
+                        divoutEpilogue(
+                            gO[gmO], gOTmp[oOff], gLse[gmLse], gStats[statOff],
+                            layoutO, layoutOTmpT, layoutLse, actualBlockShapePV,
+                            tg.qSBlockSize, tg.qNBlockSize,
+                            dumpFlag ? (800u + static_cast<uint32_t>(boIdx) * 10u
+                                        + tg.tileIdx) : 0u);
+                        // [取证 #44.52] 尾参：dumpFlag 时激活 divout UB stats 视图
+                        //（desc=800+b*10+tile max / +50 sum，见 splitb_divout.hpp）
                     }
-                }
-                // 段3 OTmp 不在此 dump：kernel 末尾的整区 float 视图 dump 一并覆盖
-                //（OTmp/stats 此时全部就绪且不再被写，devlog #44.12）
-                // AscendC::PipeBarrier<PIPE_ALL>();
-                // // DBG 探针（devlog #44.35）：PV 后 S 区金丝雀（desc=810+b*10+tile）。
-                // // P/S 解耦后 S 自 QK 写出后本应无人再写——此处与 PRE(860) 逐值一致 →
-                // // 段3 清白；出现异物 → 段3 的写落进了 S 区（GM 混用实锤）。
-                // if (dumpFlag && coreIdx == 0) {
-                //     AscendC::PipeBarrier<PIPE_FIX>();
-                //     for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
-                //         for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
-                //             const TileGeom tgd = GetTileGeom(qSb, qNb);
-                //             const uint32_t descD = 810 + static_cast<uint32_t>(boIdx) * 10
-                //                 + static_cast<uint32_t>(tgd.tileIdx);
-                //             AscendC::printf(
-                //                 "[SB-DUMP] stage=PPV(S_raw fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
-                //                 coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-                //                 tgd.qNStartIdx, tgd.rowNum, colsPad, descD);
-                //             const uint8_t dimD = 2;
-                //             uint32_t shapeD[2] = {tgd.rowNum, colsPad};
-                //             AscendC::ShapeInfo infoD(dimD, shapeD);
-                //             AscendC::DumpTensor(gS[batchBase + tgd.tileIdx * perTileElems],
-                //                                 descD, tgd.rowNum * colsPad, infoD);
-                //         }
-                //     }
-                // }
-                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);   // 每 batch 一次
-                if (debugFlag) {
-                    AscendC::printf("[SB] c%u | batch=%u S3-PV 33333EEEEEEEEEEEE\n", coreIdx, (uint32_t)boIdx);
                 }
             }
-#endif
-
-            // ==================== 段4：divout 全部 tile（VEC；每 tile 双 AIV 拆行） ====================
-#ifdef __DAV_C220_VEC__
-            // softmaxOnly：段4 整段跳过（含批级 WaitFlag(pvReady)——否则 VEC 会等
-            // 一个 CUBE 侧（段3 被 continue 跳过）永远不会 set 的 flag 而挂死）
-            if (!softmaxOnly) {
-                if (debugFlag) {
-                    AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 444441111 before PVready\n", coreIdx,
-                                    AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
-                }                
-                Arch::CrossCoreWaitFlag(pvReady);   // 每 batch 一次
-                if (debugFlag) {
-                    AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 444441111 after PVReady\n", coreIdx,
-                                    AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
-                }
-                // [Bug③a #44.53 方案B-v2] 批级消费：等本 AIV 段2 softmax 的全部 P/stats
-                // MTE3 写排空（源 = 段2 尾 Set<MTE3_MTE2>(ID1/ID7 按 subIdx)，每批每子核
-                // 恰一对收支平衡；init 预置保首轮）。置于 tiles 循环之前——divout 每 tile
-                // 的 stats GM 读从此全部晚于段2 写（同子核管线完成性，语义无歧义）。
-                // 历史：#44.52 曾在此放 Set+Wait 自配对（实证 nbad 不变=无效），#44.53
-                // v1 的 Wait 放 operator() 每 tile 一次（收支爆炸死锁，用户插桩定位）。
-                // [Bug③a #44.53 方案B-v2] 本 AIV 段2 的全部 P/stats MTE3 写排空后，投核内
-                // 事件（MTE3_MTE2 空闲域 ID1/ID7 按 AIV 分域）；消费端在段4 入口（批级，
-                // 每批每子核恰一对，收支平衡）。此前 v1 把 Wait 放 divout operator() 入口
-                //（每 tile 一次）→ 8 wait/批 vs 1 set/批，batch0 tile1 即无票死锁，连带
-                // CUBE 卡 softmaxReady（用户 2026-08-27 插桩定位，devlog #44.53c）。
-                // FAInfer 原版单 flag 双 set 拓扑保持不动（双 flag 实验亦曾挂死）。
-                // [已删 #44.53f] 此处曾留 Set+Wait(ID1/7) 自配对（用户挪入）：Bug③a 真因
-                // 是 LoadStats blockLen 截断（#44.53e）后此对沦为语义空操作，且在无
-                // printf（双 AIV 真并发）时序下疑似引发挂死——已整体移除，恢复最小态。
-                // 回答此前 FIXME：①PipeBarrier<MTE3> 在自配对场景可省；②FAInfer 不分
-                // EVENT_ID 是因为其 softmax 无 ping-pong 双缓冲，SplitB 有（#44.24 分域）。
-                if (debugFlag) {
-                    AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 4444444444\n", coreIdx,
-                                    AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
-                }
-                // [取证 #44.53d] 段4 入口（divout 读前一刻）的 GM stats 整块快照。
-                // desc=880+b*10+tile（max[0..128)+sum[128..256) 整块 statsPerTask），
-                // AIV0-only 防双份。与 890/930（段2 写完时刻）对照 → 「divout 将读时
-                // GM 是否仍等于段2 刚写的」＝写晚到/被改写 vs 读路径问题的分水岭。
-                if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {
-                    AscendC::PipeBarrier<PIPE_MTE2>();
-                    for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
-                        for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
-                            const TileGeom tgd = GetTileGeom(qSb, qNb);
-                            const uint64_t statBase = batchBase + tgd.tileIdx * perTileElems
-                                + sTileElems + oTmpTileElems;
-                            const uint32_t dAll = 880 + static_cast<uint32_t>(boIdx) * 10
-                                + static_cast<uint32_t>(tgd.tileIdx);
-                            const uint8_t dimT = 2;
-                            uint32_t shapeT[2] = {1, static_cast<uint32_t>(statsPerTask)};
-                            AscendC::ShapeInfo infoT(dimT, shapeT);
-                            AscendC::printf(
-                                "[SB-DUMP] stage=STATS_GM_DO_ENTRY b=%u tile=%u desc=%u\n",
-                                (uint32_t)boIdx, (uint32_t)tgd.tileIdx, dAll);
-                            AscendC::DumpTensor(gS[statBase], dAll,
-                                                static_cast<uint32_t>(statsPerTask), infoT);
-                        }
-                    }
-                }
-                if constexpr (MASK_TYPE == FaiKenel::MaskType::NO_MASK) {
-                    for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
-                        for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
-                            const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
-                            const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
-                            const uint64_t oOff = sOff + sTileElems;
-                            const uint64_t statOff = sOff + sTileElems + oTmpTileElems;
-                            const uint64_t gmO = static_cast<uint64_t>(boIdx) * qSeqlen * strideO +
-                                static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile * strideO +
-                                static_cast<uint64_t>(tg.qNStartIdx) * embed;
-                            const uint64_t gmLse = static_cast<uint64_t>(boIdx) * qHeads * qSeqlen +
-                                static_cast<uint64_t>(tg.qNStartIdx) * qSeqlen +
-                                static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile;
-                            LayoutO layoutO(static_cast<uint32_t>(qSeqlen),
-                                            static_cast<uint32_t>(embed * qHeads));
-                            LayoutOTmp layoutOTmpT(tg.rowNum, static_cast<uint32_t>(embed), dPad);
-                            LayoutLse layoutLse(static_cast<uint32_t>(qHeads),
-                                                static_cast<uint32_t>(qSeqlen));
-                            GemmCoord actualBlockShapePV{tg.rowNum, static_cast<uint32_t>(embed),
-                                                        static_cast<uint32_t>(kvSeqlen)};
-                            divoutEpilogue(
-                                gO[gmO], gOTmp[oOff], gLse[gmLse], gStats[statOff],
-                                layoutO, layoutOTmpT, layoutLse, actualBlockShapePV,
-                                tg.qSBlockSize, tg.qNBlockSize,
-                                dumpFlag ? (800u + static_cast<uint32_t>(boIdx) * 10u
-                                            + tg.tileIdx) : 0u);
-                            // [取证 #44.52] 尾参：dumpFlag 时激活 divout UB stats 视图
-                            //（desc=800+b*10+tile max / +50 sum，见 splitb_divout.hpp）
-                        }
-                    }
-                }
-                if (debugFlag) {
-                    AscendC::printf("[SB] c%u v%u | batch=%u S4-DO 44444EEEEEEEEEEE\n", coreIdx,
-                                    AscendC::GetSubBlockIdx(), (uint32_t)boIdx);
-                }
-            }
-#endif   // 段4 #ifdef __DAV_C220_VEC__（devlog #44.15：dump 块移动时曾误删此 endif）
             // ---- 段4 后 dump（devlog #44.15：kernel 末尾 dump 来不及刷出，移入 batch
             // 循环内运行中时机；与段1/段2 同款）----
-            // WS 终态逐 tile：OTmp=310+b*10+tile（rowNum×dPad）、stats=330+b*10+tile（2×rowNum）
+            // WS 终态逐 tile：OTmp=600+b*10+tile（rowNum×dPad）、stats=330+b*10+tile（2×rowNum）
             // O=400+b（本 batch 区，fp16 行主序 s*strideO+h*embed+d）
             // LSE=450+b（本 batch 区，[H,Sq] 头主序 h*Sq+s）
-#ifdef __DAV_C220_VEC__
-            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // AIV0-only 防双份；全核 dump（#44.46）
-                AscendC::PipeBarrier<PIPE_MTE3>();  // FIXME: 调试完成后应该移除
+            // [T17 取证] 曾暂关；#45 恢复。
+            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {
+                AscendC::PipeBarrier<PIPE_MTE3>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
                         const TileGeom tgd = GetTileGeom(qSb, qNb);
@@ -764,20 +833,6 @@ namespace SplitB {
                             + static_cast<uint32_t>(tgd.tileIdx);
                         const uint32_t descS = 330 + static_cast<uint32_t>(boIdx) * 10
                             + static_cast<uint32_t>(tgd.tileIdx);
-                        if (softmaxOnly) {
-                            // 剥离模式（devlog #44.26）：段3/4 未运行，OTmp/O/LSE 为垃圾
-                            // 不 dump（Q：用户指出）；stats 仍 dump（softmax 产物）
-                            const uint8_t dimS2 = 2;
-                            uint32_t shapeS2[2] = {1, static_cast<uint32_t>(statsPerTask)};
-                            AscendC::ShapeInfo infoS2(dimS2, shapeS2);
-                            AscendC::printf(
-                                "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..128)+sum[128..256) desc=%u\n",
-                                coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
-                                tgd.qNStartIdx, tgd.rowNum, descS);
-                            AscendC::DumpTensor(gS[tileBase + sTileElems + oTmpTileElems],
-                                                descS, static_cast<uint32_t>(statsPerTask), infoS2);
-                            continue;
-                        }
                         AscendC::printf(
                             "[SB-DUMP] stage=OTmp(fp32) core=%u b=%u tile=%u qNStart=%u rows=%u cols=%u desc=%u\n",
                             coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
@@ -791,7 +846,7 @@ namespace SplitB {
                             "[SB-DUMP] stage=STATS(max,sum fp32) core=%u b=%u tile=%u qNStart=%u rows=%u layout=max[0..rows)+sum[128..128+rows) desc=%u\n",
                             coreIdx, (uint32_t)boIdx, (uint32_t)tgd.tileIdx,
                             tgd.qNStartIdx, tgd.rowNum, descS);
-                        // stats 整块（max [0..rowNum)、sum [128..128+rowNum)，行距
+                        // stats 整块（max [0..128)、sum [128..128+rowNum)，行距
                         // ROW_NUM_MAX=128；devlog #44.15：连续 dump 2×rows 只覆盖
                         // max+未写区，须 dump 整块 statsPerTask）
                         const uint8_t dimS = 2;
@@ -802,7 +857,6 @@ namespace SplitB {
                                             descS, static_cast<uint32_t>(statsPerTask), infoS);
                     }
                 }
-                if (!softmaxOnly) {   // 段4 未运行不 dump O/LSE（devlog #44.26）
                 {
                     const uint8_t dimD = 2;
                     uint32_t shapeD[2] = {static_cast<uint32_t>(qSeqlen),
@@ -835,7 +889,6 @@ namespace SplitB {
                                         static_cast<uint32_t>(qHeads * qSeqlen),
                                         infoD);
                 }
-                }   // if (!softmaxOnly)——O/LSE dump 门控闭合（devlog #44.26）
             }
 #endif
         }
@@ -912,6 +965,7 @@ namespace SplitB {
         Arch::CrossCoreFlag qkReady{QK_READY_ID};
         Arch::CrossCoreFlag softmaxReady{SOFTMAX_READY_ID};
         Arch::CrossCoreFlag pvReady{PV_READY_ID};
+        Arch::CrossCoreFlag doReady{DO_READY_ID};   // [#45] divout 完成 → CUBE 的 OTmp 槽回收
 
         BlockMmadQK blockMmadQK;
         BlockMmadPV blockMmadPV;
@@ -934,7 +988,8 @@ namespace SplitB {
         GM_ADDR o,
         GM_ADDR lse,
         GM_ADDR workspace,
-        GM_ADDR tiling)
+        GM_ADDR tiling
+    )
     {
         // 设备侧 printf：AscendC::printf（无 fflush——输出走调试通道，kernel 结束刷出；
         // bring-up 临时探针，调通后随 #42 清单移除）
@@ -969,7 +1024,7 @@ namespace SplitB {
         using L1TileShapePV = GemmShape<128, 128, 256>;
         using L0TileShapePV = GemmShape<128, 128, 128>;
         // 第三参 WAIT_SOFTMAX=false：PV 逐 tile 调用不做内部 softmaxFlag 等待——
-        // SplitB 为批粒度同步（段3 批级 Wait 一次，devlog #39/#40）；FAInfer 缺省 true 不变
+        // SplitB 为批粒度同步（流水驱动循环批级 Wait，devlog #39/#40/#45）；FAInfer 缺省 true 不变
         using DispatchPolicyPV = Gemm::MmadAtlasA2FAIPVT<false, false, false>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using VType = Gemm::GemmType<ElementV, LayoutV>;

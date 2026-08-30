@@ -223,6 +223,7 @@ def compare_all(records, iters, ref, softmax_only=False):
     s_raw = ref["s_raw"]; p16 = ref["p16"]; mx = ref["mx"]; sumv = ref["sumv"]
     otmp = ref["otmp"]; o16 = ref["o16"]; lse = ref["lse"]
     stages_ok = {st: True for st in ("S", "P", "max", "sum", "OTmp", "O", "LSE")}
+    have = {r[0] for r in records}   # [T19 #45.1] 已采集 desc 全集（族存在性判据）
     all_out = []
 
     for it in range(iters):
@@ -262,23 +263,32 @@ def compare_all(records, iters, ref, softmax_only=False):
                 rep.append((stage, "全部相符", "maxdiff=%.2e"
                             % ((d - r).abs().max().item() if d.numel() else 0.0)))
 
-        # ---- S（desc=100+b*10+tile；每条 = AIV0 的 rows/2 行 × colsPad 紧凑）----
+        # ---- S（desc=100+b*10+tile；每条 = 全 tile rows×colsPad 紧凑）----
+        # [T19 #45.1] 全行比对（原只比 AIV0 半区，AIV1 分区坏点漏检）；缺失 tile
+        # 双侧跳过（原填 0 会制造假阳性坏点）。
+        tile_descs = lambda base: {base + b * 10 + t for b in range(B) for t, *_ in TILES}
+        if not (have & tile_descs(100)):
+            stages_ok.pop("S", None)
+            rep.append(("S", "(skip)", "S 族（100）未采集，跳过"))
         for b in range(B):
+            kept = []   # 本轮实际有 dump 的 tile：[(t, qs, rows)]
             dump_flat = []
             for (t, qs, qn, qsblk, rows) in TILES:
                 rec = nth(records, 100 + b * 10 + t, it)
                 if rec is not None:
-                    dump_flat.extend(rec[2][: (rows // 2) * COLS_PAD])
+                    dump_flat.extend(rec[2][: rows * COLS_PAD])
+                    kept.append((t, qs, rows))
                 else:
-                    dump_flat.extend([0.0] * ((rows // 2) * COLS_PAD))
+                    rep.append(("S", "(warn)", "b%dt%d dump 缺失（丢弃/漏解析），本轮跳过该 tile" % (b, t)))
+            if not kept:
+                continue
             ref_flat = []
-            for (t, qs, qn, qsblk, rows) in TILES:
-                ref_flat.extend(s_raw[b, qs][: rows // 2].reshape(-1).tolist())
+            for (t, qs, rows) in kept:
+                ref_flat.extend(s_raw[b, qs][: rows].reshape(-1).tolist())
 
-            def label(i, b=b):
-                per_tile = qsblk_row_cnt = rows * Sk
+            def label(i, b=b, kept=kept):
                 # 定位：tile 内行主序
-                for (t, qs2, qn2, qsblk2, rows2) in TILES:
+                for (t, qs2, rows2) in kept:
                     blk = rows2 * Sk
                     if i < blk:
                         return "b%d tile%d(head%d) s%d j%d" % (b, t, qs2, i // Sk, i % Sk)
@@ -286,21 +296,29 @@ def compare_all(records, iters, ref, softmax_only=False):
                 return "b%d idx%d" % (b, i)
             check("S", dump_flat, ref_flat, 5e-3, 1e-3, label)
 
-        # ---- P（desc=200+b*10+tile；每条 = AIV0 的 rows/2 行 × colsPad half）----
+        # ---- P（desc=200+b*10+tile；每条 = 全 tile rows×colsPad half）----
+        # [T19 #45.1] 全行比对 + 缺失 tile 双侧跳过（同 S）
+        if not (have & tile_descs(200)):
+            stages_ok.pop("P", None)
+            rep.append(("P", "(skip)", "P 族（200）未采集，跳过"))
         for b in range(B):
+            kept = []
             dump_flat = []
             for (t, qs, qn, qsblk, rows) in TILES:
                 rec = nth(records, 200 + b * 10 + t, it)
                 if rec is not None:
-                    dump_flat.extend(rec[2][: (rows // 2) * COLS_PAD])
+                    dump_flat.extend(rec[2][: rows * COLS_PAD])
+                    kept.append((t, qs, rows))
                 else:
-                    dump_flat.extend([0.0] * ((rows // 2) * COLS_PAD))
+                    rep.append(("P", "(warn)", "b%dt%d dump 缺失，本轮跳过该 tile" % (b, t)))
+            if not kept:
+                continue
             ref_flat = []
-            for (t, qs, qn, qsblk, rows) in TILES:
-                ref_flat.extend(p16[b, qs][: rows // 2].reshape(-1).tolist())
+            for (t, qs, rows) in kept:
+                ref_flat.extend(p16[b, qs][: rows].reshape(-1).tolist())
 
-            def label(i, b=b):
-                for (t, qs2, qn2, qsblk2, rows2) in TILES:
+            def label(i, b=b, kept=kept):
+                for (t, qs2, rows2) in kept:
                     blk = rows2 * Sk
                     if i < blk:
                         return "b%d tile%d(head%d) s%d j%d" % (b, t, qs2, i // Sk, i % Sk)
@@ -308,53 +326,64 @@ def compare_all(records, iters, ref, softmax_only=False):
                 return "b%d idx%d" % (b, i)
             check("P", dump_flat, ref_flat, 1e-3, 0.0, label)
 
-        # ---- stats + OTmp（desc=330/310 + b*10 + tile；slot==b，B=2 单核）----
-        for b in range(B):
-            # max / sum（stats 每条 = 2×rowNum：max 前 rows、sum 后 rows）
-            for name, ref_t, tol in (("max", mx, 1e-4), ("sum", sumv, 2e-3)):
-                dump_flat, ref_flat = [], []
-                for (t, qs, qn, qsblk, rows) in TILES:
-                    rec = nth(records, 330 + b * 10 + t, it)
-                    if rec is not None:
-                        off = 0 if name == "max" else 128   # sum 在 stats 块 [128..128+rows)
-                        dump_flat.extend(rec[2][off: off + rows])
-                    else:
-                        # 记录缺失（t51：大单行偶被解析器漏）——标记缺 dump 而非填 0 假错
-                        print(f"  [WARN] b{b} tile{t} 的 stats dump 记录缺失（解析丢失），跳过该项比对")
-                        dump_flat.extend([-1.0] * rows)   # -1 与任何 ref 不等但明显非 0 假象
-                    ref_flat.extend(ref_t[b, qs].tolist())
+        # ---- stats + OTmp（desc=330/600 + b*10 + tile）----
+        # [T19 #45.1] 族未采集（精简关闭）时整块跳过，不再报假 ✗
+        if not (have & tile_descs(330)) and not (have & tile_descs(600)):
+            for st in ("max", "sum", "OTmp"):
+                stages_ok.pop(st, None)
+            rep.append(("max/sum/OTmp", "(skip)", "stats 终态（330）/OTmp（600）族未采集（T19 精简），跳过"))
+        else:
+            for b in range(B):
+                # max / sum（stats 每条 = 2×rowNum：max 前 rows、sum 后 rows）
+                for name, ref_t, tol in (("max", mx, 1e-4), ("sum", sumv, 2e-3)):
+                    dump_flat, ref_flat = [], []
+                    for (t, qs, qn, qsblk, rows) in TILES:
+                        rec = nth(records, 330 + b * 10 + t, it)
+                        if rec is not None:
+                            off = 0 if name == "max" else 128   # sum 在 stats 块 [128..128+rows)
+                            dump_flat.extend(rec[2][off: off + rows])
+                        else:
+                            # 记录缺失（t51：大单行偶被解析器漏）——标记缺 dump 而非填 0 假错
+                            print(f"  [WARN] b{b} tile{t} 的 stats dump 记录缺失（解析丢失），跳过该项比对")
+                            dump_flat.extend([-1.0] * rows)   # -1 与任何 ref 不等但明显非 0 假象
+                        ref_flat.extend(ref_t[b, qs].tolist())
 
-                def label(i, b=b, name=name):
-                    for (t, qs2, qn2, qsblk2, rows2) in TILES:
-                        if i < rows2:
-                            return "b%d tile%d(head%d) %s s%d" % (b, t, qs2, name, i)
-                        i -= rows2
-                    return "b%d %s idx%d" % (b, name, i)
-                check(name, dump_flat, ref_flat, tol, 0.0, label)
-            # OTmp（desc=600+b*10+tile，devlog #44.41 起；原 310 系在 b≥2 与 stats 撞号；
-            #       每条 = AIV0 的 rows/2 行 × dPad 紧凑）
-            # softmax-only 模式：段3 未运行，跳过
-            if not softmax_only:
-                dump_flat, ref_flat = [], []
-                for (t, qs, qn, qsblk, rows) in TILES:
-                    rec = nth(records, 600 + b * 10 + t, it)
-                    if rec is not None:
-                        dump_flat.extend(rec[2][: (rows // 2) * D_PAD])
-                    else:
-                        dump_flat.extend([0.0] * ((rows // 2) * D_PAD))
-                    ref_flat.extend(otmp[b, qs][: rows // 2].reshape(-1).tolist())
+                    def label(i, b=b, name=name):
+                        for (t, qs2, qn2, qsblk2, rows2) in TILES:
+                            if i < rows2:
+                                return "b%d tile%d(head%d) %s s%d" % (b, t, qs2, name, i)
+                            i -= rows2
+                        return "b%d %s idx%d" % (b, name, i)
+                    check(name, dump_flat, ref_flat, tol, 0.0, label)
+                # OTmp（desc=600+b*10+tile，devlog #44.41 起；原 310 系在 b≥2 与 stats 撞号；
+                #       每条 = AIV0 的 rows/2 行 × dPad 紧凑）
+                # softmax-only 模式：段3 未运行，跳过
+                if not softmax_only:
+                    dump_flat, ref_flat = [], []
+                    for (t, qs, qn, qsblk, rows) in TILES:
+                        rec = nth(records, 600 + b * 10 + t, it)
+                        if rec is not None:
+                            dump_flat.extend(rec[2][: (rows // 2) * D_PAD])
+                        else:
+                            dump_flat.extend([0.0] * ((rows // 2) * D_PAD))
+                        ref_flat.extend(otmp[b, qs][: rows // 2].reshape(-1).tolist())
 
-                def label(i, b=b):
-                    for (t, qs2, qn2, qsblk2, rows2) in TILES:
-                        blk = rows2 * D
-                        if i < blk:
-                            return "b%d tile%d(head%d) s%d d%d" % (b, t, qs2, i // D, i % D)
-                        i -= blk
-                    return "b%d idx%d" % (b, i)
-                check("OTmp", dump_flat, ref_flat, 5e-2, 1e-3, label)
+                    def label(i, b=b):
+                        for (t, qs2, qn2, qsblk2, rows2) in TILES:
+                            blk = rows2 * D
+                            if i < blk:
+                                return "b%d tile%d(head%d) s%d d%d" % (b, t, qs2, i // D, i % D)
+                            i -= blk
+                        return "b%d idx%d" % (b, i)
+                    check("OTmp", dump_flat, ref_flat, 5e-2, 1e-3, label)
 
         # ---- O（desc=400+b，逐 batch 区；softmax-only 模式段4 未运行跳过）----
-        if not softmax_only:
+        # [T19 #45.1] O/LSE 族未采集（精简关闭）时跳过——两者另有张量级外部校验兜底
+        if not (have & {400 + b for b in range(B)}) and not (have & {450 + b for b in range(B)}):
+            for st in ("O", "LSE"):
+                stages_ok.pop(st, None)
+            rep.append(("O/LSE", "(skip)", "O（400）/LSE（450）族未采集（T19 精简），跳过"))
+        elif not softmax_only:
             dump_flat, ref_flat = [], []
             for b in range(B):
                 rec = nth(records, 400 + b, it)
@@ -499,16 +528,22 @@ def do_compare(text, iters, softmax_only=False):
     records = parse_log(text)
     descs = sorted(set(r[0] for r in records))
     print("\n解析到 dump 记录 %d 条，desc 集合：%s" % (len(records), descs))
-    for d in sorted({100 + b * 10 + t for b in range(B) for t, *_ in TILES}
-                    | {200 + b * 10 + t for b in range(B) for t, *_ in TILES}
-                    | {600 + b * 10 + t for b in range(B) for t, *_ in TILES}
-                    | {330 + b * 10 + t for b in range(B) for t, *_ in TILES}
-                    | {400 + b for b in range(B)}
-                    | {450 + b for b in range(B)}):
-        n = sum(1 for r in records if r[0] == d)
-        want = iters
-        warn = "" if n == want else "   ⚠ 期望 %d 条" % want
-        print("  desc=%d: %d 条%s" % (d, n, warn))
+    # [T19 精简 #45.1] 只核对"已出现"的族（未采集族由 compare_all 自动跳过）；
+    # 缺失/计数异常合并一行，替代原 40 行逐 desc 期望清单。
+    tile_set = lambda base: {base + b * 10 + t for b in range(B) for t, *_ in TILES}
+    batch_set = lambda base: {base + b for b in range(B)}
+    for name, exp in (("S", tile_set(100)), ("P", tile_set(200)),
+                      ("SMstats(max/sum)", tile_set(890)), ("DOentry", tile_set(700)),
+                      ("OTmp", tile_set(600)), ("stats终态", tile_set(330)),
+                      ("O", batch_set(400)), ("LSE", batch_set(450))):
+        cnt = {d: sum(1 for r in records if r[0] == d) for d in exp}
+        got = [d for d in exp if cnt[d] > 0]
+        if not got:
+            continue   # 族未采集（T19 精简关闭），不刷存在感
+        n_all = sum(cnt.values())
+        odd = [d for d in exp if cnt[d] != iters]
+        note = "" if not odd else "   ⚠ 缺失/计数异常: %s" % odd
+        print("  族 %-14s %d/%d 条%s" % (name, n_all, len(exp) * iters, note))
     stages_ok = compare_all(records, iters, ref, softmax_only)
     print("\n" + "=" * 60)
     verdict = " | ".join("%s:%s" % (k, "✓" if v else "✗") for k, v in stages_ok.items())

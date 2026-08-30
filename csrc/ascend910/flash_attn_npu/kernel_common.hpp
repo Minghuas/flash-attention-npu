@@ -12,10 +12,12 @@ namespace KernelCommon {
     constexpr uint32_t QK_READY_ID = 1;
     constexpr uint32_t SOFTMAX_READY_ID = 2;
     constexpr uint32_t PV_READY_ID = 3;
-    // [#44.53 方案B] 双 flag 拆分（SOFTMAX_READY_ID_B=4）曾致 kernel 挂死，已回退
-    //（2026-08-27 用户实测；FAInfer 原版同为单 flag 双 set，拓扑保持一致）。Bug③a 的
-    // 修复改走核内 HardEvent 自产链：MTE3_MTE2 空闲域 EVENT_ID1(AIV0)/EVENT_ID7(AIV1)，
-    // 见 mha_fwd_splitb.cpp 段2 尾 + splitb_divout.hpp LoadStats。
+    // [#45 批间错位流水] doReady：双 AIV 在 divout（O/LSE 落 GM）后 set → CUBE wait，
+    // 保护 OTmp 槽（boIdx 与 boIdx+2 共槽）不被 PV 提前覆写。拓扑与 softmaxReady 同构
+    //（双 set 单 wait；模式 2 双 AIV 计数器语义，官方文档实证 #44.53h）。
+    constexpr uint32_t DO_READY_ID = 4;
+    // [#44.53 方案B] 双 flag 拆分（SOFTMAX_READY_ID_B 曾短暂占用 4）已回退，ID 4 现
+    // 分配给 doReady（2026-08-30，#45）。Bug③a 的修复走 LoadStats blockLen（#44.53e）。
     constexpr uint32_t PRE_LAUNCH = 2;
     constexpr uint32_t N_SPLIT_HELPER = 2;
     constexpr uint32_t MAX_KV_STACK_LEN = 512;

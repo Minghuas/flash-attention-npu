@@ -126,8 +126,8 @@ def main():
     ap = argparse.ArgumentParser(description="FA v2 vs npu_fusion_attention bench (small-seq, large-batch)")
     ap.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16, 64, 256, 320, 1024, 2048],
                     help="batch 列表（默认聚焦大 batch）")
-    # ap.add_argument("--seqlen", type=int, nargs="+", default=[32, 64, 128, 256, 512], help="seqlen 列表（默认含小 seqlen）")
-    ap.add_argument("--seqlen", type=int, nargs="+", default=[32, 64, 128, 256, 512, 2048, 4096], help="seqlen 列表（默认含小 seqlen）")
+    ap.add_argument("--seqlen", type=int, nargs="+", default=[32, 64, 128, 256, 512], help="seqlen 列表（默认含小 seqlen）")
+    # ap.add_argument("--seqlen", type=int, nargs="+", default=[32, 64, 128, 256, 512, 2048, 4096], help="seqlen 列表（默认含小 seqlen）")
     ap.add_argument("--nheads", type=int, default=24)
     ap.add_argument("--headdim", type=int, default=128, choices=[64, 128])
     ap.add_argument("--dtype", default="fp16", choices=["fp16", "bf16"])
