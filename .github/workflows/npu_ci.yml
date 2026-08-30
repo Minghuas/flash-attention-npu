@@ -242,6 +242,9 @@ jobs:
       TARGET_SHA: ${{ needs.prepare.outputs.sha }}
       CI_CONTAINER_SCOPE: ${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
       CI_TEST_LOG_DIR_HOST: /tmp/ci_test_logs/${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-${{ matrix.arch_label }}
+      GOLDEN_CACHE_HOST_DIR: /home/FA_NPU_CI_DATA
+      GOLDEN_CACHE_DIR: /var/cache/flash-attention-npu/golden_cache
+      GOLDEN_CACHE_MODE: cache
     outputs:
       run_outcome: ${{ steps.run.outcome }}
     steps:
