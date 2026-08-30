@@ -28,9 +28,9 @@ def detect_sep(filepath):
 
 def main():
     parser = argparse.ArgumentParser(description="合并两份benchmark数据并重新计算speedup")
-    parser.add_argument('--file1', help='第一份数据文件', default='./perf/data/bench3.csv')
+    parser.add_argument('--file1', help='第一份数据文件', default='./perf/data/bench_3_2_multi_core.csv')
     parser.add_argument('--file2', help='第二份数据文件', default='./perf/data/bench2.csv')
-    parser.add_argument('-o', '--output', default='./perf/data/merged2.csv', help='输出CSV路径')
+    parser.add_argument('-o', '--output', default='./perf/data/merged2_2.csv', help='输出CSV路径')
     parser.add_argument('--sep1', help='指定文件1分隔符，默认自动检测')
     parser.add_argument('--sep2', help='指定文件2分隔符，默认自动检测')
     args = parser.parse_args()

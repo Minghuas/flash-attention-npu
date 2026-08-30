@@ -158,7 +158,10 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     const int64_t pSlotElems = sTileElems / 2;                     // 单 P 槽（128×colsPad half）
     const int64_t oTmpTileElems = rowNumMax * dPad;
     const int64_t statsPerTask = 2 * rowNumMax;
-    const int64_t qNBlockTile = std::min(std::max((rowNumMax / Sq) / 2 * 2, (int64_t)1), G);
+    // [#46 v3.2] qNBlockTile 钉 1（与 device 侧一致）：输入 Q 为 BSHD，跨头打包行
+    // 不连续，通用引擎 + 标准 RowMajor 无法表达（GQA 打包恢复需 fork 加 BSHD 条带
+    // 装载，后续项）；MHA 本就恒 1（单 GEMM 单 B）。
+    const int64_t qNBlockTile = 1;
     const int64_t nTilePerBatch = CeilDivI(G, qNBlockTile) * N2 * CeilDivI(Sq, rowNumMax);
     const int64_t perTileElems = sTileElems + oTmpTileElems + statsPerTask;
     const int64_t perCoreElems = 2 * nTilePerBatch * (perTileElems + pSlotElems);   // tile 区 + P 区（各 2 批）

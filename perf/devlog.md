@@ -811,6 +811,155 @@ CopySGmToUb 同款问题的镜像）。修复 = Wait 后补 `PipeBarrier<PIPE_MT
 debug/analyze_t17.py（注意：890 须按 printf 头 sub/off/n 解析，按出现序猜会误报
 ——t17 首版教训）。
 
+**#46.6**｜**🎉 v3 正确性全线闭环（用户实测，2026-08-30）**：
+BSHD 布局修复后全量验证通过：①B2 H8 Sq9 Sk47 ×8 位级全对（max_err=0.0000）；
+②**B4/B16 H8 Sq32 Sk96 ×8 全 PASS 且逐迭代恒定——v2 时代 7/8 失败的 l1A 撕裂族
+（Bug⑥，跨度 #44.51→#45.3→#46）结构性归零**，通用引擎的 A/B 双缓冲兑现了使命；
+③GQA B64 H32/kvH4 ×4 PASS（每头一 tile + h→h/G 寻址）；④pytest splitb 21/22（唯一
+失败 = 1/2097152 单点、|ref|≈0.006 的小值点 atol 边缘 0.0115 vs 0.01——用户归为
+既有环境性单点问题，历史功能开发同样存在；位置固定/漂移可区分路径差 vs 设备噪声）；
+⑤FLASH_ATTN_SPLITB_MULTI_CORE=1 多核模式全过（host 多核逻辑未受重构影响）。
+残差家族确认良性（0.0625 nbad=0 = fp16 大量级 1-ULP，#44.53f 定性）。**v3 至此
+正确性闭环：引擎替换（fork）+ 批间错位流水 + BSHD 布局三件套成立。后续**：
+①bench2 量化 v3 性能（对照 v1 的 1.27-2.19x 基线；MHA 粒度与 v1 相同[本就每头一
+tile]，预期正收益=流水重叠+双缓冲装载）；②GQA 打包恢复（fork 加 BSHD 条带 A 面
+装载入口 + 撤销 qNBlockTile 钉 1，GetQNBlockTile 公式本身无恙）；③S4 mask/softcap、
+S5 L1 驻留 batch。
+
+**#46.5**｜**v3.2 全量错定位：输入布局是 [B,S,H,D]（BSHD）——B 面跨步与 A 面行距全错（2026-08-30）**：
+fork 版首跑：挂死修复 ✓（8 iter 全完），但 LSE 144/144、OUT 9216/9216 全错且逐迭代
+恒定 = 确定性 bug。铁证：test 脚本 :77-79 `q/k/v = torch.zeros(B, S, H/Hkv, D)`
+直接 .npu() 入 kernel——**输入是 BSHD**。据此重推：头内相邻 token 行相距
+stride=H·D（非 embed）。v2 正确的参数化：K^T 用 `ColumnMajor(strideK, Sk)`（ldm=Hkv·D
+即 BSHD n 行跨步，v2 一直这么传！我 v3 自创 (embed,Sk,embed) → n≥1 列全错）；
+V 用 `RowMajor(Sk, strideV)`（v2 同款，我错传 (Sk,embed)）；Q 的 BSHD 行距 v2 靠
+FAI loadQGM 条带拷贝（qHeads·embed 头跨步参数），我 v3 的 `RowMajor(rowNum,embed)`
+行距错。错误指纹吻合：K n≥1 列全错 → 每行 max/sum 全错 → 全点错。修复：QK B/PV B
+照抄 v2 参数；Q 用 `RowMajor(rowNum, embed, ldm=strideQ)` 三参表达 BSHD 行跨步
+（RowMajor 三参构造存在，matrix.hpp:26；引擎 GM→L1 按 tile 布局读，尾行不越界读）。
+**附带撤回 v3.1 的 GQA 打包**：BSHD 下跨头打包行不连续（h 相距 D、s 相距 H·D），
+标准 RowMajor 无法表达（v2 靠 loadQGM 条带；GQA 打包恢复需 fork 加 BSHD 条带装载
+入口，列后续项）——qNBlockTile 重新钉 1（host+device）。教训：**换引擎时 operand
+布局参数化必须逐面与旧实现对照，不能按"逻辑矩阵"自创参数——旧参数组合本身就是
+布局契约的活文档**（本条为 [[api-doc-verification]] 的代码版：不确定的语义去读
+已验证代码，别推）。**【错误与纠正】直改依赖库 submodule → 还原 + fork 定制（用户指令，2026-08-30）**：
+我此前为解决双引擎事件生命周期，直接修改了 csrc/catlass（**git submodule**，
+cann/catlass v1.6.1）内的 block_mmad_pingpong.hpp（+presetEvents 尾参/dtor 守卫）。
+用户严正指出不可改依赖库——三重错误：①submodule 钉版本，上游同步时改动静默丢失；
+②污染 diff 不可追溯；③宿主逻辑强加库的全使用者。已 `git checkout` 还原（submodule
+status 零 modified）。**正确路线（用户指定，qk/pv_matmul.hpp 同款先例）**：fork 到
+本仓库 `splitb_bm_pingpong.hpp`——自 v1.6.1 逐行拷贝，独立类 `SplitBBlockMmad`
+（非库模板偏特化——库内已有 MmadAtlasA2Pingpong 特化，重复特化 ODR 冲突），diff
+仅三点：独立类名/自包含 using/**生命周期定制**（presetEvents 尾参：false = 宿主全权
+接管事件——ctor 不预置[防双实例 Set-on-set] + dtor 跳过 drain[防与 kernel drain
+重复消费挂死]）。文件头注明上游出处/版本/diff 清单供升级重 fork。内核：include 换
+fork、entry 类型 `SplitBBlockMmad<...>`，其余（构造 `(res,off,false)`、kernel 预置/
+排水全集、#46.2 的收支核算）不变。**规则已入长期记忆**（catlass-submodule-no-modify）。
+
+**#46.3**｜**v3.1：恢复 GQA qN 打包（用户路线质疑驱动，2026-08-30）**：
+用户问"qNBlockTile≡1 是否性能退化、是否 Pingpong 引擎限制"。澄清三层：①引擎无限制
+——BlockMmad<Pingpong> 接受任意 M≤128（含打包行）；②MHA 的 qN=1 是**数学 forced**
+（单 GEMM 单 B，MHA 每头 K 不同；v1/v2 公式对 G=1 恒 1，无退化）；③GQA 的钉 1 是
+bring-up 过度简化——已恢复 v1/v2 同款打包（共享 kv 头的头共享 B ⇒ M=qN·Sq≤128 合法；
+Q 头相邻 ⇒ 打包行 GM 连续，标准 RowMajor 直接可用）。守卫（新增，两侧一致）：
+仅 qS 单块时打包——GetQSBlockTile 恒 128 ⇒ 触发闸门 Sq≤128 下恒真；跨 qS 块打包需
+FAI loadQGM 条带拷贝，通用引擎不支持。改动：kernel 几何段恢复 GetQNBlockTile +
+GetTileGeom 恢复 v2 逻辑（qNBlockSize 尾块/rowNum=qS·qN/qNStartIdx 组内偏移），
+StageQK/PV 布局本就用 tg.rowNum/qNStartIdx 无需改；host 恢复公式 + 同款守卫。
+softmax/divout 的 rowSplit 逻辑本就支持 qN>1（raw = qS*(qN/2)），零改动。
+
+**#46.2**｜**v3 首跑出口挂死 = 引擎析构 drain 重复消费（2026-08-30，用户实测日志定位）**：
+B2Sq9Sk47 --debug：三子核 EEEE 全打出（驱动循环 + 4 flag 收支全闭合）后卡死。根因：
+新引擎为 operator() 内**局部变量**（无默认构造器），函数末尾自动执行其**析构 drain**
+（Wait MTE1_MTE2{0..3}/M_MTE1{0..3}/FIX_M ID0）；此前宿主 kernel drain 已把 pendings
+全部消费 → PV dtor（先构造后析构）Wait 无票挂死；即便单实例也必然与 kernel drain
+重复。修复：`presetEvents` 尾参语义扩展为"宿主全权接管事件生命周期"——ctor 存
+`hostOwnedEvents_` 成员，dtor 开头 `if (!hostOwnedEvents_) return;`（默认 true，example
+行为不变）。收支复核（hostOwned=false 路径）：引擎每调用 Wait-then-Set 自闭合，
+末尾每 ID 恰 1 pending（PV 引擎遗留）+ 空闲 ID 的 kernel 预置 → kernel drain 每恰
+一次 Wait 消费 ✓ 全闭合；析构（反转序 PV→QK）已跳过 ✓。**附带答疑（用户问"换
+batchMatmul 后为何还有双重循环"）**：qN 循环 = batch 维循环本尊——catlass 引擎一次
+调用只算一个 [m,n,k] 块（BlockMmad 语义），"batch" 迭代要么在宿主循环（现状，
+=BatchedMatmul kernel 类内层循环 144-169 的同构展开），要么用其 kernel 级调度（自带
+全核网格循环+空 AIV 分支，与融合流水冲突，弃）；参考实现把这层循环放进 matmul 高阶
+API 的 IterateBatch——catlass 无此 API。qS 循环 = Sq>块上限的兜底（触发闸门下恒 1 次）。
+
+**#46.1**｜**v3 实施完成（2026-08-30）**：①block_mmad_pingpong.hpp 构造器加
+`presetEvents=true` 默认尾参（example 语义不变；SplitB 双实例传 false 沿用 kernel 级
+预置）。②mha_fwd_splitb.cpp 全量重写（用户指令顺带瘦身：dump 探针/softmaxOnly/过时
+注释全清，保留 debug printf 流水探针与事件预置/排水骨架）：QK/PV 换
+`BlockMmad<MmadAtlasA2Pingpong<true>, 128×128×128 / 128×128×64>`，per-head 调用
+`engine(gmA, layoutA, gmB, layoutB, gmC, layoutC, {m,n,k})`；K^T 视图 =
+`ColumnMajor(D, Sk, ldm=embed)`；S/P/OTmp 布局与 epilogue 寻址零改动；qNBlockTile 钉 1
+（GetTileGeom 简化：qNStartIdx=qNBlockIdx、rowNum=qSBlockSize、tileIdx==扁平(qS,head)）；
+引擎为 operator() 内局部构造（无默认构造器），QK 占 L1 前 128KB、PV 顺延（静态分区）；
+l1A 守卫（EV5+PipeBarrier）随 FAI 引擎整体退役。③splitb_host.cpp qNBlockTile 钉 1
+（nTilePerBatch = qHeads×CeilDiv(Sq,128)，workspace 公式不变）。自检：括号/宏配平、
+dump/softmaxOnly/loadQGM/qk_matmul 引用清零。**[需 NPU 验证]**：编译（TileCopy 对
+half/ColMajor/half/RowMajor/fp32-C 组合的特化覆盖为最大不确定点）→ 正确性
+（B2Sq9Sk47 经典例、B4/B16 H8 Sq32 Sk96 ×8、pytest splitb）→ 性能（bench2）。
+**注意**：dump 设施已随瘦身移除，test_splitb_stage_full.py 的 --dump/--log 模式对 v3
+内核无效（张量级外部校验仍有效）；如需恢复取证按 #45.2 的 desc 族方案重加。
+
+**#46**｜**【路线转换 v3】tile 级 FAI 引擎 → catlass BatchedMatmul 引擎（用户拍板，2026-08-30）**：
+用户决策：弃 qk/pv_matmul.hpp 的 tile 级复用，改 batch matmul 路线，batch 维 = dim1 =
+G*kvN（= 参考实现的 tensorABatchSize 语义）。资料链（用户提供 + 实读核实）：
+①通用 BatchedMatmul kernel 类存在且与独立仓库
+（/data0/liaojy/workspace/FA/catlass）同步；但其 operator() 自带全核网格循环+空 AIV
+分支（独立算子形态）→ **取其引擎、弃其调度**（内层 per-block 循环 144-169 为模板）。
+②example 01 已验证组装 = `MmadAtlasA2Pingpong<true>` 通用 BlockMmad（引擎在
+block_mmad_pingpong.hpp，与我们仓库同源）。③引擎实读确认：**A/B 面 L1 双缓冲**
+（l1A/BTensorList[STAGES=2]）+ 两向事件全保护 + **跨调用槽位轮转**（l1ListId 成员
+持续）→ 头 h+1 的 GM→L1A 与头 h 的 L1→L0A 永远异槽——t19 竞态类结构性关闭，不依赖
+未确认的管线域语义；调用形态 per-block(GM 张量+布局+actualShape)，无分离 loadQGM，
+尾形内建（mRound/nRound）。④集成要点：workspace/流水/epilogue 零改动（tileIdx==headIdx
+当 qNBlockTile≡1）；GQA 用 h→h/G 寻址替代 B 侧广播；小 Sq 的 M 维利用率下降为参考
+同款语义（GQA 打包留 S5，MHA G=1 不可打包——打包头须共享同一 B 矩阵）。⑤唯一
+[需 NPU 验证]：双实例构造器预置双 Set（单 bit 语义则挂死）→ 方案 A：构造器加
+`presetEvents=true` 默认尾参（共享文件零行为差异），SplitB 传 false 沿用 kernel 级
+预置。设计全文 perf/design/splitb_batchmatmul.md（含第一部分：当前分 tile 方案存档）。
+
+**#45.4**｜**"换 catlass batch matmul"提议的核实（用户提出，2026-08-30）**：
+用户怀疑跨 tile 同步空洞（t19 已实锤 ✓）并提议弃用 tile 级 qk/pv_matmul、改用 catlass
+batch matmul 模板。核实结果三层：①`BatchedMatmulTla` 通用版（gemm/kernel/
+batched_matmul_tla.hpp:147）存在但只是**把 tile 循环挪进库内**——内部仍逐 block 调
+普通 BlockMmad，同步问题搬家不消失；且自带 BlockScheduler/网格跨步循环/空 AIV 分支，
+是独立算子形态（非嵌入我方 AIC+AIV 程序的形态）。②真正对标参考 `BATCH_LESS_THAN_L1`
+的 `MmadMultiBatch` 路径：**只有 DispatchPolicy 标签（dispatch_policy.hpp:338）和 kernel
+包装，BlockMmad 引擎特化在 gemm/block/ 中不存在（grep 零匹配）**——半成品脚手架，
+全仓库零使用者，无上板证据。③参考实现的"无同步烦恼"本质 = 高阶 matmul API 把同步
+内化（IterateBatch/WaitIterateBatch + API 内部占用 flagId[0,2N-1]，与 CrossCore flag
+冲突风险，官方文档注明）——catlass 无此 API 等价物。**决策建议（用户方向 = 正确终点，
+但分两步）**：现在先 A 面 L1 双缓冲（PV 舞步，PV 同为 tile 级批内循环却免疫 = tile
+循环非原罪、单缓冲才是）关死正确性；S5 再补 MmadMultiBatch 引擎/自研 L1 驻留 batch
+（=8-14 深读文档"阶段1 逐 tile → 阶段2 L1 驻留"计划）。深读文档 §12 的"脚手架"判断
+本轮精确验证。
+
+**#45.3**｜**【Bug⑥ t19 定案】CUBE 侧 l1A 撕裂实锤；守卫证伪的机理 = LoadData 疑似不在 MTE1 域（2026-08-30）**：
+B4 H8 Sq32 Sk96 ×8 dump 取证（裁剪版 5 族）：**S@100 撕裂** → 裁决 CUBE 侧。两处真撕裂：
+b2h6 首 2 行 192 点、b3h6 首行 96 点，比值精确 **8/7 = Q(h7)·K(h6)**（末头 loadQGM(7) 的
+MTE2 写穿透次末头 tile 的 l1A 读取，只染首 1-2 行）——与 t17 指纹完全一致，且这次是
+QK dump 时刻直接观测（softmax 未参与），铁证。**取证设施两个陷阱（已修）**：①设备丢
+记录时"头存体失"（printf 头与 DumpTensor 体两通道独立丢）——recs() 头借下一条的体 →
+假"全 tile 撕裂"（比值 ((h+2)/(h+1))²，数值拟合 h'=h+1 全吻合 = 整块下一头数据；修复 =
+头体之间不得夹其他 desc 头，实测被丢记录的头与其体间隔恰 106 行 = 一整条记录）；
+②异步刷出跨 iter 段 → 分析器分轮归因不可靠（iter1 假"全净"）。**守卫证伪机理（仓库
+代码证据链）**：CopyL1ToL0A 的实现全部基于 `AscendC::LoadData/LoadDataWithTranspose`
+（copy_l1_to_l0a.hpp，矩阵装载指令）——**极可能不在 MTE1 管线域** ⇒
+`PipeBarrier<PIPE_MTE1>`（#44.53j）与 EV5 Set/Wait<MTE1_MTE2> 守卫等了个空管，MTE2
+（GM→l1A）与 LoadData（l1A→L0A）真并发。旁证：FAInfer 原版不触发 = 每任务一次
+loadQGM 后接整个 KV 长循环（512 栈 ×N），下一 loadQGM 与本次 LoadData 天然隔远；
+**PV 免疫 = A 面（P）在 L1 已双缓冲**（pv_matmul.hpp:239 `l1ATensor[l1PPingPongFlag]`
++ 完整两向事件舞步 234/240/252/256），槽位错开结构性安全。**修复方案（待用户确认）**：
+QK A 面 L1 双缓冲，照抄 PV 的 l1P 舞步（编译期第三模板参数门控，默认 false——
+qk_matmul.hpp 为 FAInfer 主路径共享文件，默认路径必须零行为差异）；l1A 用
+MTE1_MTE2/MTE2_MTE1 ID2/ID3（MTE1_MTE2 ID2 有预置，MTE2_MTE1 走 Set-先于-Wait 免
+预置）；L1 预算核算：Q 双缓冲 128KB + l1B 128KB + PV 96KB = 352KB < 512KB，D=64/128
+下 nDynNum 均 128 不降。**[需文档核对]（用户）**：①`AscendC::LoadData`（LoadData2DParams，
+L1→L0A）归属管线域——MTE1_MTE2 事件/PipeBarrier<PIPE_MTE1> 对它是否生效；②
+`PipeBarrier<PIPE_MTE1>` 的排空范围是否含 LoadData。答案影响的是"理解是否完整"，
+不影响修复正确性（槽位隔离 + PV 同款链，两头皆安全）。
+
 **#45.2**｜**t19 dump 裁剪 + desc 撞号修复 + 取证样例纠偏（2026-08-30）**：
 用户压缩样例（B3 H4 Sq32 Sk96 ×3 --dump）两个问题：①dump 族太多（11 族 411 条）无法
 分析，且 S 族丢 8/12 条、逐 desc 期望清单噪声大；②**发现 desc 撞号**：880+10b（段4 入口）

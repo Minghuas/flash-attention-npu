@@ -63,6 +63,14 @@ def recs(chunk, desc):
         j = chunk.find("[[", i)
         if j < 0:
             break
+        # [t19 粘接陷阱] 设备丢记录时可能"头存体失"（printf 头与 DumpTensor 体两通道）：
+        # 头与其后第一个 [[ 体之间若夹着下一个 desc= 头（实测相隔 106 行 = 整条记录），
+        # 说明本条体已丢——必须弃头，不得借下一条的体（曾据此误报"全 tile 撕裂
+        # 比值 ((h+2)/(h+1))²"，实为借体假象；真撕裂是首 1-2 行、比值 (h+2)/(h+1)）。
+        nxt = chunk.find("desc=", i + 6)
+        if nxt >= 0 and nxt < j:
+            i += 6
+            continue
         k = chunk.find("]]", j)
         out.append(torch.tensor([float(x) for x in NUM.findall(chunk[j:k])]))
         i = k

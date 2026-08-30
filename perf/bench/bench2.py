@@ -124,8 +124,8 @@ def run_one(batch, seqlen, nheads, headdim, dtype, causal, softcap,
 def main():
     # batch = 320     NUM_HEADS = 24    NUM_HEADS_KV = 4   HEAD_DIM = 128 AVG_SEQ_LEN = 150      MIN_SEQ_LEN = 32   MAX_SEQ_LEN = 512
     ap = argparse.ArgumentParser(description="FA v2 vs npu_fusion_attention bench (small-seq, large-batch)")
-    ap.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16, 64, 256, 320, 1024, 2048],
-                    help="batch 列表（默认聚焦大 batch）")
+    # ap.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16, 64, 256, 320, 1024, 2048], help="batch 列表（默认聚焦大 batch）")
+    ap.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16, 64, 256, 320, 1024], help="batch 列表（默认聚焦大 batch）")
     ap.add_argument("--seqlen", type=int, nargs="+", default=[32, 64, 128, 256, 512], help="seqlen 列表（默认含小 seqlen）")
     # ap.add_argument("--seqlen", type=int, nargs="+", default=[32, 64, 128, 256, 512, 2048, 4096], help="seqlen 列表（默认含小 seqlen）")
     ap.add_argument("--nheads", type=int, default=24)
