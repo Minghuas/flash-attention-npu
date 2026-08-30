@@ -50,6 +50,7 @@ struct FAMetadataArgs {
     uint32_t pagedKV;
     float scaleValue;
     float softcapValue;
+    int64_t alibiSlopesBatchStride;
     int64_t windowSizeLeft;
     int64_t windowSizeRight;
 };

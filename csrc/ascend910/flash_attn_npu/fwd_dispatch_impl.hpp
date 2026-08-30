@@ -22,7 +22,7 @@
         <<<blockDim, nullptr, aclStream>>>(                                                  \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,               \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                              \
-            workspaceDevice, tilingDevice, kNewDevice, vNewDevice);
+            workspaceDevice, tilingDevice, alibiSlopesDevice, kNewDevice, vNewDevice);
 
 // BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
 // branch fixes the runtime bool as a named constexpr flag, so the dispatch

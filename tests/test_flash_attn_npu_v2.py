@@ -14,6 +14,7 @@ from tests.common.compare import assert_fa_close
 from tests.common.test_utils import (
     gather_paged_kv,
     gather_paged_kv_batch,
+    make_alibi_slopes,
     make_attention_inputs,
     make_block_table,
     make_cu_seqlens,
@@ -45,100 +46,107 @@ from tests.common.test_utils import (
 
 # Additional coverage: tiny head sizes 1/2/4, large-GQA decode, and special SWA windows
 
-def make_alibi_slopes(batch_size, num_heads):
-    _h = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
-    return _h.unsqueeze(0).repeat(batch_size, 1)
-
 test_cases = [
     # data_type=torch.float16, is_causal=False, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
-    (torch.float16, 2, 6, 6, 16, 131072, 64, 0, 128, False, 512, 0, 2.0, False),
-    (torch.float16, 2, 6, 3, 1, 128, 128, 0, 128, False, -1, -1, 0.0, False),
-    (torch.float16, 2, 6, 6, 3, 799, 64, 0, 128, False, -1, -1, 0.0, False),
-    (torch.float16, 2, 6, 3, 64, 256, 128, 0, 128, False, 512, 0, 2.0, False),
-    (torch.float16, 2, 6, 1, 16, 20000, 32, 0, 128, False, -1, -1, 2.0, False),
-    (torch.float16, 2, 6, 1, 3, 1024, 32, 0, 128, False, 512, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 16, 131072, 64, 0, 128, False, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 3, 1, 128, 128, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 3, 799, 64, 0, 128, False, -1, -1, 0.0, False, False),
+    (torch.float16, 2, 6, 3, 64, 256, 128, 0, 128, False, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 1, 16, 20000, 32, 0, 128, False, -1, -1, 2.0, False, False),
+    (torch.float16, 2, 6, 1, 3, 1024, 32, 0, 128, False, 512, 0, 0.0, False, False),
     # data_type=torch.bfloat16, is_causal=False, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 2, 6, 3, 1, 128, 128, 0, 128, False, 0, 256, 0.0, False),
-    (torch.bfloat16, 2, 6, 3, 64, 256, 128, 0, 128, False, 542, 647, 2.0, False),
-    (torch.bfloat16, 2, 6, 6, 3, 799, 64, 0, 128, False, 542, 647, 2.0, False),
-    (torch.bfloat16, 2, 6, 6, 16, 20000, 64, 0, 128, False, 0, 256, 0.0, False),
-    (torch.bfloat16, 2, 6, 1, 3, 1024, 32, 0, 128, False, 542, 647, 0.0, False),
-    (torch.bfloat16, 2, 6, 1, 16, 131072, 32, 0, 128, False, 0, 256, 2.0, False),
+    (torch.bfloat16, 2, 6, 3, 1, 128, 128, 0, 128, False, 0, 256, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 3, 64, 256, 128, 0, 128, False, 542, 647, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 3, 799, 64, 0, 128, False, 542, 647, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 16, 20000, 64, 0, 128, False, 0, 256, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 1, 3, 1024, 32, 0, 128, False, 542, 647, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 1, 16, 131072, 32, 0, 128, False, 0, 256, 2.0, False, False),
     # data_type=torch.float16, is_causal=True, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
-    (torch.float16, 2, 6, 3, 64, 800, 64, 0, 128, True, 512, 0, 2.0, False),
-    (torch.float16, 2, 6, 6, 1, 131072, 32, 0, 128, True, 512, 0, 2.0, False),
-    (torch.float16, 2, 6, 1, 1, 339, 128, 0, 128, True, 512, 0, 0.0, False),
-    (torch.float16, 2, 6, 3, 64, 2048, 64, 0, 128, True, -1, -1, 0.0, False),
-    (torch.float16, 2, 6, 6, 64, 800, 32, 0, 128, True, -1, -1, 0.0, False),
-    (torch.float16, 2, 6, 1, 128, 128, 128, 0, 128, True, -1, -1, 2.0, False),
+    (torch.float16, 2, 6, 3, 64, 800, 64, 0, 128, True, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 6, 1, 131072, 32, 0, 128, True, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 1, 1, 339, 128, 0, 128, True, 512, 0, 0.0, False, False),
+    (torch.float16, 2, 6, 3, 64, 2048, 64, 0, 128, True, -1, -1, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 64, 800, 32, 0, 128, True, -1, -1, 0.0, False, False),
+    (torch.float16, 2, 6, 1, 128, 128, 128, 0, 128, True, -1, -1, 2.0, False, False),
     # data_type=torch.bfloat16, is_causal=True, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 2, 6, 1, 128, 128, 64, 0, 128, True, 0, 256, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 64, 800, 32, 0, 128, True, 0, 256, 2.0, False),
-    (torch.bfloat16, 2, 6, 1, 1, 339, 64, 0, 128, True, 542, 647, 2.0, False),
-    (torch.bfloat16, 2, 6, 6, 64, 2048, 32, 0, 128, True, 542, 647, 0.0, False),
-    (torch.bfloat16, 2, 6, 3, 1, 131072, 128, 0, 128, True, 542, 647, 0.0, False),
-    (torch.bfloat16, 2, 6, 3, 64, 2048, 128, 0, 128, True, 0, 256, 2.0, False),
+    (torch.bfloat16, 2, 6, 1, 128, 128, 64, 0, 128, True, 0, 256, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 64, 800, 32, 0, 128, True, 0, 256, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 1, 1, 339, 64, 0, 128, True, 542, 647, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 64, 2048, 32, 0, 128, True, 542, 647, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 3, 1, 131072, 128, 0, 128, True, 542, 647, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 3, 64, 2048, 128, 0, 128, True, 0, 256, 2.0, False, False),
     # data_type=torch.float16, is_causal=False, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
-    (torch.float16, 2, 6, 1, 3, 799, 59, 1, 128, False, 512, 0, 0.0, False),
-    (torch.float16, 2, 6, 6, 16, 131072, 80, 1, 128, False, 512, 0, 2.0, False),
-    (torch.float16, 2, 6, 1, 16, 20000, 59, 1, 128, False, -1, -1, 2.0, False),
-    (torch.float16, 2, 6, 3, 3, 1024, 256, 1, 128, False, 512, 0, 2.0, False),
-    (torch.float16, 2, 6, 6, 1, 128, 80, 1, 128, False, -1, -1, 0.0, False),
-    (torch.float16, 2, 6, 3, 64, 256, 256, 1, 128, False, -1, -1, 0.0, False),
+    (torch.float16, 2, 6, 1, 3, 799, 59, 1, 128, False, 512, 0, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 16, 131072, 80, 1, 128, False, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 1, 16, 20000, 59, 1, 128, False, -1, -1, 2.0, False, False),
+    (torch.float16, 2, 6, 3, 3, 1024, 256, 1, 128, False, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 6, 1, 128, 80, 1, 128, False, -1, -1, 0.0, False, False),
+    (torch.float16, 2, 6, 3, 64, 256, 256, 1, 128, False, -1, -1, 0.0, False, False),
     # data_type=torch.bfloat16, is_causal=False, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 2, 6, 1, 1, 128, 80, 1, 128, False, 0, 256, 2.0, False),
-    (torch.bfloat16, 2, 6, 3, 64, 256, 256, 1, 128, False, 0, 256, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 3, 799, 59, 1, 128, False, 0, 256, 0.0, False),
-    (torch.bfloat16, 2, 6, 1, 16, 20000, 80, 1, 128, False, 542, 647, 0.0, False),
-    (torch.bfloat16, 2, 6, 3, 3, 1024, 256, 1, 128, False, 542, 647, 2.0, False),
-    (torch.bfloat16, 2, 6, 6, 16, 131072, 59, 1, 128, False, 542, 647, 2.0, False),
+    (torch.bfloat16, 2, 6, 1, 1, 128, 80, 1, 128, False, 0, 256, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 3, 64, 256, 256, 1, 128, False, 0, 256, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 3, 799, 59, 1, 128, False, 0, 256, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 1, 16, 20000, 80, 1, 128, False, 542, 647, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 3, 3, 1024, 256, 1, 128, False, 542, 647, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 16, 131072, 59, 1, 128, False, 542, 647, 2.0, False, False),
     # data_type=torch.float16, is_causal=True, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
-    (torch.float16, 2, 6, 1, 128, 128, 80, 1, 128, True, 512, 0, 2.0, False),
-    (torch.float16, 2, 6, 6, 1, 131072, 59, 1, 128, True, 512, 0, 0.0, False),
-    (torch.float16, 2, 6, 3, 1, 131072, 256, 1, 128, True, -1, -1, 2.0, False),
-    (torch.float16, 2, 6, 6, 64, 2048, 59, 1, 128, True, -1, -1, 2.0, False),
-    (torch.float16, 2, 6, 3, 64, 800, 256, 1, 128, True, 512, 0, 0.0, False),
-    (torch.float16, 2, 6, 1, 1, 339, 80, 1, 128, True, -1, -1, 0.0, False),
+    (torch.float16, 2, 6, 1, 128, 128, 80, 1, 128, True, 512, 0, 2.0, False, False),
+    (torch.float16, 2, 6, 6, 1, 131072, 59, 1, 128, True, 512, 0, 0.0, False, False),
+    (torch.float16, 2, 6, 3, 1, 131072, 256, 1, 128, True, -1, -1, 2.0, False, False),
+    (torch.float16, 2, 6, 6, 64, 2048, 59, 1, 128, True, -1, -1, 2.0, False, False),
+    (torch.float16, 2, 6, 3, 64, 800, 256, 1, 128, True, 512, 0, 0.0, False, False),
+    (torch.float16, 2, 6, 1, 1, 339, 80, 1, 128, True, -1, -1, 0.0, False, False),
     # data_type=torch.bfloat16, is_causal=True, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 2, 6, 3, 1, 339, 256, 1, 128, True, 542, 647, 0.0, False),
-    (torch.bfloat16, 2, 6, 1, 64, 2048, 59, 1, 128, True, 0, 256, 0.0, False),
-    (torch.bfloat16, 2, 6, 1, 1, 131072, 59, 1, 128, True, 542, 647, 2.0, False),
-    (torch.bfloat16, 2, 6, 6, 128, 128, 80, 1, 128, True, 542, 647, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 64, 800, 80, 1, 128, True, 0, 256, 2.0, False),
-    (torch.bfloat16, 2, 6, 3, 128, 128, 256, 1, 128, True, 0, 256, 2.0, False),
+    (torch.bfloat16, 2, 6, 3, 1, 339, 256, 1, 128, True, 542, 647, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 1, 64, 2048, 59, 1, 128, True, 0, 256, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 1, 1, 131072, 59, 1, 128, True, 542, 647, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 128, 128, 80, 1, 128, True, 542, 647, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 64, 800, 80, 1, 128, True, 0, 256, 2.0, False, False),
+    (torch.bfloat16, 2, 6, 3, 128, 128, 256, 1, 128, True, 0, 256, 2.0, False, False),
     # Tiny head sizes: 1, 2, and 4
-    (torch.bfloat16, 2, 6, 6, 256, 512, 1, 0, 128, True, -1, -1, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 256, 512, 2, 0, 128, True, -1, -1, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 256, 512, 4, 0, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 1, 0, 128, True, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 2, 0, 128, True, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 4, 0, 128, True, -1, -1, 0.0, False, False),
     # Large num_heads/GQA decode: (64,8), (128,16), and (512,1)
     (torch.bfloat16, 2, 64, 8, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False),
     (torch.bfloat16, 2, 128, 16, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False),
     (torch.float16, 2, 512, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
     # Special SWA windows: (826,973), (127,0), (65,412), (59,571), (746,16), and (512,0)
-    (torch.float16, 2, 6, 6, 512, 1024, 128, 0, 128, True, 826, 973, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 512, 512, 128, 0, 128, True, 127, 0, 0.0, False),
-    (torch.float16, 2, 6, 6, 512, 512, 128, 0, 128, False, 65, 412, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 256, 512, 128, 0, 128, False, 59, 571, 0.0, False),
-    (torch.float16, 2, 6, 6, 512, 1024, 128, 1, 128, True, 746, 16, 0.0, False),
-    (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0, False),
+    (torch.float16, 2, 6, 6, 512, 1024, 128, 0, 128, True, 826, 973, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 512, 512, 128, 0, 128, True, 127, 0, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 512, 512, 128, 0, 128, False, 65, 412, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 256, 512, 128, 0, 128, False, 59, 571, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 512, 1024, 128, 1, 128, True, 746, 16, 0.0, False, False),
+    (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0, False, False),
     # Additional negative-side windows: (508,-256) and (-128,864)
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False),
     (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False),
+    # ALiBi 
+    (torch.float16, 1, 4, 4, 512, 512, 128, 0, 128, False, -1, -1, 0.0, True, False),
+    (torch.bfloat16, 2, 8, 8, 1024, 2077, 128, 0, 128, True, -1, -1, 0.0, True, False),
+    (torch.float16, 4, 8, 2, 257, 257, 128, 0, 128, False, -1, -1, 0.0, True, False),
+    (torch.bfloat16, 2, 10, 2, 256, 256, 128, 0, 128, True, -1, -1, 0.0, True, False),
+    (torch.bfloat16, 1, 4, 4, 512, 1024, 128, 0, 128, False, -1, -1, 0.0, True, False),
+    (torch.float16, 2, 8, 2, 513, 513, 128, 0, 128, False, -1, -1, 30.0, True, False),
+    (torch.bfloat16, 4, 16, 4, 512, 512, 128, 0, 128, True, -1, -1, 50.0, True, False),
+    (torch.bfloat16, 1, 4, 2, 257, 257, 256, 0, 128, True, -1, -1, 30.0, True, False),
+    (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False, False),
     # AppendKV
-    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 0.0, True),
-    (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, -1, -1, 0.0, True),
-    (torch.bfloat16, 1, 16, 2, 1024, 2048, 128, 1, 128, True, -1, -1, 0.0, True),
-    (torch.bfloat16, 2, 4, 2, 513, 2048, 128, 1, 128, False, -1, -1, 0.0, True),
-    (torch.bfloat16, 1, 16, 2, 128, 2048, 128, 0, 128, False, -1, -1, 0.0, True),
-    (torch.bfloat16, 1, 8, 2, 512, 1024, 128, 0, 128, True, -1, -1, 0.0, True),
+    (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 0.0, False, True),
+    (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, -1, -1, 0.0, False, True),
+    (torch.bfloat16, 1, 16, 2, 1024, 2048, 128, 1, 128, True, -1, -1, 0.0, False, True),
+    (torch.bfloat16, 2, 4, 2, 513, 2048, 128, 1, 128, False, -1, -1, 0.0, False, True),
+    (torch.bfloat16, 1, 16, 2, 128, 2048, 128, 0, 128, False, -1, -1, 0.0, True, True),
+    (torch.bfloat16, 1, 8, 2, 512, 1024, 128, 0, 128, True, -1, -1, 0.0, True, True),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv", test_cases)
@@ -192,14 +200,12 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     rotary_sin = None
     cache_batch_idx = None
     leftpad_k = None
-
     if use_alibi:
         alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
         alibi_slopes = alibi_slopes_cpu.npu()
     else:
         alibi_slopes = None
         alibi_slopes_cpu = None
-    
     window_size_left_golden = window_size_left
     window_size_right_golden = window_size_right
     # Match Tri Dao GPU host: both sides vs kv_seqlen.
@@ -287,7 +293,7 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
             out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
                 query_cpu[i : i + 1], key_batched_i.unsqueeze(0), value_batched_i.unsqueeze(0), scale,
                 atten_mask_i if (is_causal_i or is_local_i) else None,
-                data_type, softcap,
+                data_type, softcap, alibi_slopes_cpu[i]
             )
             out_ref, out_pt = out_ref[0], out_pt[0]
             lse_ref, lse_pt = lse_ref[0], lse_pt[0]
@@ -310,7 +316,8 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
             atten_mask if (is_causal_golden or is_local_golden) else None,
             data_type,
             softcap,
-        )
+            alibi_slopes=alibi_slopes_cpu,
+    )
         if atten_mask is not None:
             fully_masked = atten_mask.all(dim=-1)
             golden_out_ref[:, fully_masked] = 0
@@ -340,81 +347,90 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
 func_cases = [
     # data_type=torch.float16, False, False
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 256, 512, 40, False, False, -1, -1, 0.0, 0.0),
-    (torch.float16, 4, 6, 1, 108, 256, 96, False, False, 0, 256, 0.0, 0.0),
-    (torch.float16, 4, 6, 2, 113, 211, 59, False, False, 64, 128, 0.0, 0.0),
-    (torch.float16, 4, 4, 4, 113, 203, 111, False, False, -1, -1, 2.0, 0.0),
-    (torch.float16, 4, 4, 1, 128, 217, 64, False, False, 0, 256, 2.0, 0.0),
-    (torch.float16, 4, 4, 2, 256, 512, 32, False, False, 64, 128, 2.0, 0.0),
+    (torch.float16, 4, 6, 6, 256, 512, 40, False, False, -1, -1, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 1, 108, 256, 96, False, False, 0, 256, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 2, 113, 211, 59, False, False, 64, 128, 0.0, 0.0, False),
+    (torch.float16, 4, 4, 4, 113, 203, 111, False, False, -1, -1, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 1, 128, 217, 64, False, False, 0, 256, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 2, 256, 512, 32, False, False, 64, 128, 2.0, 0.0, False),
     # data_type=torch.bfloat16, False, False
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 113, 203, 40, False, False, 512, 0, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 1, 128, 217, 64, False, False, 542, 647, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 2, 113, 211, 96, False, False, 826, 973, 0.0, 0.0),
-    (torch.bfloat16, 4, 4, 4, 256, 512, 32, False, False, 512, 0, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 1, 108, 256, 59, False, False, 542, 647, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 2, 113, 203, 111, False, False, 826, 973, 2.0, 0.0),
+    (torch.bfloat16, 4, 6, 6, 113, 203, 40, False, False, 512, 0, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 128, 217, 64, False, False, 542, 647, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 113, 211, 96, False, False, 826, 973, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 256, 512, 32, False, False, 512, 0, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 108, 256, 59, False, False, 542, 647, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 113, 203, 111, False, False, 826, 973, 2.0, 0.0, False),
     # data_type=torch.float16, False, True
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 1024, 1024, 111, False, True, 0, 256, 0.0, 0.0),
-    (torch.float16, 4, 6, 1, 1024, 1023, 59, False, True, -1, -1, 0.0, 0.0),
-    (torch.float16, 4, 6, 2, 512, 256, 32, False, True, 64, 128, 0.0, 0.0),
-    (torch.float16, 4, 4, 4, 2048, 2048, 96, False, True, 0, 256, 2.0, 0.0),
-    (torch.float16, 4, 4, 1, 1023, 1024, 40, False, True, -1, -1, 2.0, 0.0),
-    (torch.float16, 4, 4, 2, 1024, 1024, 64, False, True, 64, 128, 2.0, 0.0),
+    (torch.float16, 4, 6, 6, 1024, 1024, 111, False, True, 0, 256, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 1, 1024, 1023, 59, False, True, -1, -1, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 2, 512, 256, 32, False, True, 64, 128, 0.0, 0.0, False),
+    (torch.float16, 4, 4, 4, 2048, 2048, 96, False, True, 0, 256, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 1, 1023, 1024, 40, False, True, -1, -1, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 2, 1024, 1024, 64, False, True, 64, 128, 2.0, 0.0, False),
     # data_type=torch.bfloat16, False, True
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 1024, 1023, 64, False, True, 512, 0, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 1, 1023, 1024, 59, False, True, 826, 973, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 2, 1024, 1024, 40, False, True, 542, 647, 0.0, 0.0),
-    (torch.bfloat16, 4, 4, 4, 2048, 2048, 32, False, True, 512, 0, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 1, 512, 256, 96, False, True, 826, 973, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 2, 1024, 1023, 111, False, True, 542, 647, 2.0, 0.0),
+    (torch.bfloat16, 4, 6, 6, 1024, 1023, 64, False, True, 512, 0, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 1023, 1024, 59, False, True, 826, 973, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 1024, 1024, 40, False, True, 542, 647, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 2048, 2048, 32, False, True, 512, 0, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 512, 256, 96, False, True, 826, 973, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 1024, 1023, 111, False, True, 542, 647, 2.0, 0.0, False),
     # data_type=torch.float16, True, False
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 256, 512, 256, True, False, -1, -1, 0.0, 0.0),
-    (torch.float16, 4, 6, 1, 113, 203, 128, True, False, 64, 128, 0.0, 0.0),
-    (torch.float16, 4, 6, 2, 108, 256, 224, True, False, 0, 256, 0.0, 0.0),
-    (torch.float16, 4, 4, 4, 113, 211, 192, True, False, -1, -1, 2.0, 0.0),
-    (torch.float16, 4, 4, 1, 128, 217, 160, True, False, 64, 128, 2.0, 0.0),
-    (torch.float16, 4, 4, 2, 256, 512, 256, True, False, 0, 256, 2.0, 0.0),
+    (torch.float16, 4, 6, 6, 256, 512, 256, True, False, -1, -1, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 1, 113, 203, 128, True, False, 64, 128, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 2, 108, 256, 224, True, False, 0, 256, 0.0, 0.0, False),
+    (torch.float16, 4, 4, 4, 113, 211, 192, True, False, -1, -1, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 1, 128, 217, 160, True, False, 64, 128, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 2, 256, 512, 256, True, False, 0, 256, 2.0, 0.0, False),
     # data_type=torch.bfloat16, True, False
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 256, 512, 256, True, False, 512, 0, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 1, 128, 217, 160, True, False, 542, 647, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 2, 113, 211, 192, True, False, 826, 973, 0.0, 0.0),
-    (torch.bfloat16, 4, 4, 4, 108, 256, 224, True, False, 512, 0, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 1, 113, 203, 128, True, False, 542, 647, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 2, 256, 512, 256, True, False, 826, 973, 2.0, 0.0),
+    (torch.bfloat16, 4, 6, 6, 256, 512, 256, True, False, 512, 0, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 128, 217, 160, True, False, 542, 647, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 113, 211, 192, True, False, 826, 973, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 108, 256, 224, True, False, 512, 0, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 113, 203, 128, True, False, 542, 647, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 256, 512, 256, True, False, 826, 973, 2.0, 0.0, False),
     # data_type=torch.float16, True, True
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 1024, 1024, 160, True, True, -1, -1, 0.0, 0.0),
-    (torch.float16, 4, 6, 1, 1023, 1024, 192, True, True, 64, 128, 0.0, 0.0),
-    (torch.float16, 4, 6, 2, 512, 256, 128, True, True, 0, 256, 0.0, 0.0),
-    (torch.float16, 4, 4, 4, 2048, 2048, 256, True, True, -1, -1, 2.0, 0.0),
-    (torch.float16, 4, 4, 1, 1024, 1023, 224, True, True, 64, 128, 2.0, 0.0),
-    (torch.float16, 4, 4, 2, 1024, 1024, 160, True, True, 0, 256, 2.0, 0.0),
+    (torch.float16, 4, 6, 6, 1024, 1024, 160, True, True, -1, -1, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 1, 1023, 1024, 192, True, True, 64, 128, 0.0, 0.0, False),
+    (torch.float16, 4, 6, 2, 512, 256, 128, True, True, 0, 256, 0.0, 0.0, False),
+    (torch.float16, 4, 4, 4, 2048, 2048, 256, True, True, -1, -1, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 1, 1024, 1023, 224, True, True, 64, 128, 2.0, 0.0, False),
+    (torch.float16, 4, 4, 2, 1024, 1024, 160, True, True, 0, 256, 2.0, 0.0, False),
     # data_type=torch.bfloat16, True, True
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 1023, 1024, 192, True, True, 512, 0, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 1, 2048, 2048, 256, True, True, 826, 973, 0.0, 0.0),
-    (torch.bfloat16, 4, 6, 2, 512, 256, 128, True, True, 542, 647, 0.0, 0.0),
-    (torch.bfloat16, 4, 4, 4, 1024, 1023, 224, True, True, 512, 0, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 1, 1024, 1024, 160, True, True, 826, 973, 2.0, 0.0),
-    (torch.bfloat16, 4, 4, 2, 1023, 1024, 192, True, True, 542, 647, 2.0, 0.0),
+    (torch.bfloat16, 4, 6, 6, 1023, 1024, 192, True, True, 512, 0, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 2048, 2048, 256, True, True, 826, 973, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 512, 256, 128, True, True, 542, 647, 0.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 1024, 1023, 224, True, True, 512, 0, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 1024, 1024, 160, True, True, 826, 973, 2.0, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 1023, 1024, 192, True, True, 542, 647, 2.0, 0.0, False),
     # Dropout forward cases; return_attn_probs must be True to recover the mask.
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 0.0, 0.5),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 0.0, 0.1),
-    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, -1, -1, 0.0, 0.3),
-    (torch.float16, 2, 2, 1, 777, 888, 128, True, False, -1, -1, 0.0, 0.2),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, -1, -1, 30.0, 0.1),
-    (torch.float16, 2, 4, 4, 128, 128, 128, True, True, -1, -1, 0.0, 0.5),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 0.0, 0.5, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 0.0, 0.1, False),
+    (torch.float16, 7, 1, 1, 512, 512, 128, True, False, -1, -1, 0.0, 0.3, False),
+    (torch.float16, 2, 2, 1, 777, 888, 128, True, False, -1, -1, 0.0, 0.2, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, -1, -1, 30.0, 0.1, False),
+    (torch.float16, 2, 4, 4, 128, 128, 128, True, True, -1, -1, 0.0, 0.5, False),
     # Dropout backward regression cases from the former standalone v2_bwd test.
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 0.0, 0.3),
-    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 0.0, 0.5),
-    (torch.bfloat16, 4, 2, 1, 513, 513, 128, True, False, -1, -1, 0.0, 0.1),
-    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, True, -1, -1, 30.0, 0.3),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 0, 0.0, 0.3),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, False, -1, -1, 0.0, 0.3, False),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 0.0, 0.5, False),
+    (torch.bfloat16, 4, 2, 1, 513, 513, 128, True, False, -1, -1, 0.0, 0.1, False),
+    (torch.float16, 1, 1, 1, 1024, 1024, 128, True, True, -1, -1, 30.0, 0.3, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 0, 0.0, 0.3, False),
+    # ALiBi
+    (torch.float16, 1, 4, 4, 512, 512, 128, True, False, -1, -1, 0.0, 0.0, True),
+    (torch.bfloat16, 5, 4, 4, 1024, 1024, 128, True, True, -1, -1, 0.0, 0.0, True),
+    (torch.float16, 4, 4, 1, 513, 513, 128, False, False, -1, -1, 0.0, 0.0, True),
+    (torch.bfloat16, 2, 10, 2, 256, 256, 128, False, True, -1, -1, 0.0, 0.0, True),
+    (torch.float16, 1, 2, 2, 512, 1024, 128, False, False, -1, -1, 0.0, 0.0, True),
+    (torch.bfloat16, 4, 8, 2, 257, 257, 128, False, False, -1, -1, 30.0, 0.0, True), # 3 出错
+    (torch.float16, 2, 4, 2, 513, 513, 128, True, True, -1, -1, 50.0, 0.0, True),
+    (torch.bfloat16, 1, 4, 4, 512, 512, 256, True, False, -1, -1, 30.0, 0.0, True),
 ]
 
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi", func_cases)
@@ -469,7 +485,7 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
     )
     golden_out_ref, golden_lseL_ref, golden_out_pt, golden_lseL_pt = ref_flash_attention_pair(
         query_ref, key_ref, value_ref, scale, atten_mask, data_type, softcap,
-        drop_mask=drop_mask, dropout_p=dropout_p,
+        drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
     )
     if atten_mask is not None:
         fully_masked = atten_mask.all(dim=-1)
@@ -521,82 +537,95 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
 varlen_cases = [
     # data_type=torch.float16, is_causal=False, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 113, 203, 59, False, -1, -1, 0.0, 0, 128, 0.0),
-    (torch.float16, 4, 6, 1, 108, 256, 96, False, 0, 256, 0.0, 0, 128, 0.0),
-    (torch.float16, 4, 6, 2, 128, 217, 64, False, 64, 128, 0.0, 0, 128, 0.0),
-    (torch.float16, 4, 4, 4, 256, 512, 111, False, -1, -1, 2.0, 0, 128, 0.0),
-    (torch.float16, 4, 4, 1, 113, 211, 80, False, 0, 256, 2.0, 0, 128, 0.0),
-    (torch.float16, 4, 4, 2, 1, 147, 32, False, 64, 128, 2.0, 0, 128, 0.0),
+    (torch.float16, 4, 6, 6, 113, 203, 59, False, -1, -1, 0.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 6, 1, 108, 256, 96, False, 0, 256, 0.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 6, 2, 128, 217, 64, False, 64, 128, 0.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 4, 4, 256, 512, 111, False, -1, -1, 2.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 4, 1, 113, 211, 80, False, 0, 256, 2.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 4, 2, 1, 147, 32, False, 64, 128, 2.0, 0, 128, 0.0, False),
     # data_type=torch.bfloat16, is_causal=False, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 113, 203, 59, False, 512, 0, 0.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 6, 1, 113, 211, 80, False, 542, 647, 0.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 6, 2, 108, 256, 96, False, 826, 973, 0.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 4, 4, 1, 147, 32, False, 512, 0, 2.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 4, 1, 128, 217, 64, False, 542, 647, 2.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 4, 2, 256, 512, 111, False, 826, 973, 2.0, 0, 128, 0.0),
+    (torch.bfloat16, 4, 6, 6, 113, 203, 59, False, 512, 0, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 113, 211, 80, False, 542, 647, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 108, 256, 96, False, 826, 973, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 1, 147, 32, False, 512, 0, 2.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 128, 217, 64, False, 542, 647, 2.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 256, 512, 111, False, 826, 973, 2.0, 0, 128, 0.0, False),
     # data_type=torch.float16, is_causal=True, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 1024, 1024, 111, True, 0, 256, 0.0, 0, 128, 0.0),
-    (torch.float16, 4, 6, 1, 1024, 1023, 64, True, -1, -1, 0.0, 0, 128, 0.0),
-    (torch.float16, 4, 6, 2, 512, 256, 32, True, 64, 128, 0.0, 0, 128, 0.0),
-    (torch.float16, 4, 4, 4, 2048, 2048, 96, True, 0, 256, 2.0, 0, 128, 0.0),
-    (torch.float16, 4, 4, 1, 1023, 1024, 59, True, -1, -1, 2.0, 0, 128, 0.0),
-    (torch.float16, 4, 4, 2, 1024, 1024, 80, True, 64, 128, 2.0, 0, 128, 0.0),
+    (torch.float16, 4, 6, 6, 1024, 1024, 111, True, 0, 256, 0.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 6, 1, 1024, 1023, 64, True, -1, -1, 0.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 6, 2, 512, 256, 32, True, 64, 128, 0.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 4, 4, 2048, 2048, 96, True, 0, 256, 2.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 4, 1, 1023, 1024, 59, True, -1, -1, 2.0, 0, 128, 0.0, False),
+    (torch.float16, 4, 4, 2, 1024, 1024, 80, True, 64, 128, 2.0, 0, 128, 0.0, False),
     # data_type=torch.bfloat16, is_causal=True, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 1024, 1023, 80, True, 512, 0, 0.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 6, 1, 1023, 1024, 64, True, 826, 973, 0.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 6, 2, 1024, 1024, 59, True, 542, 647, 0.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 4, 4, 2048, 2048, 32, True, 512, 0, 2.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 4, 1, 512, 256, 96, True, 826, 973, 2.0, 0, 128, 0.0),
-    (torch.bfloat16, 4, 4, 2, 1024, 1023, 111, True, 542, 647, 2.0, 0, 128, 0.0),
+    (torch.bfloat16, 4, 6, 6, 1024, 1023, 80, True, 512, 0, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 1023, 1024, 64, True, 826, 973, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 1024, 1024, 59, True, 542, 647, 0.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 2048, 2048, 32, True, 512, 0, 2.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 512, 256, 96, True, 826, 973, 2.0, 0, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 1024, 1023, 111, True, 542, 647, 2.0, 0, 128, 0.0, False),
     # data_type=torch.float16, is_causal=False, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 113, 203, 256, False, -1, -1, 0.0, 1, 128, 0.0),
-    (torch.float16, 4, 6, 1, 108, 256, 128, False, 64, 128, 0.0, 1, 128, 0.0),
-    (torch.float16, 4, 6, 2, 113, 211, 224, False, 0, 256, 0.0, 1, 128, 0.0),
-    (torch.float16, 4, 4, 4, 1, 147, 192, False, -1, -1, 2.0, 1, 128, 0.0),
-    (torch.float16, 4, 4, 1, 128, 217, 160, False, 64, 128, 2.0, 1, 128, 0.0),
-    (torch.float16, 4, 4, 2, 256, 512, 256, False, 0, 256, 2.0, 1, 128, 0.0),
+    (torch.float16, 4, 6, 6, 113, 203, 256, False, -1, -1, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 6, 1, 108, 256, 128, False, 64, 128, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 6, 2, 113, 211, 224, False, 0, 256, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 4, 4, 1, 147, 192, False, -1, -1, 2.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 4, 1, 128, 217, 160, False, 64, 128, 2.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 4, 2, 256, 512, 256, False, 0, 256, 2.0, 1, 128, 0.0, False),
     # data_type=torch.bfloat16, is_causal=False, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 1, 147, 256, False, 512, 0, 0.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 6, 1, 256, 512, 160, False, 542, 647, 0.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 6, 2, 108, 256, 192, False, 826, 973, 0.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 4, 4, 113, 211, 224, False, 512, 0, 2.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 4, 1, 113, 203, 128, False, 542, 647, 2.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 4, 2, 128, 217, 256, False, 826, 973, 2.0, 1, 128, 0.0),
+    (torch.bfloat16, 4, 6, 6, 1, 147, 256, False, 512, 0, 0.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 256, 512, 160, False, 542, 647, 0.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 108, 256, 192, False, 826, 973, 0.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 113, 211, 224, False, 512, 0, 2.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 113, 203, 128, False, 542, 647, 2.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 128, 217, 256, False, 826, 973, 2.0, 1, 128, 0.0, False),
     # data_type=torch.float16, is_causal=True, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=A
-    (torch.float16, 4, 6, 6, 1024, 1024, 160, True, -1, -1, 0.0, 1, 128, 0.0),
-    (torch.float16, 4, 6, 1, 1023, 1024, 192, True, 64, 128, 0.0, 1, 128, 0.0),
-    (torch.float16, 4, 6, 2, 512, 256, 128, True, 0, 256, 0.0, 1, 128, 0.0),
-    (torch.float16, 4, 4, 4, 2048, 2048, 256, True, -1, -1, 2.0, 1, 128, 0.0),
-    (torch.float16, 4, 4, 1, 1024, 1023, 224, True, 64, 128, 2.0, 1, 128, 0.0),
-    (torch.float16, 4, 4, 2, 1024, 1024, 160, True, 0, 256, 2.0, 1, 128, 0.0),
+    (torch.float16, 4, 6, 6, 1024, 1024, 160, True, -1, -1, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 6, 1, 1023, 1024, 192, True, 64, 128, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 6, 2, 512, 256, 128, True, 0, 256, 0.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 4, 4, 2048, 2048, 256, True, -1, -1, 2.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 4, 1, 1024, 1023, 224, True, 64, 128, 2.0, 1, 128, 0.0, False),
+    (torch.float16, 4, 4, 2, 1024, 1024, 160, True, 0, 256, 2.0, 1, 128, 0.0, False),
     # data_type=torch.bfloat16, is_causal=True, cache_mode=1
     # softcap,num_heads,kv_heads=A, head_size=B, (q_seqlen,kv_seqlen)=B, (window_size_left,window_size_right)=B
-    (torch.bfloat16, 4, 6, 6, 1023, 1024, 192, True, 512, 0, 0.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 6, 1, 2048, 2048, 256, True, 826, 973, 0.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 6, 2, 512, 256, 128, True, 542, 647, 0.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 4, 4, 1024, 1023, 224, True, 512, 0, 2.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 4, 1, 1024, 1024, 160, True, 826, 973, 2.0, 1, 128, 0.0),
-    (torch.bfloat16, 4, 4, 2, 1023, 1024, 192, True, 542, 647, 2.0, 1, 128, 0.0),
+    (torch.bfloat16, 4, 6, 6, 1023, 1024, 192, True, 512, 0, 0.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 1, 2048, 2048, 256, True, 826, 973, 0.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 6, 2, 512, 256, 128, True, 542, 647, 0.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 4, 1024, 1023, 224, True, 512, 0, 2.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 1, 1024, 1024, 160, True, 826, 973, 2.0, 1, 128, 0.0, False),
+    (torch.bfloat16, 4, 4, 2, 1023, 1024, 192, True, 542, 647, 2.0, 1, 128, 0.0, False),
     # Dropout forward cases.
-    (torch.bfloat16, 3, 1, 1, 512, 512, 128, False, -1, -1, 0.0, 0, 128, 0.3),
-    (torch.float16, 5, 5, 1, 777, 888, 128, True, -1, -1, 0.0, 0, 128, 0.2),
-    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -1, -1, 30.0, 0, 128, 0.1),
-    (torch.float16, 2, 4, 2, 512, 512, 128, False, -1, -1, 0.0, 1, 128, 0.3),
+    (torch.bfloat16, 3, 1, 1, 512, 512, 128, False, -1, -1, 0.0, 0, 128, 0.3, False),
+    (torch.float16, 5, 5, 1, 777, 888, 128, True, -1, -1, 0.0, 0, 128, 0.2, False),
+    (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, -1, -1, 30.0, 0, 128, 0.1, False),
+    (torch.float16, 2, 4, 2, 512, 512, 128, False, -1, -1, 0.0, 1, 128, 0.3, False),
     # Dropout backward regression cases from the former standalone v2_bwd test.
-    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, -1, -1, 0.0, 0, 128, 0.3),
-    (torch.float16, 5, 5, 1, 777, 888, 128, False, -1, -1, 0.0, 0, 128, 0.2),
-    (torch.float16, 5, 5, 1, 512, 512, 128, True, -1, -1, 30.0, 0, 128, 0.5),
-    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, 0, 128, 0.3),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, -1, -1, 0.0, 0, 128, 0.3, False),
+    (torch.float16, 5, 5, 1, 777, 888, 128, False, -1, -1, 0.0, 0, 128, 0.2, False),
+    (torch.float16, 5, 5, 1, 512, 512, 128, True, -1, -1, 30.0, 0, 128, 0.5, False),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, 0, 128, 0.3, False),
+    # ALiBi cases
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, -1, -1, 0.0, 0, 128, 0.0, True),
+    (torch.float16, 3, 5, 1, 512, 512, 128, True, -1, -1, 0.0, 0, 128, 0.0, True),
+    (torch.float16, 2, 5, 1, 777, 888, 192, False, -1, -1, 0.0, 0, 128, 0.0, True),
+    (torch.float16, 4, 5, 1, 1777, 1888, 256, False, -1, -1, 0.0, 0, 128, 0.0, True),
+    (torch.bfloat16, 1, 1, 1, 512, 1024, 128, True, -1, -1, 30.0, 0, 128, 0.0, True),
+    (torch.float16, 1, 5, 1, 777, 888, 192, False, -1, -1, 30.0, 0, 128, 0.0, True),
+    (torch.bfloat16, 1, 5, 1, 512, 512, 128, True, -1, -1, 30.0, 0, 128, 0.0, True),
+    (torch.float16, 3, 2, 2, 512, 512, 128, False, 64, 128, 0.0, 0, 128, 0.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, False, 0, 256, 0.0, 0, 128, 0.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, 0, 128, 0.0, True),
+    (torch.float16, 3, 4, 2, 512, 512, 128, False, 64, 128, 0.0, 0, 128, 0.0, True),
+    (torch.bfloat16, 3, 1, 1, 512, 1024, 128, False, 0, 256, 30.0, 0, 128, 0.0, True),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, use_alibi, dropout_p", varlen_cases)
-def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, use_alibi, dropout_p):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p, use_alibi", varlen_cases)
+def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p, use_alibi):
     seqlens_q, seqlens_k = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen)
     cu_q = make_cu_seqlens(seqlens_q)
     cu_k = make_cu_seqlens(seqlens_k)
@@ -681,7 +710,8 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
         drop_mask = padded_drop_mask
     golden_out_ref, golden_lse_ref, golden_out_pt, golden_lse_pt = ref_flash_attention_pair(
         query_padded, key_padded, value_padded, scale, atten_mask, data_type, softcap,
-        drop_mask=drop_mask, dropout_p=dropout_p,
+        drop_mask=drop_mask, dropout_p=dropout_p, alibi_slopes=alibi_slopes_cpu,
+        q_seqlens=seqlens_q, kv_seqlens=seqlens_k,
     )
     fully_masked = atten_mask.all(dim=-1)
     golden_out_ref[fully_masked] = 0

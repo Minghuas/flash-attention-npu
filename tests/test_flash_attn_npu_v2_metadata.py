@@ -87,6 +87,7 @@ def _metadata(
     window_size=WINDOW_SIZE,
     softcap=0.0,
     softmax_scale=None,
+    alibi_slopes_batch_stride=0,
 ):
     return get_scheduler_metadata(
         batch_size=batch_size,
@@ -103,7 +104,16 @@ def _metadata(
         window_size=window_size,
         softcap=softcap,
         softmax_scale=softmax_scale,
+        alibi_slopes_batch_stride=alibi_slopes_batch_stride,
     )
+
+
+def _per_batch_alibi_slopes(batch_size, num_heads):
+    """[B, H] slopes with genuinely different per-batch rows, so a wrong batch
+    stride (every batch reading batch 0's slopes) changes the result."""
+    base = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
+    scales = 1.0 + torch.arange(batch_size, dtype=torch.float32)
+    return base.unsqueeze(0) * scales.unsqueeze(1)
 
 
 def _make_paged_cache(batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type):
@@ -130,6 +140,7 @@ def _assert_bsnd_matches_ref(
     is_causal,
     window_size=WINDOW_SIZE,
     softcap=0.0,
+    alibi_slopes=None,
 ):
     query_cpu = query.detach().cpu()
     key_cpu, value_cpu = kv_batched
@@ -141,6 +152,7 @@ def _assert_bsnd_matches_ref(
         _attn_mask(q_seqlen, key_cpu.shape[1], is_causal, window_size),
         data_type,
         softcap=softcap,
+        alibi_slopes=alibi_slopes,
     )
 
     assert_fa_close(output_npu, golden_out_ref, golden_out_pt, softcap=softcap, name="out")
@@ -162,6 +174,7 @@ def _assert_tnd_matches_ref(
     is_causal,
     window_size=WINDOW_SIZE,
     softcap=0.0,
+    alibi_slopes=None,
 ):
     query_cpu = query.detach().cpu().reshape(batch_size, q_offsets[1], num_heads, head_size)
     key_cpu, value_cpu = kv_batched
@@ -169,7 +182,8 @@ def _assert_tnd_matches_ref(
     value_cpu = value_cpu.reshape_as(key_cpu)
     mask = _attn_mask(q_offsets[1], key_cpu.shape[1], is_causal, window_size)
     golden_out_ref, golden_lse_batched_ref, golden_out_pt, golden_lse_batched_pt = ref_flash_attention_pair(
-        query_cpu, key_cpu, value_cpu, scale, mask, data_type, softcap=softcap
+        query_cpu, key_cpu, value_cpu, scale, mask, data_type, softcap=softcap,
+        alibi_slopes=alibi_slopes,
     )
     golden_out_ref = golden_out_ref.reshape(q_offsets[-1], num_heads, head_size)
     golden_out_pt = golden_out_pt.reshape(q_offsets[-1], num_heads, head_size)
@@ -243,6 +257,18 @@ KV_CACHE_BSND_CASES = [
     (torch.float16, 1, 2, 1, 256, 512, 128, 128, False, (128, 128), 50.0),
 ]
 
+ALIBI_FUNC_CASES = [
+    # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal
+    (torch.bfloat16, 3, 4, 4, 512, 512, 128, False),
+    (torch.float16, 2, 8, 2, 257, 513, 128, True),
+]
+
+
+ALIBI_VARLEN_CASES = [
+    # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal
+    (torch.bfloat16, 3, 4, 2, 512, 768, 128, True),
+    (torch.float16, 2, 4, 4, 512, 512, 128, False),
+]
 
 @pytest.mark.parametrize(
     "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
@@ -457,6 +483,119 @@ def test_flash_attn_varlen_func_metadata_swa_softcap(
         is_causal=is_causal,
         window_size=window_size,
         softcap=softcap,
+    )
+
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
+    ALIBI_FUNC_CASES,
+    ids=[
+        "bfloat16-3-4-4-512-512-128-False",
+        "float16-2-8-2-257-513-128-True",
+    ],
+)
+def test_flash_attn_func_metadata_alibi(
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    metadata_spy,
+):
+    """Per-batch ALiBi slopes must flow through the internal metadata path with
+    the batch stride baked into the tiling (the kernel reads it from there)."""
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, device="npu")
+    key = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
+    value = make_random_tensor((batch_size, kv_seqlen, kv_heads, head_size), data_type, device="npu")
+    slopes = _per_batch_alibi_slopes(batch_size, num_heads)
+    scale = 1.0 / (head_size ** 0.5)
+
+    output_npu, softmax_lse_npu, _ = flash_attn_func(
+        query,
+        key,
+        value,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=WINDOW_SIZE,
+        alibi_slopes=slopes.npu(),
+        return_attn_probs=True,
+    )
+    assert len(metadata_spy) == 1
+    assert metadata_spy[0][1].get("alibi_slopes_batch_stride") == num_heads
+
+    key_cpu = key.detach().cpu()
+    value_cpu = value.detach().cpu()
+    _assert_bsnd_matches_ref(
+        output_npu,
+        softmax_lse_npu,
+        query,
+        (key_cpu, value_cpu),
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        data_type=data_type,
+        is_causal=is_causal,
+        alibi_slopes=slopes,
+    )
+
+
+@pytest.mark.parametrize(
+    "data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal",
+    ALIBI_VARLEN_CASES,
+    ids=[
+        "bfloat16-3-4-2-512-768-128-True",
+        "float16-2-4-4-512-512-128-False",
+    ],
+)
+def test_flash_attn_varlen_func_metadata_alibi(
+    data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal,
+    metadata_spy,
+):
+    """Varlen + per-batch ALiBi slopes: the internal metadata call must bake the
+    batch stride, otherwise every batch silently reads batch 0's slopes."""
+    q_lengths = [q_seqlen] * batch_size
+    kv_lengths = [kv_seqlen] * batch_size
+    q_offsets = _prefix_sums(q_lengths)
+    kv_offsets = _prefix_sums(kv_lengths)
+    cu_seqlens_q = _int32_npu(q_offsets)
+    cu_seqlens_k = _int32_npu(kv_offsets)
+
+    query = make_random_tensor((q_offsets[-1], num_heads, head_size), data_type, device="npu")
+    key = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
+    value = make_random_tensor((kv_offsets[-1], kv_heads, head_size), data_type, device="npu")
+    slopes = _per_batch_alibi_slopes(batch_size, num_heads)
+    scale = 1.0 / (head_size ** 0.5)
+
+    output_npu, softmax_lse_npu, _ = flash_attn_varlen_func(
+        query,
+        key,
+        value,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        q_seqlen,
+        kv_seqlen,
+        softmax_scale=scale,
+        causal=is_causal,
+        window_size=WINDOW_SIZE,
+        alibi_slopes=slopes.npu(),
+        return_attn_probs=True,
+    )
+    assert len(metadata_spy) == 1
+    assert metadata_spy[0][1].get("alibi_slopes_batch_stride") == num_heads
+
+    key_cpu = key.detach().cpu()
+    value_cpu = value.detach().cpu()
+    _assert_tnd_matches_ref(
+        output_npu,
+        softmax_lse_npu,
+        query,
+        (key_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size),
+         value_cpu.reshape(batch_size, kv_seqlen, kv_heads, head_size)),
+        q_offsets=q_offsets,
+        batch_size=batch_size,
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        data_type=data_type,
+        is_causal=is_causal,
+        alibi_slopes=slopes,
     )
 
 
@@ -691,6 +830,7 @@ class _FAInferTilingData(ctypes.Structure):
         ("workSpaceSize", ctypes.c_uint64),
         ("scaleValue", ctypes.c_float), ("softcapValue", ctypes.c_float),
         ("dropoutValue", ctypes.c_float),
+        ("alibiSlopesBatchStride", ctypes.c_int64),
         ("padding1", ctypes.c_uint64), ("padding2", ctypes.c_uint64),
         ("padding3", ctypes.c_uint32),
         ("windowSizeLeft", ctypes.c_int64), ("windowSizeRight", ctypes.c_int64),
@@ -906,6 +1046,106 @@ def test_flash_attn_kvcache_metadata_softcap_mismatch_rejected():
             cache_seqlens=cache_seqlens,
             block_table=block_table,
             softcap=30.0,
+            scheduler_metadata=scheduler_metadata,
+        )
+
+
+def test_flash_attn_kvcache_metadata_alibi_bsnd():
+    """Paged KV + explicit scheduler_metadata + per-batch ALiBi slopes: the
+    stride baked into the metadata must drive the kernel's per-batch indexing."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 2, 4, 2
+    q_seqlen, kv_seqlen, head_size, block_size = 128, 1024, 128, 128
+
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    key_cache, value_cache, block_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+    slopes = _per_batch_alibi_slopes(batch_size, num_heads)
+    scale = 1.0 / (head_size ** 0.5)
+
+    scheduler_metadata = _metadata(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        page_size=block_size,
+        alibi_slopes_batch_stride=num_heads,
+    )
+    output_npu, softmax_lse_npu = flash_attn_with_kvcache(
+        query,
+        key_cache,
+        value_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=scale,
+        causal=False,
+        window_size=WINDOW_SIZE,
+        alibi_slopes=slopes.npu(),
+        num_splits=0,
+        scheduler_metadata=scheduler_metadata,
+        return_softmax_lse=True,
+    )
+
+    key_cache_cpu = key_cache.detach().cpu()
+    value_cache_cpu = value_cache.detach().cpu()
+    block_table_cpu = block_table.cpu()
+    _assert_bsnd_matches_ref(
+        output_npu,
+        softmax_lse_npu,
+        query,
+        gather_paged_kv_batch(
+            key_cache_cpu, value_cache_cpu, block_table_cpu, kv_seqlen, block_size
+        ),
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        num_heads=num_heads,
+        head_size=head_size,
+        scale=scale,
+        data_type=data_type,
+        is_causal=False,
+        alibi_slopes=slopes,
+    )
+
+
+def test_flash_attn_kvcache_metadata_alibi_mismatch_rejected():
+    """The ALiBi batch stride is baked into the tiling; metadata created without
+    it must be rejected when the call passes [B, H] slopes."""
+    data_type = torch.bfloat16
+    batch_size, num_heads, kv_heads = 2, 4, 2
+    q_seqlen, kv_seqlen, head_size, block_size = 128, 512, 128, 128
+
+    query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type, low=-1.0, high=1.0, device="npu")
+    key_cache, value_cache, block_table = _make_paged_cache(
+        batch_size, kv_seqlen, kv_heads, head_size, block_size, data_type
+    )
+    cache_seqlens = _int32_npu([kv_seqlen] * batch_size)
+    slopes = _per_batch_alibi_slopes(batch_size, num_heads)
+
+    scheduler_metadata = _metadata(
+        batch_size=batch_size,
+        q_seqlen=q_seqlen,
+        kv_seqlen=kv_seqlen,
+        num_heads=num_heads,
+        kv_heads=kv_heads,
+        head_size=head_size,
+        cache_seqlens=cache_seqlens,
+        data_type=data_type,
+        page_size=block_size,
+    )
+    with pytest.raises(ValueError, match="alibi_slopes_batch_stride"):
+        flash_attn_with_kvcache(
+            query,
+            key_cache,
+            value_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            alibi_slopes=slopes.npu(),
             scheduler_metadata=scheduler_metadata,
         )
 

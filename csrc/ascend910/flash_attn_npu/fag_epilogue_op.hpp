@@ -175,7 +175,7 @@ public:
     int64_t compressMode = 0;
 
     constexpr static uint32_t T2Begin = 0;
-    constexpr static uint32_t T1Begin = 33 * 1024;
+    constexpr static uint32_t T1Begin = 33 * 1024;  
     constexpr static uint32_t BoolBegin = 50 * 1024;
     constexpr static uint32_t T2BlockBegin = 58 * 1024;
     constexpr static uint32_t U8Begin = 66 * 1024;
@@ -198,10 +198,11 @@ public:
     constexpr static int64_t TMP_UB_OFFSET = 148 * 1024;
     // Dropout Select UB conflict with original SFMG, move to 140KB
     constexpr static int64_t SFMG_UB_OFFSET = 140 * 1024;
+    constexpr static int64_t ALIBI_BWD_WORK_UB_OFFSET = 33 * 1024;
+
     constexpr static int64_t TMP_UB_SIZE = 33 * 1024;
     constexpr static int64_t SFMG_UB_SIZE = 8 * 1024;
     constexpr static int64_t TOTAL_SIZE = 189 * 1024;
-    constexpr static int64_t ALIBI_BWD_WORK_UB_OFFSET = 32 * 1024;
 
     constexpr static uint32_t MMAD_BASE_SIZE = 128;
     constexpr static uint32_t S_BASE_SIZE = 512;
@@ -675,6 +676,19 @@ public:
             AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1ExtendSubGraph * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
         }
+        // With softcap+alibi the backward sech^2 factor must see the pre-bias
+        // score, so keep softcap*tanh(x) in vecClc2Buffer untouched and run the
+        // ALiBi/mask pipeline on a copy in the DbBegin scratch instead (that
+        // region is only consumed by CalcSoftMax, which overwrites it with P).
+        // SubGrapB's snapshot of T2Begin then captures the pre-bias score.
+        LocalTensor<float> scoreWithAlibiBuffer = vecClc2Buffer;
+        if constexpr (HAS_ALIBI && HAS_SOFTCAP) {
+            scoreWithAlibiBuffer = unifiedBuffer.GetWithOffset<float>(
+                33 * 1024 / sizeof(T2), DbBegin);
+            AscendC::DataCopy(scoreWithAlibiBuffer, vecClc2Buffer, s1ExtendSubGraph * s2ExtendAlign);
+            // AscendC::PipeBarrier<PIPE_V>();
+        }
+
         if constexpr (HAS_ALIBI) {
             int64_t qKSeqDiff = 0;
             if constexpr (INPUT_LAYOUT == TND) {
@@ -683,16 +697,16 @@ public:
                 GetSeqQlenKvlenByBidx(dbParam.bIdx, actualS1LenBwd, actualS2LenBwd);
                 qKSeqDiff = static_cast<int64_t>(actualS2LenBwd) - static_cast<int64_t>(actualS1LenBwd);
             } else {
-                qKSeqDiff = s2 - s1;  
+                qKSeqDiff = s2 - s1;
             }
-            qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;  
+            qKSeqDiff = (qKSeqDiff < 0) ? 0 : qKSeqDiff;
             int64_t qNBlockBaseIdx =
                 dbParam.n2Idx * static_cast<int64_t>(g) + dbParam.gIdx;
             int64_t slopesBatchOffset =
                 static_cast<int64_t>(dbParam.bIdx) * alibiSlopesBatchStride;
             AscendC::LocalTensor<float> bwdWorkUb =
                 unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
-            ApplyAlibi(vecClc2Buffer, 0, s2ExtendAlign, s2Extend,
+            ApplyAlibi(scoreWithAlibiBuffer, 0, s2ExtendAlign, s2Extend,
                 0, s1ExtendSubGraph, s1ExtendSubGraph, static_cast<int64_t>(s1VBegin),
                 qNBlockBaseIdx, qKSeqDiff,
                 alibiSlopesGm, slopesBatchOffset,
@@ -704,9 +718,9 @@ public:
         if constexpr (IS_ATTEN_MASK == ENABLE) {
             // uint8_t
             if (AttenBandMode == AttenMaskCompress::All || AttenBandMode == AttenMaskCompress::NextOnly) {
-                CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign);
+                CalcAttenMaskBool(scoreWithAlibiBuffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign);
             } else if (AttenBandMode == AttenMaskCompress::PreOnly) {
-                CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign, 1);
+                CalcAttenMaskBool(scoreWithAlibiBuffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign, 1);
             }
 
             if (compressMode == BAND_COMPRESS_MODE && AttenBandMode == AttenMaskCompress::All) {
@@ -717,13 +731,13 @@ public:
                 event_t vWaitMte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
                 AscendC::SetFlag<HardEvent::MTE2_V>(static_cast<int32_t>(vWaitMte2));
                 AscendC::WaitFlag<HardEvent::MTE2_V>(static_cast<int32_t>(vWaitMte2));
-                CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign, 1);
+                CalcAttenMaskBool(scoreWithAlibiBuffer, attenMaskUbuint8, s1ExtendSubGraph, s2ExtendAlign, 1);
             }
             AscendC::PipeBarrier<PIPE_V>();
         }
 
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(T2), DbBegin);
-        CalcSoftMax(simpleSoftmaxResBuf, vecClc2Buffer, vecInBuffer3, s1ExtendSubGraph, s2Extend, s2ExtendAlign, softmaxTilingData);
+        CalcSoftMax(simpleSoftmaxResBuf, scoreWithAlibiBuffer, vecInBuffer3, s1ExtendSubGraph, s2Extend, s2ExtendAlign, softmaxTilingData);
         LocalTensor<T2> vecDropBuffer = simpleSoftmaxResBuf;
 
         if constexpr (IS_DROP == ENABLE) {
@@ -1353,6 +1367,20 @@ public:
             AscendC::Adds(vecClc2Buffer, vecClc2Buffer, -softcapValue, s1Extend * s2ExtendAlign);
             AscendC::PipeBarrier<PIPE_V>();
         }
+        // With softcap+alibi the backward sech^2 factor must see the pre-bias
+        // score, so keep softcap*tanh(x) in vecClc2Buffer untouched and run the
+        // ALiBi/mask pipeline on a copy in the DbBegin scratch instead (that
+        // region is only consumed by CalcSoftMax, which overwrites it with P).
+        // SubGrapB's snapshot of T2Begin then captures the pre-bias score. In
+        // every other configuration scoreWithAlibiBuffer simply aliases
+        // vecClc2Buffer and the code below behaves exactly as before.
+        LocalTensor<float> scoreWithAlibiBuffer = vecClc2Buffer;
+        if constexpr (HAS_ALIBI && HAS_SOFTCAP) {
+            scoreWithAlibiBuffer = unifiedBuffer.GetWithOffset<float>(
+                33 * 1024 / sizeof(float), DbBegin);
+            AscendC::DataCopy(scoreWithAlibiBuffer, vecClc2Buffer, s1Extend * s2ExtendAlign);
+            // AscendC::PipeBarrier<PIPE_V>();
+        }
         if constexpr (HAS_ALIBI) {
             int64_t actualS1LenBwd = 0;
             int64_t actualS2LenBwd = 0;
@@ -1370,7 +1398,7 @@ public:
             AscendC::LocalTensor<float> bwdWorkUb =
                 unifiedBuffer.GetWithOffset<float>(s2ExtendAlign, ALIBI_BWD_WORK_UB_OFFSET);
 
-            ApplyAlibi(vecClc2Buffer, 0, s2ExtendAlign, s2Extend,
+            ApplyAlibi(scoreWithAlibiBuffer, 0, s2ExtendAlign, s2Extend,
                 0, s1Extend, s1Extend, qSBlockBaseIdx,
                 qNBlockBaseIdx, qKSeqDiff,
                 alibiSlopesGm, slopesBatchOffset,
@@ -1380,7 +1408,7 @@ public:
             LocalTensor<uint8_t> attenMaskUbuint8 =
                 unifiedBuffer.GetWithOffset<uint8_t>(16 * 1024 / sizeof(uint8_t), ubBufferOffset + BoolBegin);
             if (blockInfo.SeqQIdx == blockInfo.SeqKIdx) {
-                CalcAttenMaskBool(vecClc2Buffer, attenMaskUbuint8[curSeqQIdx * s1VecSize * 128], s1Extend, s2ExtendAlign,
+                CalcAttenMaskBool(scoreWithAlibiBuffer, attenMaskUbuint8[curSeqQIdx * s1VecSize * 128], s1Extend, s2ExtendAlign,
                     S2_CUBESIZE, 0);
                 AscendC::PipeBarrier<PIPE_V>();
             }
@@ -1390,7 +1418,7 @@ public:
         // simpleSoftMax
         ///////////////////////////////////////////////////////////////
         LocalTensor<float> simpleSoftmaxResBuf = unifiedBuffer.GetWithOffset<float>(33 * 1024 / sizeof(float), DbBegin);
-        CalcSoftMax(simpleSoftmaxResBuf, vecClc2Buffer, vecInBuffer3, s1Extend, s2Extend, s2ExtendAlign,
+        CalcSoftMax(simpleSoftmaxResBuf, scoreWithAlibiBuffer, vecInBuffer3, s1Extend, s2Extend, s2ExtendAlign,
             softmaxTilingData);
         LocalTensor<float> vecDropBuffer = simpleSoftmaxResBuf;
 

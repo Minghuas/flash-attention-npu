@@ -369,6 +369,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     bool has_softcap = (softcap > 0.0f);
     at::Tensor softmaxlse = at::empty({batch_size, num_heads, seqlen_q}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
 
     if (scheduler_metadata_.has_value()) {
         auto schedMd = scheduler_metadata_.value();
@@ -406,175 +407,192 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
         launchBlockDim = blockDim;
     } else {
-    at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
-                                             at::device(c10::kCPU).dtype(at::kByte));
+        at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
+                                                at::device(c10::kCPU).dtype(at::kByte));
 
-    FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
-    std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
+        FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
+        std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
 
-    at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
-    int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
-    tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
-    tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
-    tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
-    tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
-    tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
-    tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
-    tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
-    tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-    if (has_softcap) {
-        tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
-    } else {
-        tiling_cpu_ptr->set_scaleValue(softmax_scale);
-    }
-    tiling_cpu_ptr->set_softcapValue(softcap);
-    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
-    tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
-    tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
-    // Append-KV: total S per batch = old (cached) + new.
-    int32_t max_kv_seqlen = 0;
-    for (int32_t i = 0; i < batch_size; i++) {
-        int32_t kvSeqlenOld = seqlens_k_cpu[i];
-        max_kv_seqlen = std::max(max_kv_seqlen, kvSeqlenOld + static_cast<int32_t>(kvNewSeqlen));
-    }
-    tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
-    tiling_cpu_ptr->set_kvNewSeqlen(appendKV ? static_cast<uint32_t>(kvNewSeqlen) : 0U);
-    tiling_cpu_ptr->set_kvCacheSeqlen(appendKV ? static_cast<uint32_t>(kvCacheSeqlen) : 0U);
+        at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
+        int32_t* seqlens_k_cpu = static_cast<int32_t *>(seqlenk_cpu_tensor.data_ptr());
+        tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
+        tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
+        tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
+        tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
+        tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
+        tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
+        tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
+        tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
+        if (has_softcap) {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+        } else {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale);
+        }
+        tiling_cpu_ptr->set_softcapValue(softcap);
+        AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
+        tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
+        tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
+        // Append-KV: total S per batch = old (cached) + new.
+        int32_t max_kv_seqlen = 0;
+        for (int32_t i = 0; i < batch_size; i++) {
+            int32_t kvSeqlenOld = seqlens_k_cpu[i];
+            max_kv_seqlen = std::max(max_kv_seqlen, kvSeqlenOld + static_cast<int32_t>(kvNewSeqlen));
+        }
+        tiling_cpu_ptr->set_maxKvSeqlen(static_cast<uint32_t>(max_kv_seqlen));
+        tiling_cpu_ptr->set_kvNewSeqlen(appendKV ? static_cast<uint32_t>(kvNewSeqlen) : 0U);
+        tiling_cpu_ptr->set_kvCacheSeqlen(appendKV ? static_cast<uint32_t>(kvCacheSeqlen) : 0U);
 
-    // Match GPU: both sides vs seqlen_k (not right vs Sq-1).
-    if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
-        window_size_left = -1;
-    }
-    if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
-        window_size_right = -1;
-    }
-    if (is_causal) {
-        window_size_right = 0;
-    }
-    is_causal = (window_size_left < 0 && window_size_right == 0);
-    is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
-    TORCH_CHECK(!(appendKV && is_local),
+        // Match GPU: both sides vs seqlen_k (not right vs Sq-1).
+        if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
+            window_size_left = -1;
+        }
+        if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
+            window_size_right = -1;
+        }
+        if (is_causal) {
+            window_size_right = 0;
+        }
+        is_causal = (window_size_left < 0 && window_size_right == 0);
+        is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+        TORCH_CHECK(!(appendKV && is_local), 
                 "NPU FlashAttention append-KV does not support sliding-window attention (window_size) yet");
-    // Match Tri Dao set_params_fprop: infinite local side → seqlen_k (finite),
-    // not SPARSE_MODE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
-    if (is_local) {
-        if (window_size_left < 0) {
-            window_size_left = max_kv_seqlen;
+         // Match Tri Dao set_params_fprop: infinite local side → seqlen_k (finite),
+        // not SPARSE_MODE_INT_MAX (fwd MASK_SWA mishandles INT_MAX right bounds).
+        if (is_local) {
+            if (window_size_left < 0) {
+                window_size_left = max_kv_seqlen;
+            }
+            if (window_size_right < 0) {
+                window_size_right = max_kv_seqlen;
+            }
         }
-        if (window_size_right < 0) {
-            window_size_right = max_kv_seqlen;
+
+        uint32_t totalTaskNum = 0;
+        uint32_t groupSize = num_heads / num_heads_k;
+        for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
+            uint64_t qSeqlen = seqlen_q;
+            uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
+            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
+            uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
+            uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
+            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+            uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
+            uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            if (batchIdx == 0) {
+                tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+            }
+            totalTaskNum += curTaskNum;
         }
-    }
+        tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
 
-    uint32_t totalTaskNum = 0;
-    uint32_t groupSize = num_heads / num_heads_k;
-    for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-        uint64_t qSeqlen = seqlen_q;
-        uint64_t kvSeqlen = *(seqlens_k_cpu + batchIdx);
-        uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
-        uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-        uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-        uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
-        uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-        uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
-        if (batchIdx == 0) {
-            tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+        uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
+        bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
+            (max_kv_seqlen >= static_cast<int32_t>(blockDim) * 512);
+        bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
+            (max_kv_seqlen >= 1024);
+        flashDecodeFlag = paged_KV && head_size_og <= 128 &&
+            (seqlen_q * groupSize <= 128) && (seqlen_q <= 16) &&
+            (max_kv_seqlen >= 1024) && (seqlen_q > 0) && (isLongSeq || isShortSeq);
+        tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
+
+        fa_split::SplitContext splitCtx;
+        splitCtx.batch_size = batch_size;
+        splitCtx.num_heads = num_heads;
+        splitCtx.num_heads_k = num_heads_k;
+        splitCtx.seqlen_q = seqlen_q;
+        splitCtx.head_size_v = head_size_og;
+        splitCtx.cu_seqlen_q_cpu = nullptr;
+        splitCtx.seqlens_k_cpu = seqlens_k_cpu;
+        splitCtx.is_varlen_q = false;
+        splitCtx.blockDim = blockDim;
+        if (flashDecodeFlag) {
+            fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
+            auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
+            if (needCoreNum != 0) {
+                launchBlockDim = needCoreNum;
+            }
         }
-        totalTaskNum += curTaskNum;
-    }
-    tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
-
-    uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
-    bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
-        (max_kv_seqlen >= static_cast<int32_t>(blockDim) * 512);
-    bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
-        (max_kv_seqlen >= 1024);
-    flashDecodeFlag = paged_KV && head_size_og <= 128 &&
-        (seqlen_q * groupSize <= 128) && (seqlen_q <= 16) &&
-        (max_kv_seqlen >= 1024) && (seqlen_q > 0) && (isLongSeq || isShortSeq);
-    tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
-
-    fa_split::SplitContext splitCtx;
-    splitCtx.batch_size = batch_size;
-    splitCtx.num_heads = num_heads;
-    splitCtx.num_heads_k = num_heads_k;
-    splitCtx.seqlen_q = seqlen_q;
-    splitCtx.head_size_v = head_size_og;
-    splitCtx.cu_seqlen_q_cpu = nullptr;
-    splitCtx.seqlens_k_cpu = seqlens_k_cpu;
-    splitCtx.is_varlen_q = false;
-    splitCtx.blockDim = blockDim;
-    splitCtx.kvNewSeqlen = appendKV ? static_cast<int32_t>(kvNewSeqlen) : 0;
-    if (flashDecodeFlag) {
-        fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
-        auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
-        if (needCoreNum != 0) {
-            launchBlockDim = needCoreNum;
+        fa_split::SplitContext splitCtx;
+        splitCtx.batch_size = batch_size;
+        splitCtx.num_heads = num_heads;
+        splitCtx.num_heads_k = num_heads_k;
+        splitCtx.seqlen_q = seqlen_q;
+        splitCtx.head_size_v = head_size_og;
+        splitCtx.cu_seqlen_q_cpu = nullptr;
+        splitCtx.seqlens_k_cpu = seqlens_k_cpu;
+        splitCtx.is_varlen_q = false;
+        splitCtx.blockDim = blockDim;
+        splitCtx.kvNewSeqlen = appendKV ? static_cast<int32_t>(kvNewSeqlen) : 0;
+        if (flashDecodeFlag) {
+            fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
+            auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
+            if (needCoreNum != 0) {
+                launchBlockDim = needCoreNum;
+            }
         }
-    }
 
-    uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
-    uint64_t PRELANCH_NUM = 3;
-    uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        2 * PRELANCH_NUM;
-    uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t splitLseTotalSize = tiling_cpu_ptr->get_splitLseTotalSize();
-    uint64_t splitOTotalSize = tiling_cpu_ptr->get_splitOTotalSize();
-    int64_t workSpaceSize = static_cast<int64_t>(mm1OutSize + smOnlineOutSize + mm2OutSize
-        + UpdateSize + splitLseTotalSize + splitOTotalSize);
+        uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
+        uint64_t PRELANCH_NUM = 3;
+        uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            2 * PRELANCH_NUM;
+        uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t splitLseTotalSize = tiling_cpu_ptr->get_splitLseTotalSize();
+        uint64_t splitOTotalSize = tiling_cpu_ptr->get_splitOTotalSize();
+        int64_t workSpaceSize = static_cast<int64_t>(mm1OutSize + smOnlineOutSize + mm2OutSize
+            + UpdateSize + splitLseTotalSize + splitOTotalSize);
 
-    workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
-    // Empty FD splits never write partials; init like FA GPU (O=0, LSE=-inf).
-    if (flashDecodeFlag && (splitLseTotalSize > 0 || splitOTotalSize > 0)) {
-        auto float_opts = workspace_tensor.options().dtype(at::kFloat);
-        if (splitLseTotalSize > 0) {
-            TORCH_CHECK(splitLseTotalSize % sizeof(float) == 0,
-                        "splitLseTotalSize must be a multiple of sizeof(float)");
-            at::Tensor lse_init = at::full(
-                {static_cast<int64_t>(splitLseTotalSize / sizeof(float))},
-                -std::numeric_limits<float>::infinity(), float_opts);
-            workspace_tensor.narrow(/*dim=*/0, /*start=*/0,
-                static_cast<int64_t>(splitLseTotalSize))
-                .copy_(lse_init.view(at::kByte));
+        workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        // Empty FD splits never write partials; init like FA GPU (O=0, LSE=-inf).
+        if (flashDecodeFlag && (splitLseTotalSize > 0 || splitOTotalSize > 0)) {
+            auto float_opts = workspace_tensor.options().dtype(at::kFloat);
+            if (splitLseTotalSize > 0) {
+                TORCH_CHECK(splitLseTotalSize % sizeof(float) == 0,
+                            "splitLseTotalSize must be a multiple of sizeof(float)");
+                at::Tensor lse_init = at::full(
+                    {static_cast<int64_t>(splitLseTotalSize / sizeof(float))},
+                    -std::numeric_limits<float>::infinity(), float_opts);
+                workspace_tensor.narrow(/*dim=*/0, /*start=*/0,
+                    static_cast<int64_t>(splitLseTotalSize))
+                    .copy_(lse_init.view(at::kByte));
+            }
+            if (splitOTotalSize > 0) {
+                TORCH_CHECK(splitOTotalSize % sizeof(float) == 0,
+                            "splitOTotalSize must be a multiple of sizeof(float)");
+                at::Tensor o_init = at::zeros(
+                    {static_cast<int64_t>(splitOTotalSize / sizeof(float))}, float_opts);
+                workspace_tensor.narrow(/*dim=*/0,
+                    static_cast<int64_t>(splitLseTotalSize),
+                    static_cast<int64_t>(splitOTotalSize))
+                    .copy_(o_init.view(at::kByte));
+            }
         }
-        if (splitOTotalSize > 0) {
-            TORCH_CHECK(splitOTotalSize % sizeof(float) == 0,
-                        "splitOTotalSize must be a multiple of sizeof(float)");
-            at::Tensor o_init = at::zeros(
-                {static_cast<int64_t>(splitOTotalSize / sizeof(float))}, float_opts);
-            workspace_tensor.narrow(/*dim=*/0,
-                static_cast<int64_t>(splitLseTotalSize),
-                static_cast<int64_t>(splitOTotalSize))
-                .copy_(o_init.view(at::kByte));
+
+        tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
+        tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
+        tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
+        tiling_cpu_ptr->set_UpdateSize(UpdateSize);
+        tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
+
+        if (is_local) {
+            tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
+            tiling_cpu_ptr->set_windowSizeRight(window_size_right);
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
+        } else if (is_causal) {
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
         }
-    }
-
-    tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
-    tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
-    tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
-    tiling_cpu_ptr->set_UpdateSize(UpdateSize);
-    tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
-
-    if (is_local) {
-        tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
-        tiling_cpu_ptr->set_windowSizeRight(window_size_right);
-        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
-    } else if (is_causal) {
-        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
-    }
-    if (is_causal || is_local) {
-        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
-        maskDevice = static_cast<uint8_t *>(mask_gpu_tensor.data_ptr());
-    }
-    tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
-    tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
+        if (is_causal || is_local) {
+            at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
+            mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+            mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+            maskDevice = static_cast<uint8_t *>(mask_gpu_tensor.data_ptr());
+        }
+        tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
     }
 
     uint64_t fftsAddr{0};
@@ -735,6 +753,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
     auto softmaxLseDevice = static_cast<uint8_t *>(const_cast<void *>(softmaxlse.data_ptr()));
 
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
+
     // ffts related
     uint64_t fftsAddr{0};
     uint32_t fftsLen{0};
@@ -765,88 +785,87 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                                  return_softmax ? static_cast<uint8_t *>(const_cast<void *>(p.data_ptr())) : nullptr,
                                  has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr);
     } else {
-    if (is_causal || is_local) {
-        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
-        maskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.data_ptr()));
-    }
-
-    // set worksapce
-    uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
-    uint64_t PRELANCH_NUM = 3;
-    uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        2 * PRELANCH_NUM;
-    uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    int64_t workSpaceSize = mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize;
-    workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
-
-    // tiling
-    at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
-                                             at::device(c10::kCPU).dtype(at::kByte));
-    FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
-    std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
-    tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
-    tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
-    tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
-    tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size));
-    tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size));
-    tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(0));
-    tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(128));
-    tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(0));
-    if (is_local) {
-        tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
-        tiling_cpu_ptr->set_windowSizeRight(window_size_right);
-        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
-    } else if (is_causal) {
-        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
-    }
-    if (has_softcap) {
-        tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
-    } else {
-        tiling_cpu_ptr->set_scaleValue(softmax_scale);
-    }
-    tiling_cpu_ptr->set_softcapValue(softcap);
-    tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
-    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
-    tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
-    tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
-    tiling_cpu_ptr->set_maxKvSeqlen(seqlen_k);
-    tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
-    tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
-    tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
-    tiling_cpu_ptr->set_UpdateSize(UpdateSize);
-    tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
-    tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
-    tiling_cpu_ptr->set_dropMaskDevice(
-        has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
-
-    uint32_t totalTaskNum = 0;
-    uint32_t groupSize = num_heads / num_heads_k;
-    uint32_t firstBatchTaskNum = 0;
-    for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-        uint64_t qSeqlen = seqlen_q;
-        uint64_t kvSeqlen = seqlen_k;
-        uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
-        uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-        uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-        uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
-        uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-        uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
-        if (batchIdx == 0) {
-            tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
-            firstBatchTaskNum = curTaskNum;
+        if (is_causal || is_local) {
+            at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
+            mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+            mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+            maskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.data_ptr()));
         }
-        totalTaskNum += curTaskNum;
-    }
-    tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
-    tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
-    tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.data_ptr()));
+
+        // set worksapce
+        uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
+        uint64_t PRELANCH_NUM = 3;
+        uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            2 * PRELANCH_NUM;
+        uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        int64_t workSpaceSize = mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize;
+        workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
+
+        // tiling
+        at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
+                                                at::device(c10::kCPU).dtype(at::kByte));
+        FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
+        std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
+        tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
+        tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
+        tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
+        tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size));
+        tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size));
+        tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(0));
+        tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(128));
+        tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(0));
+        if (is_local) {
+            tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
+            tiling_cpu_ptr->set_windowSizeRight(window_size_right);
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
+        } else if (is_causal) {
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
+        }
+        if (has_softcap) {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+        } else {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale);
+        }
+        tiling_cpu_ptr->set_softcapValue(softcap);
+        tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
+        tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
+        tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
+        tiling_cpu_ptr->set_maxKvSeqlen(seqlen_k);
+        tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
+        tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
+        tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
+        tiling_cpu_ptr->set_UpdateSize(UpdateSize);
+        tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
+        tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
+        tiling_cpu_ptr->set_dropMaskDevice(
+            has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
+
+        uint32_t totalTaskNum = 0;
+        uint32_t groupSize = num_heads / num_heads_k;
+        uint32_t firstBatchTaskNum = 0;
+        for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
+            uint64_t qSeqlen = seqlen_q;
+            uint64_t kvSeqlen = seqlen_k;
+            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
+            uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
+            uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
+            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+            uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
+            uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            if (batchIdx == 0) {
+                tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+                firstBatchTaskNum = curTaskNum;
+            }
+            totalTaskNum += curTaskNum;
+        }
+        tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
+        tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.data_ptr()));
     }
 
     // device ptrs
@@ -1048,6 +1067,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     // LSE output is head-major NT: {num_heads, T} (matches v3).
     at::Tensor softmaxlse = at::empty({num_heads, T}, at::device(at::kPrivateUse1).dtype(at::kFloat)); // lse
     softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
 
     if (scheduler_metadata_.has_value()) {
         auto schedMd = scheduler_metadata_.value();
@@ -1074,93 +1095,92 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                                  return_softmax ? static_cast<uint8_t *>(const_cast<void *>(p.data_ptr())) : nullptr,
                                  has_dropout ? static_cast<uint8_t *>(const_cast<void *>(drop_mask_npu_tensor.data_ptr())) : nullptr);
     } else {
-    at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
-                                             at::device(c10::kCPU).dtype(at::kByte));
-    FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
-    std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
-    tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
-    tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
-    tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
-    tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
-    tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
-    tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
-    tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
-    tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
-    if (is_local) {
-        tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
-        tiling_cpu_ptr->set_windowSizeRight(window_size_right);
-        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
-    } else if (is_causal) {
-        tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
-    }
-    if (has_softcap) {
-        tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
-    } else {
-        tiling_cpu_ptr->set_scaleValue(softmax_scale);
-    }
-    tiling_cpu_ptr->set_softcapValue(softcap);
-    tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
-    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
-    tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
-    tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
-    tiling_cpu_ptr->set_maxKvSeqlen(max_seqlen_k);
-    tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
-    tiling_cpu_ptr->set_dropMaskDevice(
-        has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
-
-    uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
-    uint64_t PRELANCH_NUM = 3;
-
-    uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        2 * PRELANCH_NUM;
-    uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
-        4 * PRELANCH_NUM;
-    int64_t workSpaceSize = mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize;
-
-    workspace_tensor = at::empty({workSpaceSize},
-        at::device(at::kPrivateUse1).dtype(at::kByte));
-    tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
-    tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
-    tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
-    tiling_cpu_ptr->set_UpdateSize(UpdateSize);
-    tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
-
-    at::Tensor cu_seqlens_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
-    at::Tensor cu_seqlens_k_cpu_tensor = cu_seqlens_k.to(at::Device(at::kCPU));
-    int32_t* cu_seqlens_q_cpu = static_cast<int32_t *>(cu_seqlens_q_cpu_tensor.data_ptr());
-    int32_t* cu_seqlens_k_cpu = static_cast<int32_t *>(cu_seqlens_k_cpu_tensor.data_ptr());
-
-    uint32_t totalTaskNum = 0;
-    uint32_t groupSize = num_heads / num_heads_k;
-    for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
-        uint64_t qSeqlen = static_cast<uint64_t>(cu_seqlens_q_cpu[batchIdx + 1] - cu_seqlens_q_cpu[batchIdx]);
-        uint64_t kvSeqlen = static_cast<uint64_t>(cu_seqlens_k_cpu[batchIdx + 1] - cu_seqlens_k_cpu[batchIdx]);
-        uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
-        uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
-        uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
-        uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
-        uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
-        uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
-        if (batchIdx == 0) {
-            tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+        at::Tensor tiling_cpu_tensor = at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))},
+                                                at::device(c10::kCPU).dtype(at::kByte));
+        FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
+        std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
+        tiling_cpu_ptr->set_batch(static_cast<uint32_t>(batch_size));
+        tiling_cpu_ptr->set_numHeads(static_cast<uint32_t>(num_heads));
+        tiling_cpu_ptr->set_kvHeads(static_cast<uint32_t>(num_heads_k));
+        tiling_cpu_ptr->set_embeddingSize(static_cast<uint32_t>(head_size_og));
+        tiling_cpu_ptr->set_embeddingSizeV(static_cast<uint32_t>(head_size_og));
+        tiling_cpu_ptr->set_numBlocks(static_cast<uint32_t>(num_blocks));
+        tiling_cpu_ptr->set_blockSize(static_cast<uint32_t>(page_block_size));
+        tiling_cpu_ptr->set_maxNumBlocksPerBatch(static_cast<uint32_t>(max_num_blocks_per_seq));
+        if (is_local) {
+            tiling_cpu_ptr->set_windowSizeLeft(window_size_left);
+            tiling_cpu_ptr->set_windowSizeRight(window_size_right);
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_BAND));
+        } else if (is_causal) {
+            tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
         }
-        totalTaskNum += curTaskNum;
-    }
-    tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
-    tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1)); // Tiling to Device
-    tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.data_ptr()));
+        if (has_softcap) {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale / softcap);
+        } else {
+            tiling_cpu_ptr->set_scaleValue(softmax_scale);
+        }
+        tiling_cpu_ptr->set_softcapValue(softcap);
+        tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
+        tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
+        tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
+        tiling_cpu_ptr->set_maxKvSeqlen(max_seqlen_k);
+        tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
+        tiling_cpu_ptr->set_dropMaskDevice(
+            has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
 
-    // attention mask
-    if (is_causal || is_local) {
-        at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
-        mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
-        mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
-        maskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.data_ptr()));
-    }
+        uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
+        uint64_t PRELANCH_NUM = 3;
+
+        uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            2 * PRELANCH_NUM;
+        uint64_t mm2OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        uint64_t UpdateSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
+            4 * PRELANCH_NUM;
+        int64_t workSpaceSize = mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize;
+
+        workspace_tensor = at::empty({workSpaceSize},
+            at::device(at::kPrivateUse1).dtype(at::kByte));
+        tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
+        tiling_cpu_ptr->set_smOnlineOutSize(smOnlineOutSize);
+        tiling_cpu_ptr->set_mm2OutSize(mm2OutSize);
+        tiling_cpu_ptr->set_UpdateSize(UpdateSize);
+        tiling_cpu_ptr->set_workSpaceSize(workSpaceSize);
+
+        at::Tensor cu_seqlens_q_cpu_tensor = cu_seqlens_q.to(at::Device(at::kCPU));
+        at::Tensor cu_seqlens_k_cpu_tensor = cu_seqlens_k.to(at::Device(at::kCPU));
+        int32_t* cu_seqlens_q_cpu = static_cast<int32_t *>(cu_seqlens_q_cpu_tensor.data_ptr());
+        int32_t* cu_seqlens_k_cpu = static_cast<int32_t *>(cu_seqlens_k_cpu_tensor.data_ptr());
+
+        uint32_t totalTaskNum = 0;
+        uint32_t groupSize = num_heads / num_heads_k;
+        for (int32_t batchIdx = 0; batchIdx < batch_size; batchIdx++) {
+            uint64_t qSeqlen = static_cast<uint64_t>(cu_seqlens_q_cpu[batchIdx + 1] - cu_seqlens_q_cpu[batchIdx]);
+            uint64_t kvSeqlen = static_cast<uint64_t>(cu_seqlens_k_cpu[batchIdx + 1] - cu_seqlens_k_cpu[batchIdx]);
+            uint64_t curQNBlockTile = fa_split::GetQNBlockTile(qSeqlen, groupSize);
+            uint64_t qNBlockNumPerGroup = (groupSize + curQNBlockTile - 1) / curQNBlockTile;
+            uint64_t curQNBlockNum = qNBlockNumPerGroup * num_heads_k;
+            uint64_t curQSBlockTile = fa_split::GetQSBlockTile(kvSeqlen);
+            uint64_t curQSBlockNum = (qSeqlen + curQSBlockTile - 1) / curQSBlockTile;
+            uint64_t curTaskNum = curQNBlockNum * curQSBlockNum;
+            if (batchIdx == 0) {
+                tiling_cpu_ptr->set_firstBatchTaskNum(curTaskNum);
+            }
+            totalTaskNum += curTaskNum;
+        }
+        tiling_cpu_ptr->set_totalTaskNum(totalTaskNum);
+        tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1)); // Tiling to Device
+        tilingDevice = static_cast<uint8_t *>(const_cast<void *>(tiling_gpu_tensor.data_ptr()));
+
+        // attention mask
+        if (is_causal || is_local) {
+            at::Tensor mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
+            mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
+            mask_gpu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
+            maskDevice = static_cast<uint8_t *>(const_cast<void *>(mask_gpu_tensor.data_ptr()));
+        }
     }
 
     uint64_t fftsAddr{0};
@@ -1501,7 +1521,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     AlibiSlopes alibi = set_params_alibi(alibi_slopes_, qsizes[0], qsizes[2]);
     return launch_fag_general(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, std::nullopt, std::nullopt, qsizes[1], ksizes[1], scale, softcap,
-        is_causal, window_size_left, window_size_right, deterministic, p_dropout, rng_state);
+        is_causal, window_size_left, window_size_right, deterministic, p_dropout, rng_state, alibi.ptr, alibi.batchStride);
 }
 
 at::Tensor get_scheduler_metadata(
@@ -1520,7 +1540,9 @@ at::Tensor get_scheduler_metadata(
         int64_t window_size_left,
         int64_t window_size_right,
         double softcap,
-        std::optional<double> softmax_scale)
+        std::optional<double> softmax_scale,
+        int64_t alibi_slopes_batch_stride
+    )
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     const bool is_varlen_q = cu_seqlens_q.has_value();
@@ -1566,6 +1588,7 @@ at::Tensor get_scheduler_metadata(
     args.pagedKV = page_size.has_value() ? 1U : 0U;
     args.scaleValue = scaleValue;
     args.softcapValue = static_cast<float>(softcap);
+    args.alibiSlopesBatchStride = alibi_slopes_batch_stride;
     return GetSchedulerMetadataImpl(args, cache_seqlens, cu_seqlens_q);
 }
 
