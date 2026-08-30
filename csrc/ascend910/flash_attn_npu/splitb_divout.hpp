@@ -11,7 +11,8 @@
  *   - 无在线状态机（isFirst/isLast 恒真）：OTmp GM 直读 GO；行 max/sum 从 GM stats 读入
  *     UB（GM@168KB+10K/GL@168KB+12K）——与 SplitBSoftmax 的 stats 写布局严格配对
  *   - 无 SWA 行置零（delStartRow/delEndRow/InvalidLineLSEProcess，S4 补）与 FD SplitKV
- *   - 0 行子核防护：stub MTE3 写 + MTE3_MTE2(6) set 保下一 tile wait 自配对（devlog #23）
+ *   - 0 行子核（Sq<16 对齐分摊后 AIV0 恒 0 行）：净返回不发射——stub 方案证伪
+ *     （#44.53h：闸门下批内 0 行性均匀，逐 tile 链无混合配对需求，stub 反成挂死源）
  * O/LSE 散射（打包行还原 BSND 头主序）与 Brcb 布局参数照抄 FAInfer 原值。
  */
 
@@ -96,11 +97,17 @@ public:
     // stats GM→UB：max→[rowOffsetGm]，sum→[ROW_NUM_MAX+rowOffsetGm]，读入 [0..curRowNumRound)
     // MTE2→V 自配对事件（相邻 Set+Wait，无需预置；与 FAInfer go←GM 同型）
     __aicore__ inline
-    void LoadStats(AscendC::GlobalTensor<float> gStats, uint32_t rowOffsetGm, uint32_t rowNumCurLoopRound)
+    void LoadStats(AscendC::GlobalTensor<float> gStats, uint32_t rowOffsetGm, uint32_t rowNumCurLoop)
     {
         AscendC::DataCopyParams statParams;
         statParams.blockCount = 1;
-        statParams.blockLen = rowNumCurLoopRound / FLOAT_BLOCK_SIZE;   // 32B 块单位（devlog #29）
+        // [Bug③a 真根因，devlog #44.53e] 块数必须按 RoundUp(行数,8) 计算。形参曾名
+        // rowNumCurLoopRound 而调用方实际传入未取整的 rowActualCurLoop：23/8=2 块
+        //（应 3）→ MTE2 只读前 64B=16 floats，UB[16..24) 残留上一 tile 陈旧值 →
+        // 除数广播/LSE 的尾 lanes 全错（t15 实测边界精确 packed[16]）。Sq%16≠0 时
+        // 尾块行数非 8 倍数必触发；8 倍数形状 raw==round 故历史全绿。写侧
+        // CopyStatsToGm 用真 Round 值 → GM 终态永远正确（890/880/330 三方快照实证）。
+        statParams.blockLen = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE) / FLOAT_BLOCK_SIZE;
         statParams.srcStride = 0;
         statParams.dstStride = 0;
         AscendC::DataCopy(gmUbTensor, gStats[rowOffsetGm], statParams);
@@ -108,6 +115,9 @@ public:
         // PipeBarrier<PIPE_MTE2>（devlog #44.10）：防 Scalar 的 set_flag 早于 MTE2
         // 拷贝完成发射（-O2 Scalar/MTE2 发射乱序窗口）
         AscendC::PipeBarrier<PIPE_MTE2>();
+        // 多读的 RoundUp padding 行（GM stats 区内 gap）进 UB 尾 lanes，仅用于
+        // Brcb/Ln 的对齐 lane 数，不进任何输出（Div repeat=curRowNum、LSE 写
+        // totalRowNum 行），无越界：stats 区每 tile 256 floats，off+round ≤ 128+128。
         // 子核事件分域（devlog #44.40）：AIV0 用 0、AIV1 用 2（详见 SubCoreCompute 头注释）
         const uint32_t evId = 2 * AscendC::GetSubBlockIdx();
         AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evId);
@@ -311,7 +321,8 @@ public:
         AscendC::GlobalTensor<ElementLse> gLse, AscendC::GlobalTensor<float> gStats,
         const LayoutO &layoutOutput, const LayoutOTmp &layoutInput, const LayoutLse &layoutLse,
         GemmCoord actualBlockShape,
-        uint32_t qSBlockSizeTile, uint32_t qNBlockSize)
+        uint32_t qSBlockSizeTile, uint32_t qNBlockSize,
+        uint32_t dbgDescUb = 0)
     {
         const uint32_t rowNum = actualBlockShape.m();
         const uint32_t embed = actualBlockShape.n();
@@ -348,15 +359,19 @@ public:
             layoutLse.GetOffset(MatrixCoord(outLseRowOffsetThisSubBlock, outLseColOffsetThisSubBlock));
         auto gLseThisSubBlock = gLse[offsetLse];
 
+        // [#44.53 方案B-v2] 段2 写排空的批级等待已上移至 kernel 段4 入口（每批一次，
+        // 对段2 尾的每批一次 Set 收支平衡）。本函数每 tile 调用一次——原 v1 在此放
+        // Wait 导致 8 wait/批 vs 1 set/批 收支爆炸死锁（用户 2026-08-27 插桩定位）。
+
         if (inRowActualThisSubBlock == 0U) {
-            // 0 行子核：stub MTE3 写 + MTE3_MTE2(6) set 保下一 tile 的 wait 自配对（devlog #23/#34）
-            AscendC::DataCopyParams stubParams;
-            stubParams.blockCount = 1;
-            stubParams.blockLen = 8 * sizeof(ElementO);
-            stubParams.srcStride = 0;
-            stubParams.dstStride = 0;
-            AscendC::DataCopyPad(gOutput, goUbTensor16, stubParams);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(2 * AscendC::GetSubBlockIdx());   // #44.40 分域
+            // 0 行子核：直接返回，不发射任何指令（devlog #44.53h）。
+            // 原 stub（DataCopyPad + Set<MTE3_MTE2>）是 #44.23 为"批内 0 行/非 0 行
+            // tile 混合"设计的逐 tile 链配对——该混合在 SplitB 闸门（Sq≤128 ⇒ 单
+            // qS 块 ⇒ 批内 0 行性均匀）下不可能发生；而对齐分摊（#44.52）使 Sq<16
+            // 首次真正走进 0 行路径后，stub 的 8×无配对 Set + DataCopyPad 反成挂死
+            // 源（AIV0 的 MTE3 队列滞留 → 段2尾 softmaxReady 的 PIPE_MTE3 入队项
+            // 永不触发 → CUBE 死等；Sq=9 B2 iter0 batch1 实测）。净返回后 AIV0 的
+            // 逐 tile 链零发射：无 Wait 无 Set，init 预置由 kernel 末 drain 消费。
             return;
         }
 
@@ -381,6 +396,25 @@ public:
 
             // stats GM→UB（全局行偏移；与 SplitBSoftmax::CopyStatsToGm 布局严格配对）
             LoadStats(gStats, rowOffsetCurLoop, rowActualCurLoop);
+
+            // [取证 #44.52] divout 实际读入 UB 的 stats 视图（dumpFlag 门控；与 GM 终态
+            // 330 系对照区分「softmax 写错」vs「divout 读到陈旧/垃圾」——Bug③a 的 O/LSE
+            // 尾块坏但 GM 终态正确，唯此观测能定位消费时刻的值）。desc=800+b*10+tile
+            // （max）/ 850+b*10+tile（sum），避开既有家族。
+            if (dbgDescUb != 0U) {
+                const uint8_t dimT = 2;
+                uint32_t shapeT[2] = {1, ROW_NUM_MAX};
+                AscendC::ShapeInfo infoT(dimT, shapeT);
+                AscendC::printf(
+                    "[SB-DUMP] stage=STATS_UB(max divout读 sub=%u) rows=%u round=%u desc=%u\n",
+                    subBlockIdx, rowActualCurLoop,
+                    RoundUp(rowActualCurLoop, FLOAT_BLOCK_SIZE), dbgDescUb);
+                AscendC::DumpTensor(gmUbTensor, dbgDescUb, ROW_NUM_MAX, infoT);
+                AscendC::printf(
+                    "[SB-DUMP] stage=STATS_UB(sum divout读 sub=%u) rows=%u desc=%u\n",
+                    subBlockIdx, rowActualCurLoop, dbgDescUb + 50U);
+                AscendC::DumpTensor(glUbTensor, dbgDescUb + 50U, ROW_NUM_MAX, infoT);
+            }
 
             const int64_t offsetOutput =
                 static_cast<int64_t>(rowLoopIdx * rowNumTile / qSThisSubBlock * embed) + outOffsetSubBlock;

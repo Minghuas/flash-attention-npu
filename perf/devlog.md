@@ -797,6 +797,139 @@ core/b/tile/qStart/行列数，来源明确）；② 脚本捕获改 os.dup2 fd 
 ② device 输出捕获必须 fd 级（redirect_stdout 无效）；③ 整区 dump 只适合紧凑布局，
 块状 workspace 的有效数据占比低时逐区紧凑 dump 更划算。
 
+**#44.53h**｜**官方 API 文档破案（用户提供）+ Sq=9 挂死 = 0 行 stub 死代码首次执行（2026-08-29）**：
+用户提供 CANN CrossCoreSetFlag 官方文档，三决定性语义：①**模式 2 = 双 AIV 计数器**
+（两个 AIV 都 set 后 AIC 的 wait 才放行；AIC set 一次 → 双 AIV wait 都放行）——
+**追溯性解释双 flag 实验死锁**（#44.53：CUBE 等 B 需双 AIV 都 set B，AIV0 永不 set →
+计数器永不满）；同时宣告"先到先释"理论错误（Bug③a 真因始终是 LoadStats 截断，与
+#44.53e 自洽）。②flagId 合法域 0-10、同 ID 计数器**最多 set 15 次**（我方 1/2/3 合法
+且收支平衡）。③Matmul 高阶 API/SyncAll 会占 flagId（我方 catlass 低阶栈不占）。
+**Sq=9 挂死**（B2 iter0 batch1：CUBE 死等 softmaxReady、双 AIV 死等 pvReady）：
+对齐分摊后 RoundDown(9/2,8)=0 → AIV0 恒 0 行——**divout 0 行 stub 路径（#44.23 写）
+首次被执行**。其 8×无配对 Set<MTE3_MTE2>(ID0) + DataCopyPad 滞留 AIV0 的 MTE3 队列
+→ batch1 段2尾 softmaxReady（PIPE_MTE3 入队）永不触发。batch0"打完"是假象（printf
+在标量侧不受 MTE3 队列阻塞）。stub 设计前提（批内 0 行/非 0 行 tile 混合）在闸门
+（Sq≤128 ⇒ 单 qS 块 ⇒ 0 行性均匀）下不可能发生。修复：0 行路径净返回（与 softmax
+侧同形）；AIV0 逐 tile 链零发射，init 预置由 kernel 末 drain 消费。附：Sq=33 曾现
+1/528 LSE 偶发小错（0.02 级，iter2）——残余低频竞争待观察（疑⑤/⑥族）。
+
+**#44.53g**｜**跨迭代卡死 = 孤儿预置事件未回收（用户点破）；HardEvent=单 bit 实锤（2026-08-27）**：
+删自配对后无-debug 多迭代：iter0 全 PASS（③a 修复+判定对齐双实锤），**iter1 init 处卡死**。
+用户指出"新增事件未回收"——正确。机制：核内 HardEvent 是单 bit 标志（非计数器），预置
+Set(ID1/ID7) 置位后无任何 Wait 清除（业务对已删、drain 列表 0,2,3,4,5,6 不含 1/7）→
+置位态跨 launch 残留 → 下一 launch 的 init Set 撞已置位标志 → 阻塞。完美解释"恰好第二
+次迭代"（首 launch 前槽干净）。修复：删除 ID1/ID7 两行孤儿预置，MTE3_MTE2 域恢复
+launch 内收支闭合（预置 0,2..6 ↔ drain 0,2..6，业务 0/2 链自配对）。事件域全审计：
+M_MTE1/FIX_M/MTE1_MTE2（CUBE）与 MTE3_V/V_MTE2（VEC）均预置↔drain↔业务三向平衡 ✓。
+教训入 #17 检查单：**新增任何 Set/Wait 必须同步审计预置块与 drain 块两头的收支**。
+
+**#44.53f**｜**修复验证：LSE 全对（③a 实锤）；OUT 残差定性 1-ULP 量化翻转；删除段4空操作对（2026-08-27）**：
+修复后 B1-H2-Sq31-Sk47：**LSE nbad=0/62 PASS（③a 修复实锤，此前 LSE 重灾区）**。
+OUT 残差 49 点探针：误差值集合 {0.0156, 0.0312} 全部 = 恰 1 个 fp16 ULP、相对误差 max
+0.094%（≈2^-10）、聚在 s8/s17 两行 = ref（matmul 一次取整）vs kernel（cube 累加→div→
+cast）的合法量化路径差，非 bug。debug 脚本 [OUT] 判定改与 pytest 同式（tol=atol+rtol·|ref|）。
+**遗留：不开 --debug 挂死**（printf 的核级串行化掩盖了双 AIV 真并发下的某竞争；t15
+构建时代未测过无-debug 路径）。处置：先删段4 的 Set+Wait(ID1/7) 自配对（#44.53e 证明
+其为语义空操作 + 唯一新增同步嫌疑），恢复最小态后由用户复测；仍挂则做阶段剥离二分。
+
+**#44.53e**｜**【Bug③a 真根因定案】LoadStats blockLen 整数截断；"时序竞争"论全盘撤回（2026-08-27）**：
+t15 同刻三方快照（analyze_t15.py）：890/930（段2 写完）✓ + 880（段4 读前）✓ + 输出尾块
+✗ → 病灶锁定 divout 内部。UB 视图（800/850）rec6 精确边界 = packed[16]（64B=2 块），
+第 3 块全为陈旧值。**根因**：divout::LoadStats 形参名 rowNumCurLoopRound（语义=已取整）
+而 operator() 实参传 rowActualCurLoop（raw）→ blockLen = raw/8 截断：Sq=31 AIV1 23 行
+→ 23/8=2 块（应 3）→ MTE2 只读 16 floats，UB[16..24) 残留上一 tile 值 → Brcb 除数/LSE
+尾 lanes 全错 → 全局行 [24,31) 坏。全观测 100% 吻合：Sq=33(17行)→s32、Sq=17(9行)→s16、
+Sq%16==0（行数全 8 倍数 raw==round）→ 历史全绿、写侧 CopyStatsToGm 用真 Round 值 → GM
+终态永远正确、"确定性"（非时序）。**撤回**：#44.51 以来的全部 l1A/stats 时序竞争论中，
+凡涉 Bug③a 的部分作废——三轮"竞争"修复（双 flag/v1/v2 核内事件）全是被此截断误导的
+弯路（且引入了三次挂死，HardEvent/FFTS 语义教训保留：#44.53b/c/d）。修复：LoadStats
+内部防御式 RoundUp，多读的 padding 行不进输出（Div repeat=curRowNum、LSE 写 n 行）。
+教训（极其昂贵）：**参数名与实参语义漂移是隐形炸弹；"确定性数值错"优先怀疑软件逻辑
+（尤其整数除法/取整边界），时序竞争是排除法后的最后选项**——本轮若先查 blockLen 一行
+即可结束。反常点早有信号：真时序竞争应随 iter 波动，而 Bug③a 逐位确定。
+
+**#44.53d**｜**v2 批级 Wait 仍挂死（batch=1）；用户自挪自配对解挂；插桩升级为同刻三方对照（2026-08-27）**：
+v2（Set 段2尾 + Wait 段4入口，批级 1↔1）实测 batch=1 挂死：VEC 无 batch1 任何打印、
+CUBE 卡 softmaxReady——计数模型无法解释（收支平衡），HardEvent/FFTS 语义仍有未认知
+维度（核级共享事件文件 + 预置票跨子核叠加等）。用户自救：把 Set+Wait 相邻对挪到段4
+＝等价 #44.52 已证伪的自排空（到段4时 MTE3 早已排空，语义空操作）→ 无死锁、Bug③a
+残留与修复前逐位一致（Sq33：LSE 16/528 = s32 全 (b,h)；O 1078 定值）。
+**关键反思：t13 UB 视图的"尾块缺失"可能是 DumpTensor 观测伪影**（LoadStats 的
+MTE2_V wait 只约束 V 管线后续指令，dump 调试 DMA 可绕过 → 快照到 DMA 在途态）——
+"divout 读到陈旧 stats"从未被无伪影证据确证。确证事实仍为：GM 终态✓/OTmp 全行✓/
+S,P✓/O,LSE 尾块✗ 确定性。
+下一步插桩（analyze_t15.py）：同刻三方 GM 快照链——890/930（段2 写完时刻，双 AIV
+各 dump 各分区）→ 880（段4 入口 divout 读前，整块）→ 330（终态）+ 既有 800/850
+（UB 读后）。判定矩阵：890对+880对+输出坏→divout 内部数学；890对+880坏→段2后段4前
+被改写；890坏→softmax 写错/晚。待用户编译采 t15。
+
+**#44.53c**｜**方案B v1 死锁根因 = Wait 粒度错位；v2 批级收支修复（2026-08-27，用户插桩定位）**：
+用户 --debug 插桩（S1/S2/S3/S4 各段 before/END 标记）给出决定性时序：batch0 三段
+"看似完成"后，**两个 AIV 无 batch1 的任何 S2-SM 打印** + CUBE 卡 batch1
+"before wait softmaxReady"。复原：v1 把 Wait(ID1/7) 放 divout operator() 入口（每
+tile 一次，8 tiles/批）而 Set 仅段2尾每批 1 次 → batch0 tile1 起无票死锁（S4-DO 三行
+打印在 tiles 循环之前，"完成"是假象）；VEC 卡死 → softmaxReady(batch1) 无票 → CUBE
+连带卡死。收支铁律再次验证（#15/#44.28 同源）：**同步原语 set/wait 必须同粒度配对**。
+v2：Wait 上移 kernel 段4 入口 pvReady wait 之后（批级），Set 留段2尾（批级）——每批
+每子核恰一对；divout operator() 恢复纯净。init 预置 ID1/ID7 已在（#44.53B 轮加入）。
+教训：向既有流水插同步时，先数清"消费点会被循环执行几次"。
+
+**#44.53b**｜**双 flag 修复挂死；回退改核内事件链方案B（2026-08-27，用户实测+设计约束）**：
+双 flag（A/B 槽 + CUBE 双 Wait）实测 B=2 单核即挂死。排查排除项：ID=4 不撞系统保留
+（SYNC 系列为 11-14）；wait_flag_dev 忽略 mode；PV 编译期不用 softmaxFlag；_ffstMsg
+仅 4-bit id 但 ≤7 合法。根因未定案——用户指出 FAInfer 原版同为单 flag 双 set 且工作
+正常，对该 flag 的"消费计数"理解存疑（catlass 注释：同槽连 set 上限 15 次、wait 可
+能有 rendezvous 语义），双 wait 触碰未知语义即死锁。
+方案B（当前工作树）：**不改变任何 FFTS 跨核拓扑**（单 flag 原样恢复），改为同子核
+HardEvent 自产链补写读序：段2 尾 PipeBarrier<MTE3> 后 Set<MTE3_MTE2>(ID1=AIV0 /
+ID7=AIV1)，divout operator() 入口（0 行早退之前）Wait 同 id——每批每子核恰一对，
+收支平衡；init 预置 MTE3_MTE2 补 ID1/ID7 保首轮通过；与既有逐 tile 链（2*subIdx）无
+交集；smOnly 模式下票残留可接受（调试模式，批数小）。机理指向不变（t13 实证 AIV1
+UB stats 尾块装载时刻缺 = 段2 写未排空即被段4 读），方案B 强制的是同一物理子核自己的
+管线完成性，语义无歧义。
+
+**#44.53**｜**【Bug③a 定案】softmaxReady 先到先释 = 根因；t13 三方取证（2026-08-27）**：
+t13 三方取证（debug/analyze_t13.py + UB 视图探针）：**OTmp 全行 ✓ 净（PV 无罪）**；
+divout LoadStats 后的 UB max/sum 视图（800/850 系）——AIV0 四条与金标绝对位置逐位一致；
+AIV1（rec4-7）packed[0,14+) 与 shift+8 假设前段精确一致、尾区发散 → **装载时刻 stats 就
+缺尾块**。判定矩阵落位：OTmp 净 + UB 垃圾 → softmax 写↔divout 读跨核时序竞争。
+机理：softmaxReady 单 flag 由双 AIV 各 Set、CUBE 单 Wait = **先到先释**——AIV0 行数少
+（对齐后 8 行）先放行 → CUBE PV 立即开跑并提早设 pvReady → AIV1（23 行）末 tile 的
+stats/P MTE3 写还在飞行中即被下游消费。此前段4 入口 MTE3 自排空无效的矛盾就此解释：
+排空发生在竞争窗口之后，为时已晚（#44.52 根因②正式销案）。GM 终态正确=写晚到非写错
+闭环。附带解释 P 未坏：PV 大延迟每次都吞掉 AIV1 的滞后（ fortunate timing），而
+divout 段首整读紧贴 pvReady 必中。
+修复（mha_fwd_splitb.cpp + kernel_common.hpp SOFTMAX_READY_ID_B=4）：
+① 段2 尾按 GetSubBlockIdx 分设 softmaxReady（AIV0）/ softmaxReadyB（AIV1），PIPE_MTE3
+域不变；② 段3 CUBE 双 Wait（softmaxOnly 模式 CUBE 仍消费两 flag，维持 #44.27 收支）；
+③ 删除段4 已证伪的自排空对。
+验证清单（待用户编译）：31/33/17/9×Sk47 靶场无 dump PASS；对齐形状回归（32/48/64/
+Sk40/H2H4 多头）；Sk96Sq32 与 B64-64-D128 两残余竞争样例观察是否同族受益；t15 dump
+复核 AIV1 UB 尾区应全净。
+
+**#44.52**｜**【Bug③a 续】stats 分摊对齐修复（根因①）；MTE3_MTE2 drain 证伪；三方取证就绪待 t13（2026-08-27）**：
+pytest 复测（用户 t1/t2 log）：仅剩 2 例且两轮不一致——33×47 = Bug③a 确定性 + Sk96/D128
+= 残余竞争偶发（ramp 下 B64 Sq32-Sk96 10/10 全败 nbad 0.1-1.9% 波动=理想取证样本，
+Sq16 探针当时全绿是 tile 几何不同掩盖）。
+**Bug③a 根因①（已修：stats 写交叠/非对齐）**：softmax CopyStatsToGm blockLen 按 32B
+取整（15→16 行），第 16 行为 UB 未装载的 rounding 行（t11 实证 max=2.6e11 / sum=inf）
+恰落 AIV1 首行 gStats[15] → 双写竞争；AIV1 写起点（+60B）非 32B 对齐再放大。修复 =
+softmax/divout 两处分摊 RoundDown(,8) 成对对齐。修后 t12 dump：stats GM 全净（含原垃圾
+行），坏块从 [8,15) 移到 [24,31)——治好写侧竞争但 O/LSE 尾块仍坏。
+**候选根因②（证伪）**：段4 入口 Set/Wait<MTE3_MTE2> 自排空修复 → nbad 逐位不变。
+且指纹自相矛盾（②除数≈74.4 vs LSE≈ln(3e29) 同 buffer 不可能两值）→ 垃圾源不在已排查
+路径，真凶在 OTmp 尾行或 stats 消费时刻。
+**决定性证据链缺口**：t12 的 S/P/stats/O/LSE 三方全对唯独 [24,31) 坏 + LSE≈ln(3e29)
+（未初始化量级）→ 需要「divout 消费时刻」的直接观测。本轮加：①OTmp dump 改全行（原
+rowNum/2 截断，尾行从未被验证！mha_fwd_splitb.cpp:682）；②divout LoadStats 后新增 UB
+视图 dump（desc=800+b*10+tile max / +50 sum，splitb_divout.hpp dbgDescUb 尾参，dumpFlag
+门控）。判定矩阵：OTmp 脏→PV；OTmp 净+UB 垃圾→写读时序竞争；均净→divout 算术错。
+分析器 debug/analyze_t13.py。顺带记录：确定性散点 ULP 残差全部 = ±0.0312（1 fp16 ULP，
+LSE err=0、ΔOTmp=0）→ 纯 divout Cast 取整语义差（⑤类，CAST_NONE vs RINT 待对照
+FAInfer），非竞争；perf 版删减清单见 git（82c1e5c 为 debug 回滚锚点）：逐批 MTE3 全排
+空 drain、dump 五组、debugFlag printf×5 已物理删除，默认多核反转 + getenv 静态缓存——
+bench2 用户实测小 S 区间 1.3~2.2x 优势成立。
+
 **#44.51**｜**【重大战果】l1A 跨 tile 覆写竞争 = Bug②③b④ 统一根因；一行守卫修复三 bug；Bug③a 签名规律化（2026-08-26）**：
 **取证（t8 新 .so dump + debug/analyze_t6_sk40.py）**：先推翻"divout 有罪"（#44.50 尾注的
 误判——当时把 scaled 域 max 当真值已更正，但 O/LSE 错误归因 divout 是错的）：Sk=40 坏行

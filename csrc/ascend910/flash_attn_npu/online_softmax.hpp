@@ -72,7 +72,7 @@ public:
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;  // NOTE: LP 和 MASK 复用UB空间
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
 
@@ -855,7 +855,7 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
 
         CalcLocalRowSum(sUbOffset, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);  // 计算完成当前的S tile，可以开始加载下一个tile的 S
 
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
@@ -865,10 +865,10 @@ public:
                 if (!startsWithMaskThenNomaskFlag) {
                     AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
                 }
-                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);  // FIXME: 最后一次循环呢？不再有Mask加载，被谁消费？PV阶段吗？
             }
         } else {
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);  // FIXME_: 被谁消费？ P写回GM后，通知下一个Mask从GM搬运到UB；注意P和Mask复用空间 // FIXME: 最后一次循环呢？不再有Mask加载，被谁消费？PV阶段吗？ kernel主文件的尾处理阶段有一堆wait操作，大概就是消费这些内容
         }
         UpdateGlobalRowSum(
             sUbOffset, rowNumCurLoop, rowNumCurLoopRound, dmUbOffsetCurCycle, rowOffset, isFirstStackTile);
@@ -915,11 +915,11 @@ public:
 
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);
                 if (startsWithMaskTile && rowLoopIdx == 0) {
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);  // FIXME_: 和谁对应？ 应该是 P从UB写回GM 和 Mask从GM读到UB 的同步，两者复用空间！
                 }
                 CopySGmToUb(
                     gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumPad);
-                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);  // S的搬运： MTE2 和 V之间的同步
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
@@ -932,7 +932,7 @@ public:
                 int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gOutputCurLoop = gOutput[offsetOutput];
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
-                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);  // S的搬运: 等待前面搬运完成后，开始计算
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
@@ -1035,7 +1035,7 @@ public:
                     uint32_t integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
                     // the number of integral heads within a cycle
                     uint32_t epiTokenNum = rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0); // FIXME_D: 和谁对应？ 等上一个P写回GM后，加载Mask到UB，两者复用UB
                     CopyMaskGmToUb(
                         gMaskThisSubBlock,
                         maskColumn, maskColumnRound, maskStride,
@@ -1100,7 +1100,7 @@ public:
                     uint32_t integralHeadNum = (nextRowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
                     uint32_t epiTokenNum =
                         nextRowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0); // 与line871的SET对应，即在上一个tile的P从UB写回GM后，开始加载下一个tile的MASK
                     CopyMaskGmToUb(
                         gMaskThisSubBlock,
                         maskColumn, maskColumnRound, maskStride,
@@ -1250,7 +1250,7 @@ public:
                     }
                     ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRoundPre,
                               addMaskUbOffset);
-                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
+                    AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6); // FIXME: 这里的EVENT_ID6 是和谁同步？这时候的MTE2负责搬运什么？看起来是特殊情况下的Mask，这时候的Mask搬运直接和V计算同步
                     // *** TriUNextMask
                     uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
                     // the token num of the prologue part

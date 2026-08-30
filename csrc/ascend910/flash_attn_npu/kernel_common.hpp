@@ -12,6 +12,10 @@ namespace KernelCommon {
     constexpr uint32_t QK_READY_ID = 1;
     constexpr uint32_t SOFTMAX_READY_ID = 2;
     constexpr uint32_t PV_READY_ID = 3;
+    // [#44.53 方案B] 双 flag 拆分（SOFTMAX_READY_ID_B=4）曾致 kernel 挂死，已回退
+    //（2026-08-27 用户实测；FAInfer 原版同为单 flag 双 set，拓扑保持一致）。Bug③a 的
+    // 修复改走核内 HardEvent 自产链：MTE3_MTE2 空闲域 EVENT_ID1(AIV0)/EVENT_ID7(AIV1)，
+    // 见 mha_fwd_splitb.cpp 段2 尾 + splitb_divout.hpp LoadStats。
     constexpr uint32_t PRE_LAUNCH = 2;
     constexpr uint32_t N_SPLIT_HELPER = 2;
     constexpr uint32_t MAX_KV_STACK_LEN = 512;

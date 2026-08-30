@@ -427,9 +427,9 @@ public:
         // 先于 RowSum 尾部发射，事件提前置位 → 拷贝读未完成的 llUb（判刀 W 残留
         // 错误的候选根因）。
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evId);
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evId);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evId);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evId); // 通知P写回GM
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(evId);  // 通知下一个S从GM到UB
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evId);  
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
         CopyStatsToGm(gStats, rowOffsetThisSubBlock + rowOffsetCurLoop, rowNumCurLoopRound);
         // MTE3_V 置于两个拷贝之后：覆盖 P+stats 双写。原位于 P 拷贝后（devlog #44.6）：
@@ -438,7 +438,7 @@ public:
         // 前一 tile 的 stats（t16 h1-h6 中等误差；全 1 输入因 rowmax 处处相同被掩盖）。
         // PipeBarrier<PIPE_MTE3>（devlog #44.10）：同理防 Scalar 的 set_flag 早于
         // MTE3 拷贝完成发射。
-        AscendC::PipeBarrier<PIPE_MTE3>();
+        // AscendC::PipeBarrier<PIPE_MTE3>(); // FIXME: FAInfer中从未用过这种同步
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(evId);
     }
 
@@ -497,13 +497,13 @@ public:
                 const int64_t offsetInput = layoutInput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gInputCurLoop = gInput[offsetInput];
 
-                const uint32_t evId = pingpongFlag + 2 * AscendC::GetSubBlockIdx();
+                const uint32_t evId = pingpongFlag + 2 * AscendC::GetSubBlockIdx(); // FIXME: 大概率不必根据BIdx调整eventId
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evId);
                 CopySGmToUb(gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM),
                         rowNumCurLoop, columnNumRound, columnNumPad);
                 // PipeBarrier<PIPE_MTE2>（devlog #44.10）：防 Scalar 的 set_flag 早于
                 // MTE2 拷贝完成发射（-O2 下 Scalar/MTE2 发射乱序窗口）
-                AscendC::PipeBarrier<PIPE_MTE2>();
+                // AscendC::PipeBarrier<PIPE_MTE2>(); // FIXME: FAInfer中从未用过这种同步
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evId);
             }
             if (rowLoopIdx >= preLoad) {

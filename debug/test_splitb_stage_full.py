@@ -411,7 +411,7 @@ def run_kernel(iters, softmax_only=False, multi_core=False, debug=False, dump=Fa
     import torch
     import torch_npu
     from flash_attn_npu import flash_attn_func
-    torch.npu.set_device(4)
+    torch.npu.set_device(3)
 
     ref = make_ref()
     q = ref["q"].half().npu()
@@ -434,11 +434,16 @@ def run_kernel(iters, softmax_only=False, multi_core=False, debug=False, dump=Fa
             print("[OUT] iter=%d softmax-only：O 未计算，判定以 P/stats 比对为准" % it, flush=True)
             continue
         err = (out.float().cpu() - o16).abs()
-        nbad = int((err > 1e-2).sum())
+        # 判定与 pytest 对齐（rtol=atol=1e-2 → tol = 1e-2 + 1e-2*|ref|）：kernel 的
+        # cube 累加→div→cast 路径与 ref（matmul 一次取整）存在 1 fp16 ULP 的合法
+        # 量化翻转（#44.53f 实测全部 ≤1 ULP、相对误差 ~1e-3），绝对阈值误报。
+        tol = 1e-2 + 1e-2 * o16.abs()
+        nbad = int((err > tol).sum())
         mx = err.max().item()
         am = torch.unravel_index(err.argmax(), err.shape)
         print("[OUT] iter=%d max_err=%.4f nbad=%d/%d argmax=(b=%d s=%d h=%d d=%d) %s"
-              % (it, mx, nbad, err.numel(), am[0], am[1], am[2], am[3], "PASS" if mx < 1e-2 else "FAIL"), flush=True)  # NOTE: 错误容忍度改为1e-2
+              % (it, mx, nbad, err.numel(), am[0], am[1], am[2], am[3],
+                 "PASS" if nbad == 0 else "FAIL"), flush=True)
 
 
 def main():

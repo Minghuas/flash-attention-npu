@@ -411,6 +411,13 @@ namespace SplitB {
                     // 相邻自配对，与 QK/PV 的 l1KvPingPongFlag{0,1} 无生命周期交叠。
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
+                    // [Bug⑥ 残余补强，devlog #44.53j] t17 实证守卫仍被穿透：890 写出时刻
+                    // stats 前几行 = Q(h+1) 撕裂（比值精确 (h+2)/(h+1)，AIV0 分区 s0-2 行
+                    // 首、flaky）——loadQGM 的 MTE2 DataCopy 发射被 -O2 提到 WaitFlag 之前
+                    //（#44.10 实证过的 Scalar/管道发射乱序族）。补 PipeBarrier（仓库既有
+                    // 惯例，如 softmax CopySGmToUb）：标量在此硬等 MTE1 排空，后续 MTE2
+                    // 发射不可能再穿越。
+                    AscendC::PipeBarrier<PIPE_MTE1>();
                     blockMmadQK.loadQGM(gQ[gmQ], layoutQTemp, tg.rowNum, singleHead, qHeadsP);
                     GemmCoord actualBlockShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
                                                 static_cast<uint32_t>(embed)};
@@ -422,7 +429,7 @@ namespace SplitB {
             // ---- 段1 dump（devlog #44.12/#44.15，逐 tile 有效区紧凑版）----
             // 整区方案曾超 1MB 预算（数据全丢只剩最后一条）。有效 S = 每 tile 前
             // rowNum×colsPad（本配置 colsPad=Sk 无 pad），desc = 100 + b*10 + tile。
-            if (dumpFlag) {   // 多核 dump：desc 按全局 boIdx 跨核唯一（#44.46）
+            if (false && dumpFlag) {   // [T17 取证] S dump 暂关（预算让位 stats 族）
                 AscendC::PipeBarrier<PIPE_FIX>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
@@ -512,7 +519,7 @@ namespace SplitB {
             }
             // ---- 段2 dump（devlog #44.12/#44.15）：逐 tile 有效 P（half 紧凑）----
             // P 独立区（#44.35）有效数据 = 每 tile 前 rowNum×colsPad half。desc = 200 + b*10 + tile。
-            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // AIV0-only 防双份；全核 dump（#44.46）
+            if (false && dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // [T17 取证] P dump 暂关
                 AscendC::PipeBarrier<PIPE_MTE3>();
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
@@ -751,7 +758,7 @@ namespace SplitB {
             // O=400+b（本 batch 区，fp16 行主序 s*strideO+h*embed+d）
             // LSE=450+b（本 batch 区，[H,Sq] 头主序 h*Sq+s）
 #ifdef __DAV_C220_VEC__
-            if (dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // AIV0-only 防双份；全核 dump（#44.46）
+            if (false && dumpFlag && AscendC::GetSubBlockIdx() == 0) {   // [T17 取证] OTmp/O/LSE dump 暂关（原 AIV0-only 防双份；全核 dump #44.46）
                 AscendC::PipeBarrier<PIPE_MTE3>();  // FIXME: 调试完成后应该移除
                 for (uint32_t qSb = 0; qSb < curQSBlockNum; ++qSb) {
                     for (uint32_t qNb = 0; qNb < curQNBlockNum; ++qNb) {
