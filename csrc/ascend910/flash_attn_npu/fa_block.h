@@ -15,7 +15,7 @@ using namespace Catlass;
 
 namespace Catlass::Epilogue {
     enum class LseModeT {NONE = 0, OUT_ONLY = 1};
-    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_SOFTCAP_, bool RETURN_SOFTMAX_, bool HAS_DROPOUT_>
+    template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_SOFTCAP_, bool RETURN_SOFTMAX_, bool HAS_DROPOUT_, bool HAS_ALIBI_>
     struct EpilogueAtlasA2OnlineSoftmaxT {
         using ArchTag = Arch::AtlasA2;
         using IntermPrec = SM_DTYPE_;
@@ -23,6 +23,7 @@ namespace Catlass::Epilogue {
         static constexpr bool HAS_SOFTCAP = HAS_SOFTCAP_;
         static constexpr bool RETURN_SOFTMAX = RETURN_SOFTMAX_;
         static constexpr bool HAS_DROPOUT = HAS_DROPOUT_;
+        static constexpr bool HAS_ALIBI = HAS_ALIBI_;
     };
 
     template <LseModeT LSE_MODE_, typename SM_DTYPE_, bool HAS_DROPOUT_>

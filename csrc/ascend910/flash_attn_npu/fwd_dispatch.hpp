@@ -20,6 +20,7 @@ struct FwdLaunchArgs {
     bool has_softcap;
     bool return_softmax = false;
     bool has_dropout = false;
+    uint8_t *alibiSlopesDevice;  
     uint8_t *qDevice;
     uint8_t *kDevice;
     uint8_t *vDevice;

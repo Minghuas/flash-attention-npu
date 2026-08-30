@@ -45,6 +45,10 @@ from tests.common.test_utils import (
 
 # Additional coverage: tiny head sizes 1/2/4, large-GQA decode, and special SWA windows
 
+def make_alibi_slopes(batch_size, num_heads):
+    _h = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
+    return _h.unsqueeze(0).repeat(batch_size, 1)
+
 test_cases = [
     # data_type=torch.float16, is_causal=False, cache_mode=0
     # softcap,num_heads,kv_heads=A, head_size=A, (q_seqlen,kv_seqlen)=A, (window_size_left,window_size_right)=A
@@ -137,8 +141,8 @@ test_cases = [
     (torch.bfloat16, 1, 8, 2, 512, 1024, 128, 0, 128, True, -1, -1, 0.0, True),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, new_kv", test_cases)
-def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, new_kv):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv", test_cases)
+def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, window_size_left, window_size_right, softcap, use_alibi, new_kv):
     block_size = 128
     query = make_random_tensor((batch_size, q_seqlen, num_heads, head_size), data_type,
                                device="npu", requires_grad=True)
@@ -188,7 +192,14 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     rotary_sin = None
     cache_batch_idx = None
     leftpad_k = None
-    alibi_slopes = None
+
+    if use_alibi:
+        alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
+        alibi_slopes = alibi_slopes_cpu.npu()
+    else:
+        alibi_slopes = None
+        alibi_slopes_cpu = None
+    
     window_size_left_golden = window_size_left
     window_size_right_golden = window_size_right
     # Match Tri Dao GPU host: both sides vs kv_seqlen.
@@ -406,8 +417,8 @@ func_cases = [
     (torch.bfloat16, 1, 1, 1, 1024, 1024, 128, True, True, 512, 0, 0.0, 0.3),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p", func_cases)
-def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi", func_cases)
+def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, return_attn_probs, is_causal, window_size_left, window_size_right, softcap, dropout_p, use_alibi):
     num_blocks = 64
     query, key_cache, value_cache, dout = make_attention_inputs(
         (batch_size, q_seqlen, num_heads, head_size),
@@ -420,7 +431,12 @@ def test_fa_func_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_se
 
     scale = 1.0 / (head_size ** 0.5)
     num_splits = 0
-    alibi_slopes = None
+    if use_alibi:
+        alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
+        alibi_slopes = alibi_slopes_cpu.npu()
+    else:
+        alibi_slopes = None
+        alibi_slopes_cpu = None
 
     ret = flash_attn_func(
         query,
@@ -579,8 +595,8 @@ varlen_cases = [
     (torch.bfloat16, 3, 1, 1, 512, 1024, 128, True, 512, 0, 0.0, 0, 128, 0.3),
 ]
 
-@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p", varlen_cases)
-def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, dropout_p):
+@pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, use_alibi, dropout_p", varlen_cases)
+def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size_left, window_size_right, softcap, cache_mode, block_size, use_alibi, dropout_p):
     seqlens_q, seqlens_k = make_varlen_seqlens(batch_size, q_seqlen, kv_seqlen)
     cu_q = make_cu_seqlens(seqlens_q)
     cu_k = make_cu_seqlens(seqlens_k)
@@ -608,7 +624,12 @@ def test_fa_varlen_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_
     actual_kv_len = cu_k.npu()
 
     scale = 1.0 / (head_size ** 0.5)
-    alibi_slopes = None
+    if use_alibi:
+        alibi_slopes_cpu = make_alibi_slopes(batch_size, num_heads)
+        alibi_slopes = alibi_slopes_cpu.npu()
+    else:
+        alibi_slopes = None
+        alibi_slopes_cpu = None
     deterministic = False
     return_attn_probs = True
 

@@ -39,6 +39,29 @@ using namespace Catlass;
 using namespace KernelCommon;
 
 #define CHECK_SHAPE(x, ...) TORCH_CHECK(x.sizes() == torch::IntArrayRef({__VA_ARGS__}), #x " must have shape (" #__VA_ARGS__ ")")
+
+struct AlibiSlopes { uint8_t *ptr; int64_t batchStride; };
+AlibiSlopes set_params_alibi(const std::optional<at::Tensor> &alibi_slopes_, int64_t batch_size, int64_t num_heads) {
+#ifdef FLASHATTENTION_DISABLE_ALIBI
+    TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
+    return {nullptr, 0};
+#else
+    if (alibi_slopes_.has_value()) {
+        auto slopes = alibi_slopes_.value();
+        TORCH_CHECK(slopes.dtype() == at::kFloat, "ALiBi slopes must have dtype fp32");
+        TORCH_CHECK(torch_npu::utils::is_npu(slopes), "ALiBi slopes must be on NPU");
+        TORCH_CHECK(slopes.stride(-1) == 1, "ALiBi slopes tensor must have contiguous last dimension");
+        TORCH_CHECK(slopes.sizes() == torch::IntArrayRef({num_heads}) ||
+                    slopes.sizes() == torch::IntArrayRef({batch_size, num_heads}),
+            "ALiBi slopes must have shape [num_heads] or [batch, num_heads]");
+        int64_t batchStride = slopes.dim() == 2 ? slopes.stride(0) : 0;
+        return {static_cast<uint8_t *>(slopes.data_ptr()), batchStride};
+    } else {
+        return {nullptr, 0};
+    }
+#endif
+}
+
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadataV2(void *args);
@@ -248,7 +271,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         TORCH_CHECK(seqlens_k.dtype() == torch::kInt32, "seqlens_k must have dtype int32");
     }
 
-    TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes");
     TORCH_CHECK(!leftpad_k_.has_value(), "NPU FlashAttention does not support leftpad_k");
     TORCH_CHECK(!rotary_cos_.has_value(), "NPU FlashAttention does not support rotary embedding");
     TORCH_CHECK(!rotary_sin_.has_value(), "NPU FlashAttention does not support rotary embedding");
@@ -406,6 +428,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         tiling_cpu_ptr->set_scaleValue(softmax_scale);
     }
     tiling_cpu_ptr->set_softcapValue(softcap);
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
+    tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     // Append-KV: total S per batch = old (cached) + new.
     int32_t max_kv_seqlen = 0;
@@ -593,6 +617,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     fwd_args.kvSeqDevice = kvSeqDevice;
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
+    fwd_args.alibiSlopesDevice = alibi.ptr;
     auto launch_fa_infer = [fwd_args]() -> int {
         launch_fwd<false>(fwd_args);
         return 0;
@@ -630,8 +655,6 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     TORCH_CHECK(p_dropout >= 0.0f && p_dropout < 1.0f, "p_dropout must be in [0.0, 1.0)");
 
     // block unsupported params
-    TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
-
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(v.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -790,6 +813,8 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     }
     tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
+    tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
     tiling_cpu_ptr->set_maxQSeqlen(seqlen_q);
     tiling_cpu_ptr->set_maxKvSeqlen(seqlen_k);
     tiling_cpu_ptr->set_mm1OutSize(mm1OutSize);
@@ -863,6 +888,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
     fwd_args.kvSeqDevice = kvSeqDevice;
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
+    fwd_args.alibiSlopesDevice = alibi.ptr;
     auto launch_fa_infer = [fwd_args]() -> int {
         launch_fwd<false>(fwd_args);
         return 0;
@@ -913,7 +939,6 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(is_bf16 || is_fp16, "NPU FlashAttention only supports Float16 or BFloat16.");
     TORCH_CHECK(!seqused_k_.has_value(), "NPU FlashAttention does not support seqused_k.");
     TORCH_CHECK(!leftpad_k_.has_value(), "NPU FlashAttention does not support leftpad_k.");
-    TORCH_CHECK(!alibi_slopes_.has_value(), "NPU FlashAttention does not support alibi_slopes.");
     TORCH_CHECK(p_dropout >= 0.0f && p_dropout < 1.0f, "p_dropout must be in [0.0, 1.0)");
     TORCH_CHECK(!zero_tensors, "NPU FlashAttention does not support zero_tensors.");
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
@@ -1075,6 +1100,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
     tiling_cpu_ptr->set_softcapValue(softcap);
     tiling_cpu_ptr->set_dropoutValue(1.0f / (1.0f - p_dropout));
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, batch_size, num_heads);
+    tiling_cpu_ptr->set_alibiSlopesBatchStride(alibi.batchStride);
     tiling_cpu_ptr->set_maxQSeqlen(max_seqlen_q);
     tiling_cpu_ptr->set_maxKvSeqlen(max_seqlen_k);
     tiling_cpu_ptr->set_pDevice(return_softmax ? static_cast<uint8_t*>(const_cast<void*>(p.data_ptr())) : nullptr);
@@ -1181,6 +1208,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     fwd_args.kvSeqDevice = kvSeqDevice;
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
+    fwd_args.alibiSlopesDevice = alibi.ptr;
     auto launch_fa_infer = [fwd_args]() -> int {
         launch_fwd<true>(fwd_args);
         return 0;
@@ -1245,8 +1273,6 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         dv = torch::empty_like(v);
     }
 
-    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
-
     // parse shape args
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
@@ -1290,13 +1316,16 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     const bool local_is_causal = local_window_size_left < 0 && local_window_size_right == 0;
     const bool is_local = (local_window_size_left >= 0 || local_window_size_right >= 0) && !local_is_causal;
 
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, seqlens_q.numel() - 1, qsizes[1]);
+    bool has_alibi = alibi.ptr != nullptr;
+
     // varlen optimized kernel only supports headdim equal to 128
     if (!seqlens_q.equal(seqlens_k) || is_local || p_dropout > 0.0f || headdim != 128) {
         float scale = softmax_scale > 0.f ? softmax_scale : (1.0f / sqrt(static_cast<float>(headdim)));
         return launch_fag_general(
             dout, q, k, v, out, softmax_lse, dq, dk, dv, seqlens_q, seqlens_k, max_seqlen_q, max_seqlen_k, scale,
             softcap, local_is_causal, local_window_size_left, local_window_size_right, deterministic, p_dropout,
-            rng_state);
+            rng_state, alibi.ptr, alibi.batchStride);
     }
 
     // tiling args set
@@ -1317,6 +1346,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         fagInfo.scaleValue = softmax_scale;
     }
     fagInfo.softcapValue = softcap;
+    fagInfo.alibiSlopesBatchStride = alibi.batchStride;
     uint64_t workspaceSize = 0;
     FAGTiling::GetFATilingParam(fagInfo, blockDim, reinterpret_cast<int64_t *>(tiling_cpu_tensor.data_ptr<uint8_t>()), workspaceSize);
     at::Tensor tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -1375,6 +1405,8 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     vb_args.is_bf16 = is_bf16;
     vb_args.is_causal = is_causal;
     vb_args.is_softcap = has_softcap;
+    vb_args.has_alibi = has_alibi;
+    vb_args.alibiSlopesDevice = alibi.ptr;
     vb_args.qDevice = qDevice;
     vb_args.kDevice = kDevice;
     vb_args.vDevice = vDevice;
@@ -1438,8 +1470,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         dv = torch::empty_like(v);
     }
 
-    TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
-
     auto qsizes = q.sizes();
     auto ksizes = k.sizes();
     auto vsizes = v.sizes();
@@ -1468,6 +1498,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     TORCH_CHECK(static_cast<uint32_t>(vsizes[2]) == nheads_k, "mha_bwd: v nheads_k must match k");
     float scale = softmax_scale > 0.f ? softmax_scale
                                       : (1.0f / sqrt(static_cast<float>(headdim)));
+    AlibiSlopes alibi = set_params_alibi(alibi_slopes_, qsizes[0], qsizes[2]);
     return launch_fag_general(
         dout, q, k, v, out, softmax_lse, dq, dk, dv, std::nullopt, std::nullopt, qsizes[1], ksizes[1], scale, softcap,
         is_causal, window_size_left, window_size_right, deterministic, p_dropout, rng_state);
