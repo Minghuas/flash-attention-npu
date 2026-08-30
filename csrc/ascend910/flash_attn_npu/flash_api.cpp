@@ -42,10 +42,6 @@ using namespace KernelCommon;
 
 struct AlibiSlopes { uint8_t *ptr; int64_t batchStride; };
 AlibiSlopes set_params_alibi(const std::optional<at::Tensor> &alibi_slopes_, int64_t batch_size, int64_t num_heads) {
-#ifdef FLASHATTENTION_DISABLE_ALIBI
-    TORCH_CHECK(!alibi_slopes_.has_value(), "This flash attention build does not support alibi.");
-    return {nullptr, 0};
-#else
     if (alibi_slopes_.has_value()) {
         auto slopes = alibi_slopes_.value();
         TORCH_CHECK(slopes.dtype() == at::kFloat, "ALiBi slopes must have dtype fp32");
@@ -59,7 +55,6 @@ AlibiSlopes set_params_alibi(const std::optional<at::Tensor> &alibi_slopes_, int
     } else {
         return {nullptr, 0};
     }
-#endif
 }
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
@@ -495,23 +490,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
             (max_kv_seqlen >= 1024) && (seqlen_q > 0) && (isLongSeq || isShortSeq);
         tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
 
-        fa_split::SplitContext splitCtx;
-        splitCtx.batch_size = batch_size;
-        splitCtx.num_heads = num_heads;
-        splitCtx.num_heads_k = num_heads_k;
-        splitCtx.seqlen_q = seqlen_q;
-        splitCtx.head_size_v = head_size_og;
-        splitCtx.cu_seqlen_q_cpu = nullptr;
-        splitCtx.seqlens_k_cpu = seqlens_k_cpu;
-        splitCtx.is_varlen_q = false;
-        splitCtx.blockDim = blockDim;
-        if (flashDecodeFlag) {
-            fa_split::splitBN2S1GS2(tiling_cpu_ptr, splitCtx);
-            auto needCoreNum = tiling_cpu_ptr->get_needCoreNum();
-            if (needCoreNum != 0) {
-                launchBlockDim = needCoreNum;
-            }
-        }
         fa_split::SplitContext splitCtx;
         splitCtx.batch_size = batch_size;
         splitCtx.num_heads = num_heads;

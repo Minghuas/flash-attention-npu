@@ -116,9 +116,9 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 256, 512, 2, 0, 128, True, -1, -1, 0.0, False, False),
     (torch.bfloat16, 2, 6, 6, 256, 512, 4, 0, 128, True, -1, -1, 0.0, False, False),
     # Large num_heads/GQA decode: (64,8), (128,16), and (512,1)
-    (torch.bfloat16, 2, 64, 8, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False),
-    (torch.bfloat16, 2, 128, 16, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False),
-    (torch.float16, 2, 512, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0, False),
+    (torch.bfloat16, 2, 64, 8, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False, False),
+    (torch.bfloat16, 2, 128, 16, 1, 2048, 128, 1, 128, True, -1, -1, 0.0, False, False),
+    (torch.float16, 2, 512, 1, 1, 1024, 128, 1, 128, True, -1, -1, 0.0, False, False),
     # Special SWA windows: (826,973), (127,0), (65,412), (59,571), (746,16), and (512,0)
     (torch.float16, 2, 6, 6, 512, 1024, 128, 0, 128, True, 826, 973, 0.0, False, False),
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 0, 128, True, 127, 0, 0.0, False, False),
@@ -126,9 +126,9 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 256, 512, 128, 0, 128, False, 59, 571, 0.0, False, False),
     (torch.float16, 2, 6, 6, 512, 1024, 128, 1, 128, True, 746, 16, 0.0, False, False),
     (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, 512, 0, 0.0, False, False),
-    # Additional negative-side windows: (508,-256) and (-128,864)
-    (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False),
-    (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False),
+    # Additional negative-side windows with KV-cache: (508,-256) and (-128,864)
+    (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False, False),
+    (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False, False),
     # ALiBi 
     (torch.float16, 1, 4, 4, 512, 512, 128, 0, 128, False, -1, -1, 0.0, True, False),
     (torch.bfloat16, 2, 8, 8, 1024, 2077, 128, 0, 128, True, -1, -1, 0.0, True, False),
@@ -138,8 +138,6 @@ test_cases = [
     (torch.float16, 2, 8, 2, 513, 513, 128, 0, 128, False, -1, -1, 30.0, True, False),
     (torch.bfloat16, 4, 16, 4, 512, 512, 128, 0, 128, True, -1, -1, 50.0, True, False),
     (torch.bfloat16, 1, 4, 2, 257, 257, 256, 0, 128, True, -1, -1, 30.0, True, False),
-    (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, 508, -256, 0.0, False, False),
-    (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, -128, 864, 0.0, False, False),
     # AppendKV
     (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, -1, -1, 0.0, False, True),
     (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, -1, -1, 0.0, False, True),
@@ -293,7 +291,8 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
             out_ref, lse_ref, out_pt, lse_pt = ref_flash_attention_pair(
                 query_cpu[i : i + 1], key_batched_i.unsqueeze(0), value_batched_i.unsqueeze(0), scale,
                 atten_mask_i if (is_causal_i or is_local_i) else None,
-                data_type, softcap, alibi_slopes_cpu[i]
+                data_type, softcap,
+                alibi_slopes=alibi_slopes_cpu[i] if use_alibi else None,
             )
             out_ref, out_pt = out_ref[0], out_pt[0]
             lse_ref, lse_pt = lse_ref[0], lse_pt[0]
@@ -428,7 +427,7 @@ func_cases = [
     (torch.float16, 4, 4, 1, 513, 513, 128, False, False, -1, -1, 0.0, 0.0, True),
     (torch.bfloat16, 2, 10, 2, 256, 256, 128, False, True, -1, -1, 0.0, 0.0, True),
     (torch.float16, 1, 2, 2, 512, 1024, 128, False, False, -1, -1, 0.0, 0.0, True),
-    (torch.bfloat16, 4, 8, 2, 257, 257, 128, False, False, -1, -1, 30.0, 0.0, True), # 3 出错
+    (torch.bfloat16, 4, 8, 2, 257, 257, 128, False, False, -1, -1, 30.0, 0.0, True), 
     (torch.float16, 2, 4, 2, 513, 513, 128, True, True, -1, -1, 50.0, 0.0, True),
     (torch.bfloat16, 1, 4, 4, 512, 512, 256, True, False, -1, -1, 30.0, 0.0, True),
 ]
