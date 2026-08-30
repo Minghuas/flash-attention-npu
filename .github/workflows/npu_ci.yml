@@ -367,9 +367,13 @@ jobs:
           retention-days: 7
 
       - name: Clean up this job's CI containers
-        if: always()
+        if: always() && steps.arch.outputs.match == 'true'
         run: |
-          bash ci/cleanup_ci_containers.sh
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi
 
   finalize:
     name: 写最终状态

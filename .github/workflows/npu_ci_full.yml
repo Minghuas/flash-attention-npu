@@ -140,7 +140,7 @@ jobs:
           bash ci/run_ci_container.sh
 
       - name: Upload test logs
-        if: always()
+        if: always() && steps.arch.outputs.match == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: test-logs-${{ matrix.arch_label }}
@@ -148,6 +148,10 @@ jobs:
           retention-days: 7
 
       - name: Clean up this job's CI containers
-        if: always()
+        if: always() && steps.arch.outputs.match == 'true'
         run: |
-          bash ci/cleanup_ci_containers.sh
+          if [ -f ci/cleanup_ci_containers.sh ]; then
+            bash ci/cleanup_ci_containers.sh
+          else
+            echo "cleanup script not found; skipping cleanup"
+          fi
