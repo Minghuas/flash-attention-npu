@@ -294,6 +294,9 @@ def cached_ref_flash_attention_pair(
     sink_matrix=None,
     drop_mask=None,
     dropout_p=0.0,
+    alibi_slopes=None,
+    q_seqlens=None,
+    kv_seqlens=None,
     metadata=None,
 ):
     """Cached wrapper for the two forward reference implementations."""
@@ -302,6 +305,11 @@ def cached_ref_flash_attention_pair(
     )
     case_metadata["rescale_threshold"] = rescale_threshold
     case_metadata["dropout_p"] = dropout_p
+    case_metadata["alibi_slopes_shape"] = (
+        None if alibi_slopes is None else list(alibi_slopes.shape)
+    )
+    case_metadata["q_seqlens"] = None if q_seqlens is None else list(q_seqlens)
+    case_metadata["kv_seqlens"] = None if kv_seqlens is None else list(kv_seqlens)
     inputs = {
         "query": query,
         "key": key,
@@ -309,6 +317,9 @@ def cached_ref_flash_attention_pair(
         "mask": mask,
         "sink": sink_matrix,
         "drop_mask": drop_mask,
+        "alibi_slopes": alibi_slopes,
+        "q_seqlens": q_seqlens,
+        "kv_seqlens": kv_seqlens,
     }
 
     def compute():
@@ -316,6 +327,7 @@ def cached_ref_flash_attention_pair(
             query, key, value, scale, mask, data_type, softcap,
             rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
             drop_mask=drop_mask, dropout_p=dropout_p,
+            alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
         )
         return dict(zip(("out_ref", "lse_ref", "out_pt", "lse_pt"), values))
 
@@ -409,6 +421,9 @@ def ref_flash_attention_pair(
     sink_matrix=None,
     drop_mask=None,
     dropout_p=0.0,
+    alibi_slopes=None,
+    q_seqlens=None,
+    kv_seqlens=None,
 ):
     # Backward tests need the live CPU graph to remain available when their
     # separate gradient artifact is missing or being refreshed.  Forward-only
@@ -421,10 +436,12 @@ def ref_flash_attention_pair(
             query, key, value, scale, mask, data_type, softcap,
             rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
             drop_mask=drop_mask, dropout_p=dropout_p,
+            alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
         )
     return cached_ref_flash_attention_pair(
         query, key, value, scale, mask, data_type, softcap,
         nodeid=_current_nodeid(),
         rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
         drop_mask=drop_mask, dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
     )
