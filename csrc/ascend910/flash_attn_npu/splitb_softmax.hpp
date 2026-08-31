@@ -13,7 +13,8 @@
  *   - 无在线状态机（S2 不切分，单遍即全局）：行 max/sum 直接写 GM stats 供段4 divout
  *     消费——stats 布局：tile 块内 [0,ROW_NUM_MAX)=rowmax, [ROW_NUM_MAX,2×ROW_NUM_MAX)=
  *     rowsum，行距 ROW_NUM_MAX=Q_TILE_CEIL=128（与 splitb_host.cpp workspace 公式一致）
- *   - 0 行子核防护：rowActualThisSubBlock==0 时补最小真 MTE3 写再返回（devlog #23 竞态）
+ *   - 0 行子核：rowActualThisSubBlock==0 时净返回不发射（#44.53h：闸门下批内 0 行性
+ *     均匀，原 #44.23 stub 的无配对 Set 反成挂死源）
  *   - 去 MTE3_V(EVENT_ID4) 等待：跨段 GM/UB 冲突已由 CrossCoreFlag 链 + 管道内序保证
  *     （该等待在 FAInfer 由 rescale 的 LSE 拷贝 set 配对，SplitB 下无此配对需求）
  * 行归约原语为 RowmaxTAILTILE/RowsumTAILTILE 形态（S2≤128 恒走 tail 分支，devlog #18/#20）。
@@ -299,7 +300,7 @@ public:
             tvUbTensor.ReinterpretCast<uint32_t>(),
             lmUbTensor.ReinterpretCast<uint32_t>(),
             rowNumCurLoopRound / FLOAT_BLOCK_SIZE,
-            AscendC::BrcbRepeatParams(1, 8));  // FIXME: 这里和CalcLocalRowMax复用了tvUbTensor，需要检查是否安全? 需要加同步吧？
+            AscendC::BrcbRepeatParams(1, 8));
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t subIdx = 0; subIdx < columnNum / FLOAT_VECTOR_SIZE; ++subIdx) {
             AscendC::Sub<float, false>(
@@ -436,9 +437,6 @@ public:
         // stats 拷贝尚在飞行时下一 tile 的 WaitFlag<MTE3_V> 即放行，其 CalcLocalRowMax/
         // CalcLocalRowSum（V，写 lmUb/llUb）与 stats 拷贝（读 lmUb/llUb）竞态 → 污染
         // 前一 tile 的 stats（t16 h1-h6 中等误差；全 1 输入因 rowmax 处处相同被掩盖）。
-        // PipeBarrier<PIPE_MTE3>（devlog #44.10）：同理防 Scalar 的 set_flag 早于
-        // MTE3 拷贝完成发射。
-        // AscendC::PipeBarrier<PIPE_MTE3>(); // FIXME: FAInfer中从未用过这种同步
         AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(evId);
     }
 
@@ -497,13 +495,12 @@ public:
                 const int64_t offsetInput = layoutInput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gInputCurLoop = gInput[offsetInput];
 
-                const uint32_t evId = pingpongFlag + 2 * AscendC::GetSubBlockIdx(); // FIXME: 大概率不必根据BIdx调整eventId
+                // evId 分域必需（#44.24：HardEvent 核级共享，固定 ID 会被另一 AIV 的
+                // 同 ID Set 越权放行），详见 SubCoreCompute 头注
+                const uint32_t evId = pingpongFlag + 2 * AscendC::GetSubBlockIdx();
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(evId);
                 CopySGmToUb(gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM),
                         rowNumCurLoop, columnNumRound, columnNumPad);
-                // PipeBarrier<PIPE_MTE2>（devlog #44.10）：防 Scalar 的 set_flag 早于
-                // MTE2 拷贝完成发射（-O2 下 Scalar/MTE2 发射乱序窗口）
-                // AscendC::PipeBarrier<PIPE_MTE2>(); // FIXME: FAInfer中从未用过这种同步
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evId);
             }
             if (rowLoopIdx >= preLoad) {
@@ -513,8 +510,6 @@ public:
                 const uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 const uint32_t rowNumCurLoop =
                     (delayedRowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
-                
-                // FIXME: 参数不一致
                 const uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);
 
                 const int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));

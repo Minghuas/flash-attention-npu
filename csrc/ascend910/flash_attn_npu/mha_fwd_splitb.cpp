@@ -148,27 +148,19 @@ namespace SplitB {
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
 #ifdef __DAV_C220_CUBE__
-            // ① 硬件事件预置：引擎/流水首次 Wait 依赖"已释放"初态（S3 实测教训）。
-            //    覆盖 Pingpong 引擎全部在用 ID（MTE1_MTE2{0..3}、M_MTE1{0..3}、FIX_M）
-            //    及其 MTE2_MTE1/MTE1_M/M_FIX 配对域。
+            // ① 硬件事件预置：引擎首次 Wait 依赖"已释放"初态（S3 实测教训）。
+            //    [#47 清理收敛] CUBE 侧唯一事件消费者 = Pingpong 引擎（presetEvents=false，
+            //    宿主接管），在用 ID：MTE1_MTE2{0..3}（l1A/l1B 槽）+ M_MTE1{0..3}（l0A/l0B 槽）；
+            //    其 MTE2_MTE1/MTE1_M 为调用内自配对（免预置）；FIX_M 在 unit-flag 模式不使用。
+            //    预置与末尾 drain 严格镜像（事件收支 launch 内闭合，#44.53g）。
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID3);
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID4);
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID5);
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID6);
-            AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID7);
-            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
-            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID6);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID7);
             // ② [#46 v3] 通用 Pingpong 引擎（example 01 同款组装）：A/B 面 L1 双缓冲
             //    （l1A/BTensorList[STAGES=2]）+ 两向事件全保护 + 跨调用槽位轮转——
             //    t19 定罪的 l1A 竞态类结构性关闭。局部构造（引擎无默认构造器）；
@@ -185,13 +177,8 @@ namespace SplitB {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);   // 子核1 的 softmax 链（#44.24）
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID3);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID5);
-            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
@@ -387,33 +374,18 @@ namespace SplitB {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID3);
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID4);
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID5);
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID7);
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID4);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID5);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID6);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID7);
 #endif
 #ifdef __DAV_C220_VEC__
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);   // softmax AIV1 链（#44.24/#44.45）
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID2);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID3);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID4);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID5);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
@@ -595,7 +567,7 @@ namespace SplitB {
                         divoutEpilogue(
                             gO[gmO], gOTmp[oOff], gLse[gmLse], gStats[statOff],
                             layoutO, layoutOTmpT, layoutLse, actualBlockShapePV,
-                            tg.qSBlockSize, tg.qNBlockSize, 0u);
+                            tg.qSBlockSize, tg.qNBlockSize);
                     }
                 }
             }

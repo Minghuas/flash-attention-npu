@@ -143,7 +143,7 @@ public:
             innerOGmOffset += embed;
             innerGOUbOffset += proTokenNum * embedRound;
         }
-        for (uint32_t qN_idx = 0; qN_idx < integralHeadNum; qN_idx++) {
+        for (uint32_t qNIdx = 0; qNIdx < integralHeadNum; qNIdx++) {
             AscendC::DataCopyPad(
                 gOutput[innerOGmOffset],
                 goUbTensor16[innerGOUbOffset],
@@ -202,14 +202,12 @@ public:
             glUbTensor.ReinterpretCast<uint32_t>(),
             curRowNumRound / FLOAT_BLOCK_SIZE,
             AscendC::BrcbRepeatParams(1, 8));
-        AscendC::PipeBarrier<PIPE_V>();  // FIXME: 补充同步！
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(evId);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(evId);
+        AscendC::PipeBarrier<PIPE_V>();   // Brcb→Div 的 V 管道内 RAW
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-        for (uint32_t vdiv_idx = 0; vdiv_idx < embed / FLOAT_VECTOR_SIZE; ++vdiv_idx) {
+        for (uint32_t vDivIdx = 0; vDivIdx < embed / FLOAT_VECTOR_SIZE; ++vDivIdx) {
             AscendC::Div<float, false>(
-                goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE],
-                goUbTensor32[vdiv_idx * FLOAT_VECTOR_SIZE],
+                goUbTensor32[vDivIdx * FLOAT_VECTOR_SIZE],
+                goUbTensor32[vDivIdx * FLOAT_VECTOR_SIZE],
                 tvUbTensor,
                 (uint64_t)0,
                 curRowNum,
@@ -285,7 +283,7 @@ public:
                 lseUbTensor.ReinterpretCast<uint32_t>(),
                 CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                 AscendC::BrcbRepeatParams(1, 8));
-            AscendC::PipeBarrier<PIPE_V>();  // FIXME: 补充同步！
+            AscendC::PipeBarrier<PIPE_V>();   // #44.10：防 Scalar 的 set_flag 早于 Brcb 完成发射
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(evId);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(evId);
 
@@ -321,8 +319,7 @@ public:
         AscendC::GlobalTensor<ElementLse> gLse, AscendC::GlobalTensor<float> gStats,
         const LayoutO &layoutOutput, const LayoutOTmp &layoutInput, const LayoutLse &layoutLse,
         GemmCoord actualBlockShape,
-        uint32_t qSBlockSizeTile, uint32_t qNBlockSize,
-        uint32_t dbgDescUb = 0)
+        uint32_t qSBlockSizeTile, uint32_t qNBlockSize)
     {
         const uint32_t rowNum = actualBlockShape.m();
         const uint32_t embed = actualBlockShape.n();
@@ -396,25 +393,6 @@ public:
 
             // stats GM→UB（全局行偏移；与 SplitBSoftmax::CopyStatsToGm 布局严格配对）
             LoadStats(gStats, rowOffsetCurLoop, rowActualCurLoop);
-
-            // [取证 #44.52] divout 实际读入 UB 的 stats 视图（dumpFlag 门控；与 GM 终态
-            // 330 系对照区分「softmax 写错」vs「divout 读到陈旧/垃圾」——Bug③a 的 O/LSE
-            // 尾块坏但 GM 终态正确，唯此观测能定位消费时刻的值）。desc=800+b*10+tile
-            // （max）/ 850+b*10+tile（sum），避开既有家族。
-            if (dbgDescUb != 0U) {
-                const uint8_t dimT = 2;
-                uint32_t shapeT[2] = {1, ROW_NUM_MAX};
-                AscendC::ShapeInfo infoT(dimT, shapeT);
-                AscendC::printf(
-                    "[SB-DUMP] stage=STATS_UB(max divout读 sub=%u) rows=%u round=%u desc=%u\n",
-                    subBlockIdx, rowActualCurLoop,
-                    RoundUp(rowActualCurLoop, FLOAT_BLOCK_SIZE), dbgDescUb);
-                AscendC::DumpTensor(gmUbTensor, dbgDescUb, ROW_NUM_MAX, infoT);
-                AscendC::printf(
-                    "[SB-DUMP] stage=STATS_UB(sum divout读 sub=%u) rows=%u desc=%u\n",
-                    subBlockIdx, rowActualCurLoop, dbgDescUb + 50U);
-                AscendC::DumpTensor(glUbTensor, dbgDescUb + 50U, ROW_NUM_MAX, infoT);
-            }
 
             const int64_t offsetOutput =
                 static_cast<int64_t>(rowLoopIdx * rowNumTile / qSThisSubBlock * embed) + outOffsetSubBlock;
