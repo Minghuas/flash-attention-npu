@@ -15,14 +15,16 @@
  *    Set-on-set 语义未证实，#44.53g）；②析构 drain 跳过——否则与宿主
  *    kernel drain / 第二实例析构重复 Wait 同一批 ID → 出口挂死（#46.2
  *    实测：三子核 EEEE 全打出后卡死）；
- * 3. 头文件自包含 using（上游靠外围 namespace 语境）。
+ * 3. 头文件自包含 using（上游靠外围 namespace 语境）；
+ * 4. [v3.3] 新增 AOperandBSHD + operator() BSHD 重载（A 面 [B,S,H,D] 布局的
+ *    可选打包头组自装——GQA 打包/MHA 单头统一形态）与私有 loadAPackedBSHD。
  *
  * 【为什么 fork 它（v3 引擎选型，devlog #46）】A/B 面 L1 双缓冲
  * （l1A/BTensorList[STAGES=2]）+ 两向事件全保护 + 跨调用槽位轮转——
  * t19 定罪的 FAI 引擎 l1A 单缓冲竞态类结构性关闭（#45.3）。
  *
  * 上游同步提示：catlass 升级时对照 block_mmad_pingpong.hpp 重新 fork，
- * 差异仅上述三点（diff 可见）。
+ * 差异仅上述四点（diff 可见）。
  */
 
 #ifndef SPLITB_BM_PINGPONG_HPP_
@@ -173,6 +175,34 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
     }
 
+    /// [SplitB v3.3] A 面操作数描述：BSHD 布局 [B, S, H, D] 的（可选打包）Q 头组。
+    /// 头内相邻 token 行距 = rowStride（= qHeads·D）；同 s 相邻头距 = K 维（D）——
+    /// 引据此在 operator() BSHD 重载内自装 A 面。headNum=1（MHA）退化为标准单头装载。
+    struct AOperandBSHD {
+        uint32_t rowsPerHead;   // 每头行数（qS 块行数；行区 fractal 对齐要求 16 的倍数）
+        uint32_t headNum;       // 打包头数（共享同一 B；MHA=1）
+        int64_t rowStride;      // BSHD 头内行距（= qHeads·D）
+    };
+
+    /// BSHD 重载：A 面按 AOperandBSHD 语义装载（内部逐头 Nd2Nz 到 zN 行区），随后
+    /// 走主 operator() 流程。约定：K ≤ L1TileShape::K（kTileCount==1，闸门 D≤128
+    /// 内恒真）；rowsPerHead 为 16 的倍数（fractal 对齐）。
+    CATLASS_DEVICE
+    void operator()(
+        AscendC::GlobalTensor<ElementA> const &gmA, AOperandBSHD const &a,
+        AscendC::GlobalTensor<ElementB> const &gmB, LayoutB const &layoutB,
+        AscendC::GlobalTensor<ElementC> const &gmC, LayoutC const &layoutC,
+        GemmCoord const &actualShape)
+    {
+        uint32_t kActual = min(actualShape.k(), L1TileShape::K);
+        loadAPackedBSHD(gmA, a.rowsPerHead, a.headNum, a.rowStride, kActual);
+        // 主流程的首次 A 装载已由 aPrefilledA_ 跳过；此处的 layoutA 仅其 K 预取
+        // 路径（本重载约定 kTileCount==1，不触达）引用。
+        LayoutA layoutA(a.rowsPerHead * a.headNum, static_cast<uint32_t>(actualShape.k()),
+                        a.rowStride);
+        (*this)(gmA, layoutA, gmB, layoutB, gmC, layoutC, actualShape);
+    }
+
     /// Perform a block-scoped matrix multiply-accumulate
     CATLASS_DEVICE
     void operator()(
@@ -190,11 +220,14 @@ public:
 
         uint32_t kActual = min(actualShape.k(), L1TileShape::K);
 
-        // load first matrix A tile from GM to L1
-        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1ListId]);
+        // load first matrix A tile from GM to L1（[v3.3] loadAPackedBSHD 预装后跳过；
+        // layoutTileA 声明保留在块外——下方 K 预取路径复用（上游结构））
         auto layoutTileA = layoutA.GetTileLayout(MakeCoord(actualShape.m(), kActual));
-        copyGmToL1A(l1ATensorList[l1ListId], gmA, layoutAInL1, layoutTileA);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ListId]);
+        if (!aPrefilledA_) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1ListId]);
+            copyGmToL1A(l1ATensorList[l1ListId], gmA, layoutAInL1, layoutTileA);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ListId]);
+        }
 
         // load first matrix B tile from GM to L1
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[l1ListId]);
@@ -350,6 +383,32 @@ public:
         } else {
             copyL0CToGm(gmC, l0CTensor, layoutBlock, layoutInL0C, 0b11);
         }
+        aPrefilledA_ = false;   // [v3.3] 预装标志按调用消费（下一次调用默认自装）
+    }
+
+private:
+    /// [SplitB v3.3] BSHD 条带 A 面装载（operator() BSHD 重载的内部实现）：逐头调用
+    /// 标准 4 参 Nd2Nz（语义已被 MHA 路径上板验证），头 h 的 [rowsPerHead × K] 写入
+    /// L1 槽 zN 排布的行区 [h·rowsPerHead, ...)（zN GetOffset；rowsPerHead 16 对齐
+    /// ⇒ fractal 对齐，由 BSHD 重载约定保证）。事件纪律与引擎内置装载一致；
+    /// 置 aPrefilledA_ 令主 operator() 跳过其首次 A 装载。
+    /// 不用 FAI loadQGM 的 9 参条带重载：其目的 stride 按 zN(rowNum,K) 定容推导，
+    /// 与本引擎 zN(L1TileM, L1TileK) 槽寻址仅在 rowNumRound==L1TileM 时重合。
+    CATLASS_DEVICE
+    void loadAPackedBSHD(AscendC::GlobalTensor<ElementA> const &gmA,
+                         uint32_t rowsPerHead, uint32_t headNum,
+                         int64_t rowStride, uint32_t kActual)
+    {
+        auto layoutAInL1 = LayoutAInL1::template MakeLayout<ElementA>(L1TileShape::M, L1TileShape::K);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1AEventList[l1ListId]);
+        for (uint32_t h = 0; h < headNum; ++h) {
+            LayoutA layoutHead(rowsPerHead, kActual, rowStride);
+            int64_t dstOff = layoutAInL1.GetOffset(MatrixCoord{h * rowsPerHead, 0});
+            copyGmToL1A(l1ATensorList[l1ListId][dstOff], gmA[h * kActual],
+                        layoutAInL1, layoutHead);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ListId]);
+        aPrefilledA_ = true;
     }
 
 protected:
@@ -373,6 +432,9 @@ protected:
 
     // 宿主接管事件生命周期标记（= ctor presetEvents 实参）
     bool hostOwnedEvents_{true};
+
+    // [v3.3] loadAPackedBSHD 预装标志（operator() 首次 A 装载据此跳过，调用末尾复位）
+    bool aPrefilledA_{false};
 
     TileMmad tileMmad;
     CopyGmToL1A copyGmToL1A;

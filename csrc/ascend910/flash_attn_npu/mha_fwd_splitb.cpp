@@ -83,7 +83,7 @@ namespace SplitB {
         using ElementLse = typename EpilogueSplitBDivOut::ElementLse;
         using LayoutLse = typename EpilogueSplitBDivOut::LayoutLse;
 
-        // tile 几何（v3.1：qN 打包恢复——MHA 每头一 tile，GQA 共 kv 头的头打包）
+        // tile 几何（v3.3：qN 打包——MHA 每头一 tile，GQA 共 kv 头的头打包）
         struct TileGeom {
             uint32_t qSBlockSize;   // 本 tile 每头行数（≤128，末块取尾）
             uint32_t qNBlockSize;   // 本 tile 打包头数（MHA 恒 1；GQA ≤ qNBlockTile）
@@ -219,17 +219,16 @@ namespace SplitB {
             statsPerTask = 2 * static_cast<uint64_t>(Q_TILE_CEIL);        // max 128 + sum 128
             perTileElems = sTileElems + oTmpTileElems + statsPerTask;
 
-            // ---- tile 几何 ----
-            // qNBlockTile 钉 1（每头一 tile，MHA 数学 forced：单 GEMM 单 B；GQA 暂同：
-            // 输入 Q 为 [B,Sq,H,D]（BSHD），跨头打包行不连续（h 相距 D、s 相距 H·D），
-            // 通用引擎 + 标准 RowMajor 无法表达——v2 靠 FAI loadQGM 条带拷贝实现打包，
-            // GQA 打包恢复需 fork（splitb_bm_pingpong.hpp）加 BSHD 条带装载入口，后续项）。
-            // host 侧（splitb_host.cpp）同步钉 1。
+            // ---- tile 几何（v3.3：恢复 GQA qN 打包） ----
+            // 打包条件（host 侧同款守卫，须一致）：①qS 单块（Sq ≤ qSBlockTile，闸门下
+            // 恒真）；②Sq 16 对齐（引擎 BSHD A 面装载的行区 fractal 对齐要求）。
+            // MHA（G=1）恒 1（单 GEMM 单 B，数学 forced）。
             curQSBlockTile = GetQSBlockTile(static_cast<uint32_t>(kvSeqlen));
             curQSBlockNum = CeilDiv(static_cast<uint32_t>(qSeqlen), curQSBlockTile);
-            curQNBlockTile = 1;
-            qNBlockNumPerGroup = static_cast<uint32_t>(groupSize);
-            curQNBlockNum = qNBlockNumPerGroup * static_cast<uint32_t>(kvHeads);   // = qHeads
+            curQNBlockTile = (curQSBlockNum == 1U && (qSeqlen % 16 == 0)) ?
+                GetQNBlockTile(static_cast<uint32_t>(qSeqlen), static_cast<uint32_t>(groupSize)) : 1U;
+            qNBlockNumPerGroup = CeilDiv(static_cast<uint32_t>(groupSize), curQNBlockTile);
+            curQNBlockNum = qNBlockNumPerGroup * static_cast<uint32_t>(kvHeads);
             tileNumPerBatch = static_cast<uint64_t>(curQNBlockNum) *
                 static_cast<uint64_t>(curQSBlockNum);                     // 批内 tile 数 T
             perBatchTileElems = tileNumPerBatch * perTileElems;
@@ -426,7 +425,7 @@ namespace SplitB {
 
         // ==================== 段1：QK 批 matmul（CUBE） ====================
         // [#46 v3] 每 tile 一次引擎调用 [rowNum,D]×[D,Sk]→S[rowNum,Sk]（MHA 每头
-        // 一 tile；GQA 打包共享 kv 头的头，v3.1 恢复）。纯计算段：跨核 flag
+        // 一 tile；GQA 打包共享 kv 头的头）。纯计算段：跨核 flag
         //（qkReady set）在流水驱动循环内。
         __aicore__ inline void StageQK(
             uint32_t coreIdx,
@@ -443,6 +442,11 @@ namespace SplitB {
             const uint64_t batchBuf = static_cast<uint64_t>(boIdx) % 2;   // ping/pong 槽
             const uint64_t batchBase = batchBuf * perBatchTileElems;
 
+            // 循环不变量外提：B 面布局（K^T 转置视图 ColumnMajor(strideK, Sk)，v2 同款
+            // ——ldm=strideK=Hkv·D 即 BSHD [B,S,H,D] 输入的 n 行跨步，元素 (k,n)→k+n·Hkv·D）
+            // 与 strideQ 的类型转换。A/C 面描述依赖尾块（qS 末块行数、qN 末组头数
+            // 如 G=6/qN=4 → 4,2），非全循环常量，保留在循环内。
+            LayoutK layoutB(static_cast<uint64_t>(strideK), static_cast<uint32_t>(kvSeqlen));
             for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                 for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                     const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
@@ -453,20 +457,14 @@ namespace SplitB {
                         static_cast<uint64_t>(tg.kvNIdx) * embed;
                     const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
 
-                    // 输入 Q/K/V 为 [B, S, H, D]（BSHD，test 脚本/torch 惯例）——
-                    // 头内相邻 token 行相距 strideQ/K/V = H·D，而非 embed！
-                    // A = Q[b,h] 头块 [rowNum, D]：RowMajor 三参，行跨步 = strideQ
-                    //（v2 靠 FAI loadQGM 的 BSHD 条带拷贝，通用引擎用 ldm 表达）。
-                    // B = K[b,kvN] 转置视图 [D,Sk]：ColumnMajor(strideK, Sk)（v2 同款，
-                    // ldm=strideK=Hkv·D 即 BSHD 的 n 行跨步；元素 (k,n)→k+n·Hkv·D）。
-                    // C = S 头块 [rowNum,Sk]（行步长 colsPad，workspace 布局与 epilogue 一致）
-                    LayoutQ layoutA(tg.rowNum, static_cast<uint32_t>(embed),
-                                    static_cast<int64_t>(strideQ));
-                    LayoutK layoutB(static_cast<uint64_t>(strideK), static_cast<uint32_t>(kvSeqlen));
+                    // A：BSHD 操作数描述（[B,S,H,D] 头内行距 = H·D；引擎内自装，
+                    // GQA 打包/MHA 单头统一形态）；C：S 头块（行步长 colsPad）
+                    typename BlockMmadQK::AOperandBSHD aOperand{
+                        tg.qSBlockSize, tg.qNBlockSize, static_cast<int64_t>(strideQ)};
                     LayoutS layoutC(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
                     GemmCoord actualShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
                                             static_cast<uint32_t>(embed)};
-                    blockMmadQKEngine(gQ[gmQ], layoutA, gK[gmK], layoutB, gS[sOff], layoutC,
+                    blockMmadQKEngine(gQ[gmQ], aOperand, gK[gmK], layoutB, gS[sOff], layoutC,
                                       actualShapeQK);
                 }
             }
@@ -531,6 +529,9 @@ namespace SplitB {
             const uint64_t batchBuf = static_cast<uint64_t>(boIdx) % 2;
             const uint64_t batchBase = batchBuf * perBatchTileElems;
 
+            // 循环不变量外提：B 面布局（V [Sk,D] RowMajor(Sk, strideV)——ldm=Hkv·D
+            // 即 BSHD 的 n 行跨步）。A/C 面描述依赖尾块（同段1注），保留在循环内。
+            LayoutV layoutB(static_cast<uint32_t>(kvSeqlen), static_cast<uint64_t>(strideV));
             for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
                 for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
                     const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
@@ -541,10 +542,8 @@ namespace SplitB {
                         static_cast<uint64_t>(tg.kvNIdx) * embed;
 
                     // A = P 头槽 [rowNum,Sk]（workspace 布局，行步长 colsPad）；
-                    // B = V[b,kvN] [Sk,D]：RowMajor(Sk, strideV)（v2 同款，ldm=Hkv·D
-                    // 即 BSHD 的 n 行跨步）；C = OTmp（行步长 dPad）
+                    // C = OTmp（行步长 dPad）
                     LayoutP layoutA(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
-                    LayoutV layoutB(static_cast<uint32_t>(kvSeqlen), static_cast<uint64_t>(strideV));
                     LayoutOTmp layoutC(tg.rowNum, static_cast<uint32_t>(embed), dPad);
                     GemmCoord actualShapePV{tg.rowNum, static_cast<uint32_t>(embed),
                                             static_cast<uint32_t>(kvSeqlen)};
@@ -604,7 +603,7 @@ namespace SplitB {
         }
 
     private:
-        // tile 几何（v3.1：qN 打包恢复；MHA 退化为此前的每头一 tile）
+        // tile 几何（v3.3：qN 打包；MHA 退化为此前的每头一 tile）
         __aicore__ inline
         TileGeom GetTileGeom(uint32_t qSBlockIdx, uint32_t qNBlockIdx) const
         {

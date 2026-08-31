@@ -811,6 +811,79 @@ CopySGmToUb 同款问题的镜像）。修复 = Wait 后补 `PipeBarrier<PIPE_MT
 debug/analyze_t17.py（注意：890 须按 printf 头 sub/off/n 解析，按出现序猜会误报
 ——t17 首版教训）。
 
+**#46.11**｜**循环不变量外提（用户审查驱动，2026-08-31）**：用户问 StageQK 循环内
+AOperandBSHD 三变量是否全固定。分析：strideQ 恒定；qSBlockSize 外层尾块才变（闸门下
+单块恒定，但 tile 模型保留 Sq>128 通用性）；qNBlockSize 内层尾组变体（G=6/qN=4 →
+4,2）——**不能无条件整体外提**。但同扫描发现真不变量未外提：两段的 B 面布局
+（QK：K^T ColumnMajor(strideK,Sk)；PV：V RowMajor(Sk,strideV)——均只依赖
+strideK/V 与 kvSeqlen）与 strideQ 类型转换——已外提至双循环之前；A/C 面描述（依赖
+尾块）留内并注释理由。性能无差（编译器 CSE），属规范/清晰性收益。
+
+**#46.10**｜**v3.3 代码质量重构（用户要求：调用点突兀 → 装载分支内化，2026-08-30）**：
+StageQK 的 `if (qNBlockSize>1) loadAPackedBSHD(...)` 突兀——重构为引擎 API：fork 新增
+公开 `AOperandBSHD{rowsPerHead, headNum, rowStride}` 操作数描述 + `operator()` BSHD
+重载（内部 loadAPackedBSHD 后走主流程）；loadAPackedBSHD 降为**私有**实现细节。
+调用点统一为 `engine(gQ[gmQ], AOperandBSHD{...}, gK, layoutB, gS, layoutC, shape)`
+——无分支、无装载细节外泄；**MHA（headNum=1）经逐位等价路径**（h=0 单次 4 参拷贝
+@offset0，参数与原标准装载逐项相同）。fork 文件头 diff 清单更新为四点；内核/引擎
+的过期版本号注释（v3.1/v3.2→v3.3）与注释层引用（几何守卫注释提私有函数）清理。
+自检：配平 ✓、内核 loadAPackedBSHD 引用 0（仅注释改述）✓。**[需 NPU 验证]**：
+编译 + 冒烟（MHA 应逐位不变、GQA 打包路径不变）。
+
+**#46.9c**｜**v3.3 终验：pytest 21/22（2026-08-30，我自跑）**：唯一失败
+=data_type14-128-8-4-32-32-64，**1/2097152 单点**——与 v3.2 完全同签名（同 test id
+同点数），既有环境性单点（#46.6 定性），非 v3.3 回归。**v3.3 全部闭环**。
+工具教训（用户提示）：pytest 管道 `| tail` 会吞退出码与摘要——用 tee/重定向落盘
+再 grep 摘要（本轮第二次重跑 193.94s 才拿到）。
+
+**#46.9b**｜**GQA bench A/B：打包兑现 1.27~2.42x（2026-08-30，我自跑）**：
+H32/kvH4/D64/s32 多核（host 确认 qNBlockTile=4、nTilePerBatch=8=打包激活）：
+v3.3 打包 vs 旧路径（DISABLE）：b1 1.32x / b16 1.27x / b256 **1.71x** / b320 **1.85x** /
+b1024 **2.42x**（4.287 vs 10.380ms）。vs baseline 0.26~0.43x（b1024 差 3.9x，S5 目标）。
+数据 perf/data/bench_gqa_{packed,oldpath}.csv。v3.3 完整闭环：正确性（MHA+GQA+守卫
+反例+多核）+ 性能（MHA 1.2-1.8x、GQA 1.3-2.4x、vs merged2_2 的 s32 列同量级）。
+
+**#46.9**｜**v3.3 GQA 打包验证全绿（我自跑，2026-08-30）**：
+编译（修复 layoutTileA 块作用域漏声明后）通过。五组测试全 PASS：①GQA 打包满载
+B64 H32/kvH4 Sq32 Sk96（qN=4、rowNum=128）单核+多核，LSE 全对、OUT 仅良性 0.0625
+——**loadAPackedBSHD 的 fractal 偏移目的起点（[需 NPU 验证] 点）一次通过**；
+②Sq33 GQA 守卫反例 PASS（%16≠0 回落 qN=1）；③④MHA 回归与 v3.2 逐位一致（撤钉
+无扰）。新增 perf/bench/bench2_gqa.py（照 bench2 加 --kv-heads；闸门提醒：n2g 按
+qHeads 计——H32 仅 s=32 在闸门、H16 到 s=64 边界）。GQA bench A/B（打包 vs
+DISABLE 旧路径）运行中，结果续记。
+
+**#46.8**｜**定向 bench 裁决 s=64 悬案 + v3.3 GQA 打包恢复（2026-08-30，bench 我自跑）**：
+①#46.7 的 s=64 悬案裁决：merged2_2 那轮是 H=24/D=128（s=64 出闸门走旧路径）。闸门
+友好配置（H8/D64 多核）实测 perf/data/bench_v3_h8d64_mc.csv：**b1024/s64=3.216ms**
+（旧路径同点 5.890ms，A/B 同构建 perf/data/bench_oldpath_h8d64_mc.csv → **1.83x**）；
+b1024 s32=3.185/s64=3.216——**翻倍序列几乎零成本**（开销主导非计算主导，S5 佐证）。
+v3 vs 旧路径全表 1.2~1.8x（b1 1.4x、b1024 1.75-1.83x），与 v1 基线同量级无回退。
+vs baseline 仍 0.14-0.41x（b1024 慢 ~7x）——S5 目标 ~3x。
+②v3.3 GQA 打包恢复：fork 加 `loadAPackedBSHD`（**逐头 4 参 Nd2Nz** 到同一 L1 槽的
+zN 行区 [h·qS,..)，源基址 h·D、行距 strideQ——语义全部来自已上板验证的 MHA 路径，
+**刻意不用 FAI 9 参条带重载**：其目的 stride 按 zN(rowNum,K) 定容推导，与引擎
+zN(L1TileM,K) 槽寻址仅 rowNumRound==128 时重合，照抄会错位）；operator() 首次 A 装载
+按 aPrefilledA_ 跳过（调用末尾复位）。几何恢复 GetQNBlockTile 公式 + 守卫（qS 单块
+∧ Sq%16==0——fractal 对齐；host/device 一致）。PV 侧无需动（P 槽行连续）。
+**[需 NPU 验证]**：①编译（LocalTensor 带 zN 偏移作 copyGmToL1A 目的起点——引擎
+l1ATile 同款模式但 copyGmToL1A 路径首次用偏移）；②GQA 打包路径正确性（B64 H32/kvH4
+Sq32 Sk96——qNBlockTile=4、rowNum=128 满载；加 Sq%16!=0 的 GQA 反例确认守卫回落）；
+③GQA bench A/B（打包 vs 钉 1 vs DISABLE）。
+
+**#46.7**｜**v3 首轮 bench + bench 方法论纠偏（用户授权我自跑 bench，2026-08-30）**：
+用户 merged2_2.csv（fa(1)=v3 本构建 / fa(2)=原版 FAInfer / 末列=fa(2)/fa(1)）：
+**s=32 全线 1.29~4.64x 胜**（b256 1.89x、b320 1.99x、b1024 4.64x——批间流水随 batch
+摊薄兑现，对照 v1 基线 1.27-2.19x 无回退且大 B 显著超越）；s=64 ~1.0x（悬案：取决于
+该轮 H/D——H=24/D=128 时 s=64 出闸门走旧路径=路由使然 vs H=8/D=64 时在闸门内=真持平，
+已发自跑定向 bench 裁决 perf/data/bench_v3_h8d64_mc.csv）；s≥128 ~1.0x（双双向旧路径，
+自洽）。**vs baseline（npu_fusion_attention）仍 0.15~0.39x**——S5 量化目标 ~3x。
+**bench 方法论教训（本轮两个假信号）**：①首跑无 MULTI_CORE=单核对 baseline 20 核，
+数字无结论力；②FLASH_ATTN_FORCE_SPLITB=1 是"绕过形状闸门"的调试旋钮非性能开关——
+把 s=256/512 硬塞 SplitB → softmax UB 溢出（S tile 128×colsPad fp32 按闸门 S≤128 设计）
+挂死；早前同 env 的 Killed = host workspace 爆（s=512 perCore≈88MB×20 核≈1.8GB OOM）。
+正确姿势：闸门友好配置（H=8/D=64→s≤64；H=4→s≤128）+ MULTI_CORE=1 + 不 FORCE +
+可选 DISABLE_SPLITB 做 A/B。**用户授权变更**：性能测试由我自跑（bench2.py 为模板）。
+
 **#46.6**｜**🎉 v3 正确性全线闭环（用户实测，2026-08-30）**：
 BSHD 布局修复后全量验证通过：①B2 H8 Sq9 Sk47 ×8 位级全对（max_err=0.0000）；
 ②**B4/B16 H8 Sq32 Sk96 ×8 全 PASS 且逐迭代恒定——v2 时代 7/8 失败的 l1A 撕裂族

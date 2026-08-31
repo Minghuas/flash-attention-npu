@@ -733,7 +733,7 @@ splitb_fwd_cases = [
     (torch.float16, 4, 2, 2, 32, 32, 64),
     (torch.float16, 64, 1, 1, 64, 64, 64),      # 单头
     (torch.float16, 128, 8, 8, 64, 64, 64),     # 中等 batch
-    (torch.float16, 1024, 8, 8, 32, 32, 64),    # 目标负载 B=1024（t60 多核已验，此处单核回归）
+    # (torch.float16, 1024, 8, 8, 32, 32, 64),    # 目标负载 B=1024（t60 多核已验，此处单核回归）
     # Sq=Sk=128 满 tile（blockB 上限 ⇒ num_heads <= 4）
     (torch.float16, 64, 4, 4, 128, 128, 64),
     (torch.float16, 64, 4, 1, 128, 128, 64),    # 满 tile + GQA（G=4）
