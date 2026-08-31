@@ -284,6 +284,11 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 1, 131072, 128, 1, 128, True, "TND", True, 746, 16, 1),
     (torch.bfloat16, 2, 6, 1, 64, 2048, 256, 1, 128, True, "TND", True, 746, 16, 1),
     # ========== Special cases: tiny head_size, large-GQA decode, num_splits=2, and special SWA windows ==========
+    # Flash Decode with the maximum supported head dim. These cases keep the
+    # default scheduler behavior and exercise the host FD decision directly.
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 256, 1, 128, False, "TND", True, -1, -1, 0,),
+    (torch.float16, 1, 8, 1, 16, 4096, 256, 1, 128, True, "TND", True, -1, -1, 1,),
+    (torch.bfloat16, 1, 8, 1, 1, 4096, 256, 1, 128, False, "TND", True, -1, -1, 2,),
     (torch.bfloat16, 2, 6, 6, 256, 512, 1, 0, 128, True, "BSND", False, -1, -1, 0),
     (torch.bfloat16, 2, 6, 6, 256, 512, 2, 0, 128, True, "BSND", False, -1, -1, 0),
     (torch.bfloat16, 2, 6, 6, 256, 512, 4, 0, 128, True, "BSND", False, -1, -1, 0),
