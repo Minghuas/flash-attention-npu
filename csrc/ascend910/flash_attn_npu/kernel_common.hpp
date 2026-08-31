@@ -73,6 +73,7 @@ namespace KernelCommon {
         GM_ADDR lse;
         GM_ADDR workSpace;
         GM_ADDR tiling;
+        GM_ADDR alibiSlopes;
         GM_ADDR kNew;
         GM_ADDR vNew;
 
@@ -80,9 +81,9 @@ namespace KernelCommon {
 
         __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
                 GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_,
-                    GM_ADDR tiling_, GM_ADDR kNew_ = nullptr, GM_ADDR vNew_ = nullptr)
+                    GM_ADDR tiling_, GM_ADDR alibiSlopes_, GM_ADDR kNew_ = nullptr, GM_ADDR vNew_ = nullptr)
             : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
-                actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_),
+                actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_), alibiSlopes(alibiSlopes_),
                 kNew(kNew_), vNew(vNew_) {}
     };
 

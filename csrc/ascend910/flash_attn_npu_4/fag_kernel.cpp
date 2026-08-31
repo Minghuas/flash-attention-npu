@@ -791,7 +791,7 @@ public:
         AscendC::TPipe pipeVec;
         TBuf<> unifiedBuffer;
         EpilogueFAGSabVec epilogueFAGSabVec(resource, &pipeVec, params.q, params.k, params.v, params.dout, params.drop_mask, params.atten_mask,
-            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv,
+            params.out, params.softmax_lse, params.cu_seq_qlen, params.cu_seq_kvlen, params.dq, params.dk, params.dv, nullptr,
             params.workspace, params.tiling, unifiedBuffer);
 
         EpilogueFAGDtmAdd epilogueFAGDtmAdd(resource, params.cu_seq_qlen, params.cu_seq_kvlen, params.workspace, params.tiling, unifiedBuffer);
@@ -993,7 +993,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
                         GM_ADDR v, GM_ADDR out, GM_ADDR drop_mask,
                         GM_ADDR atten_mask, GM_ADDR softmax_lse,
                         GM_ADDR cu_seq_qlen, GM_ADDR cu_seq_kvlen, GM_ADDR dq_,
-                        GM_ADDR dk_, GM_ADDR dv_, GM_ADDR alibi_slopes_,
+                        GM_ADDR dk_, GM_ADDR dv_,
                         GM_ADDR workspace, GM_ADDR tiling, GM_ADDR ptrDump = nullptr
 ) {
     // Set FFTS address
@@ -1089,7 +1089,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
     using EpilogueFAGSfmg = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2FAGSfmg, InputType, FAGTilingData>;
 
     // VEC_Op：计算S = Mask(Q*K^T)，并完成重计算 P = Softmax(S)，再计算dS = P * Sub(dP, Sfmg)
-    using EpilogueAtlasA2SameAbVec = Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP>;
+    using EpilogueAtlasA2SameAbVec = Catlass::Epilogue::EpilogueAtlasA2SameAbVec<INPUT_LAYOUT, IS_DROP, IS_ATTEN_MASK, HAS_SOFTCAP, false>;
     using EpilogueFAGSabVec = Catlass::Epilogue::Block::BlockEpilogue<EpilogueAtlasA2SameAbVec, OutputType, InputType, FAGTilingData>;
 
     // VEC_Post：dQ*scale和dK*scale，并搬运输出dQ/dK/dV
@@ -1102,7 +1102,7 @@ CATLASS_GLOBAL void FAGGeneral(uint64_t fftsAddr, GM_ADDR dout, GM_ADDR q, GM_AD
 
     // Kernel level
     using FAGKernel = FlashAttentionScoreGrad<BlockMmadFAGCube1, BlockMmadFAGCube2, BlockMmadFAGCube3, EpilogueFAGPre, EpilogueFAGSfmg, EpilogueFAGSabVec, EpilogueFAGPost, EpilogueFAGDtmAdd, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DTM>;
-    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, alibi_slopes_, workspace, tiling};
+    FAGKernelParams params{dout, q, k, v, out, drop_mask, atten_mask, softmax_lse, cu_seq_qlen, cu_seq_kvlen, dq_, dk_, dv_, nullptr, workspace, tiling};
 
     // call kernel
     FAGKernel flashAttn;

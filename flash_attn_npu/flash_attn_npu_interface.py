@@ -850,6 +850,10 @@ class FlashAttnFunc(torch.autograd.Function):
         cache_seqlens = torch.full(
             (batch_size,), seqlen_k, dtype=torch.int32, device=q.device
         )
+        if alibi_slopes is None:
+            alibi_slopes_batch_stride = 0
+        else:
+            alibi_slopes_batch_stride = alibi_slopes.shape[1] if alibi_slopes.dim() == 2 else 0
         scheduler_metadata = get_scheduler_metadata(
             batch_size, seqlen_q, seqlen_k, num_heads, num_heads_k, head_size,
             cache_seqlens,
@@ -857,7 +861,8 @@ class FlashAttnFunc(torch.autograd.Function):
             causal=causal,
             window_size=window_size,
             softcap=softcap,
-            softmax_scale=softmax_scale,
+            softmax_scale=softmax_scale, 
+            alibi_slopes_batch_stride=alibi_slopes_batch_stride,
         )
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
             q,
@@ -969,6 +974,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_heads_k = k.shape[1]
             metadata_max_seqlen_k = max_seqlen_k
         cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        if alibi_slopes is None:
+            alibi_slopes_batch_stride = 0
+        else:
+            alibi_slopes_batch_stride = alibi_slopes.shape[1] if alibi_slopes.dim() == 2 else 0
         scheduler_metadata = get_scheduler_metadata(
             batch_size, max_seqlen_q, metadata_max_seqlen_k, num_heads, num_heads_k, head_size,
             cache_seqlens,
@@ -979,6 +988,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size=window_size,
             softcap=softcap,
             softmax_scale=softmax_scale,
+            alibi_slopes_batch_stride=alibi_slopes_batch_stride,
         )
         out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
             q,
@@ -1660,6 +1670,7 @@ def flash_attn_with_kvcache(
             seqlen_q=q.shape[1],
             block_table=block_table,
             k_cache=k_cache,
+            alibi_slopes=alibi_slopes,
         )
     out, softmax_lse = flash_attn_npu.fwd_kvcache(
         q,
@@ -1688,7 +1699,8 @@ def flash_attn_with_kvcache(
 
 
 def _validate_scheduler_metadata(scheduler_metadata, *, causal, window_size, softcap,
-                                 softmax_scale, seqlen_q, block_table, k_cache):
+                                 softmax_scale, seqlen_q, block_table, k_cache,
+                                 alibi_slopes=None):
     """Reject scheduler_metadata created with arguments that do not match this
     call; the AICPU-written tiling bakes in the mask layout, paged geometry and
     softcap-divided softmax scale."""
@@ -1704,6 +1716,12 @@ def _validate_scheduler_metadata(scheduler_metadata, *, causal, window_size, sof
         "softcap": float(softcap),
         "softmax_scale": float(softmax_scale),
         "max_seqlen_q": int(seqlen_q),
+        # The kernel reads the per-batch ALiBi stride from the baked tiling, so
+        # it must match how this call indexes alibi_slopes.
+        "alibi_slopes_batch_stride": (
+            0 if alibi_slopes is None
+            else (int(alibi_slopes.shape[1]) if alibi_slopes.dim() == 2 else 0)
+        ),
     }
     if block_table is not None:
         # The fwd mask derivation and the block-table row stride both use the
@@ -1741,6 +1759,7 @@ def get_scheduler_metadata(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,   # 0.0 means deactivated
     softmax_scale=None,  # defaults to 1 / sqrt(headdim); must match the fwd call
+    alibi_slopes_batch_stride=0,  
 ):
     """Precompute the forward scheduler metadata (tiling, optional mask, and —
     for paged KV cache — the flash-decode split schedule) on the AICPU. Pass the
@@ -1759,6 +1778,7 @@ def get_scheduler_metadata(
         window_size[0], window_size[1],
         softcap,
         softmax_scale,
+        alibi_slopes_batch_stride,
     )
     # Fingerprint the creation arguments so flash_attn_with_kvcache can reject
     # metadata whose baked-in tiling does not match the call consuming it.
@@ -1772,5 +1792,6 @@ def get_scheduler_metadata(
         "page_size": None if page_size is None else int(page_size),
         "max_seqlen_q": int(max_seqlen_q),
         "max_seqlen_k": int(max_seqlen_k),
+        "alibi_slopes_batch_stride": int(alibi_slopes_batch_stride),
     }
     return scheduler_metadata

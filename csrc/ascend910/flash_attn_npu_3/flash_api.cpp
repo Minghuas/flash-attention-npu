@@ -192,7 +192,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     uint32_t blockDim = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     uint32_t launchBlockDim = blockDim;
     at::Tensor seqlens_k, block_table, out;
-    at::Tensor rotary_cos, rotary_sin, cache_batch_idx, alibi_slopes;
+    at::Tensor rotary_cos, rotary_sin, cache_batch_idx;
 
     at::Tensor cu_seqlens_q, cu_seqlens_k;
     at::Tensor out_accum, softmax_lse_accum;

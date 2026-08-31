@@ -86,6 +86,38 @@ def apply_attention_dropout(prob, drop_mask, dropout_p):
     return prob * drop_mask / (1.0 - dropout_p)
 
 
+def alibi_bias(alibi_slopes, q_len, k_len, q_seqlens=None, kv_seqlens=None):
+    """Build the additive ALiBi bias [B, H, Q, K] (float32, non-positive).
+
+    alibi_slopes is fp32 shaped (H,) or (B, H). Positions use bottom-right
+    alignment: query i and key j get -slope * |i + max(0, k - q) - j|. With
+    per-batch q_seqlens/kv_seqlens (padded varlen goldens) the alignment offset
+    becomes per-batch; padding positions keep bias 0 so the boolean mask stays
+    authoritative.
+    """
+    slopes = torch.as_tensor(alibi_slopes, dtype=torch.float32)
+    if slopes.dim() == 1:
+        slopes = slopes.unsqueeze(0)
+    batch, num_heads = slopes.shape
+    row = torch.arange(q_len, dtype=torch.float32)
+    col = torch.arange(k_len, dtype=torch.float32)
+    if q_seqlens is None or kv_seqlens is None:
+        row_offset = float(max(0, k_len - q_len))
+        dist = (row_offset + row[:, None] - col[None, :]).abs()
+        return -slopes.reshape(batch, num_heads, 1, 1) * dist.reshape(1, 1, q_len, k_len)
+    q_seqlens = torch.as_tensor(q_seqlens)
+    kv_seqlens = torch.as_tensor(kv_seqlens)
+    bias = torch.zeros(batch, num_heads, q_len, k_len)
+    for b in range(batch):
+        valid_row = row < float(q_seqlens[b])
+        valid_col = col < float(kv_seqlens[b])
+        row_offset = float(max(0, int(kv_seqlens[b]) - int(q_seqlens[b])))
+        dist = (row_offset + row[:, None] - col[None, :]).abs()
+        dist = dist * valid_row[:, None] * valid_col[None, :]
+        bias[b] = -slopes[b].reshape(num_heads, 1, 1) * dist.reshape(1, q_len, k_len)
+    return bias
+
+
 def softmax_with_sink(scores, sink_matrix, value_dtype):
     """Compute attention probabilities and LSE with an extra sink term."""
     sink_matrix = torch.as_tensor(sink_matrix, device=scores.device)
@@ -121,6 +153,9 @@ def ref_flash_attention(
     sink_matrix=None,
     drop_mask=None,
     dropout_p=0.0,
+    alibi_slopes=None,
+    q_seqlens=None,
+    kv_seqlens=None,
 ):
     """BSND reference implementation that computes all batches together."""
     dtype_og = query.dtype
@@ -132,6 +167,11 @@ def ref_flash_attention(
 
     if softcap > 0.0:
         qk_result = torch.tanh(qk_result / softcap) * softcap
+    if alibi_slopes is not None:
+        bias = alibi_bias(
+            alibi_slopes, qk_result.shape[-2], qk_result.shape[-1], q_seqlens, kv_seqlens
+        ).to(device=qk_result.device)
+        qk_result = qk_result + bias.to(qk_result.dtype)
     if mask is not None:
         mask = mask.to(device=qk_result.device, dtype=torch.bool)
         if mask.dim() == 2:
@@ -200,18 +240,25 @@ def _ref_flash_attention_pair(
     sink_matrix=None,
     drop_mask=None,
     dropout_p=0.0,
+    alibi_slopes=None,
+    q_seqlens=None,
+    kv_seqlens=None,
 ):
     """Return the two BSND golden references used by the comparator."""
     kwargs = {} if rescale_threshold is None else {"rescale_threshold": rescale_threshold}
     out_ref, lse_ref = ref_flash_attention(
         query, key, value, scale, mask, data_type, softcap,
         upcast=True, reorder_ops=False, sink_matrix=sink_matrix,
-        drop_mask=drop_mask, dropout_p=dropout_p, **kwargs,
+        drop_mask=drop_mask, dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
+        **kwargs,
     )
     out_pt, lse_pt = ref_flash_attention(
         query, key, value, scale, mask, data_type, softcap,
         upcast=False, reorder_ops=True, sink_matrix=sink_matrix,
-        drop_mask=drop_mask, dropout_p=dropout_p, **kwargs,
+        drop_mask=drop_mask, dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
+        **kwargs,
     )
     return out_ref, lse_ref, out_pt, lse_pt
 
@@ -247,6 +294,9 @@ def cached_ref_flash_attention_pair(
     sink_matrix=None,
     drop_mask=None,
     dropout_p=0.0,
+    alibi_slopes=None,
+    q_seqlens=None,
+    kv_seqlens=None,
     metadata=None,
 ):
     """Cached wrapper for the two forward reference implementations."""
@@ -255,6 +305,11 @@ def cached_ref_flash_attention_pair(
     )
     case_metadata["rescale_threshold"] = rescale_threshold
     case_metadata["dropout_p"] = dropout_p
+    case_metadata["alibi_slopes_shape"] = (
+        None if alibi_slopes is None else list(alibi_slopes.shape)
+    )
+    case_metadata["q_seqlens"] = None if q_seqlens is None else list(q_seqlens)
+    case_metadata["kv_seqlens"] = None if kv_seqlens is None else list(kv_seqlens)
     inputs = {
         "query": query,
         "key": key,
@@ -262,6 +317,9 @@ def cached_ref_flash_attention_pair(
         "mask": mask,
         "sink": sink_matrix,
         "drop_mask": drop_mask,
+        "alibi_slopes": alibi_slopes,
+        "q_seqlens": q_seqlens,
+        "kv_seqlens": kv_seqlens,
     }
 
     def compute():
@@ -269,6 +327,7 @@ def cached_ref_flash_attention_pair(
             query, key, value, scale, mask, data_type, softcap,
             rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
             drop_mask=drop_mask, dropout_p=dropout_p,
+            alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
         )
         return dict(zip(("out_ref", "lse_ref", "out_pt", "lse_pt"), values))
 
@@ -362,6 +421,9 @@ def ref_flash_attention_pair(
     sink_matrix=None,
     drop_mask=None,
     dropout_p=0.0,
+    alibi_slopes=None,
+    q_seqlens=None,
+    kv_seqlens=None,
 ):
     # Backward tests need the live CPU graph to remain available when their
     # separate gradient artifact is missing or being refreshed.  Forward-only
@@ -374,10 +436,12 @@ def ref_flash_attention_pair(
             query, key, value, scale, mask, data_type, softcap,
             rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
             drop_mask=drop_mask, dropout_p=dropout_p,
+            alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
         )
     return cached_ref_flash_attention_pair(
         query, key, value, scale, mask, data_type, softcap,
         nodeid=_current_nodeid(),
         rescale_threshold=rescale_threshold, sink_matrix=sink_matrix,
         drop_mask=drop_mask, dropout_p=dropout_p,
+        alibi_slopes=alibi_slopes, q_seqlens=q_seqlens, kv_seqlens=kv_seqlens,
     )

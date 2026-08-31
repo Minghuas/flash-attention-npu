@@ -53,22 +53,22 @@
 // IS_SOFTCAP map to the kernel's template params. Argument order is identical
 // to LaunchFAGGeneralKernel in fag_general_launch.hpp; the drop_mask kernel arg
 // is a.dropMaskDevice (nullptr when dropout is off).
-#define FAG_KERNEL_LAUNCH(DTYPE, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP)                             \
-    ::FAGGeneral<DTemplateType::DTYPE, DType, kInputLayout, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP>  \
-        <<<a.blockDim, nullptr, a.aclStream>>>(                                                      \
-            a.fftsAddr, a.dOutDevice, a.qDevice, a.kDevice, a.vDevice,                               \
-            a.outDevice, a.dropMaskDevice, a.attenMaskDevice, a.softMaxLseDevice,                    \
-            a.cuSeqQlenDevice, a.cuSeqKvlenDevice, a.dqDevice, a.dkDevice,                           \
-            a.dvDevice, nullptr, a.workspaceDevice, a.tilingDevice)
+#define FAG_KERNEL_LAUNCH(DTYPE, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IS_ALIBI)                              \
+    ::FAGGeneral<DTemplateType::DTYPE, DType, kInputLayout, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IS_ALIBI>   \
+        <<<a.blockDim, nullptr, a.aclStream>>>(                                                                 \
+            a.fftsAddr, a.dOutDevice, a.qDevice, a.kDevice, a.vDevice,                                          \
+            a.outDevice, a.dropMaskDevice, a.attenMaskDevice, a.softMaxLseDevice,                               \
+            a.cuSeqQlenDevice, a.cuSeqKvlenDevice, a.dqDevice, a.dkDevice,                                      \
+            a.dvDevice, a.alibiSlopesDevice, a.workspaceDevice, a.tilingDevice)
 
 // Pick the headdim specialization at runtime.
-#define FAG_LAUNCH_HD(IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP)                                          \
+#define FAG_LAUNCH_HD(IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IS_ALIBI)                                          \
     do {                                                                                               \
         switch (a.qk_headdim_kernel) {                                                                 \
-            case 64:  FAG_KERNEL_LAUNCH(Aligned64,  IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP); break;    \
-            case 128: FAG_KERNEL_LAUNCH(Aligned128, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP); break;    \
-            case 192: FAG_KERNEL_LAUNCH(Aligned192, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP); break;    \
-            case 256: FAG_KERNEL_LAUNCH(Aligned256, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP); break;    \
+            case 64:  FAG_KERNEL_LAUNCH(Aligned64,  IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IS_ALIBI); break;    \
+            case 128: FAG_KERNEL_LAUNCH(Aligned128, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IS_ALIBI); break;    \
+            case 192: FAG_KERNEL_LAUNCH(Aligned192, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IS_ALIBI); break;    \
+            case 256: FAG_KERNEL_LAUNCH(Aligned256, IS_CAUSAL, IS_DROP, IS_DTM, IS_SOFTCAP, IS_ALIBI); break;    \
             default: break;                                                                            \
         }                                                                                              \
     } while (0)
@@ -91,7 +91,9 @@ void launch_fag_general_dispatch_impl(const FagGeneralLaunchArgs &a) {
             FAG_BOOL_SWITCH(a.is_causal, IsAttenMask, {
                 FAG_BOOL_SWITCH(a.deterministic, IsDtm, {
                     FAG_BOOL_SWITCH(a.has_dropout, IsDrop, {
-                        FAG_LAUNCH_HD(IsAttenMask, IsDrop, IsDtm, HasSoftcap);
+                        FAG_BOOL_SWITCH(a.has_alibi, IsAlibi, {
+                            FAG_LAUNCH_HD(IsAttenMask, IsDrop, IsDtm, HasSoftcap, IsAlibi);
+                        });
                     });
                 });
             });

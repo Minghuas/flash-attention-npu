@@ -16,13 +16,13 @@
 // FAInfer (no IS_FD template arg — flash-decode moved to tiling). MASK_TYPE and
 // LAYOUT are named enum values fixed by the switch macros below. RETURN_SOFTMAX
 // and DROPOUT are the forward's optional epilogue / dropout template axes.
-#define FWD_KERNEL_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT, SOFTCAP, RETURN_SOFTMAX, DROPOUT) \
+#define FWD_KERNEL_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT, SOFTCAP, RETURN_SOFTMAX, DROPOUT, ALIBI) \
     SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT,                        \
-                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP, RETURN_SOFTMAX, DROPOUT> \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP, RETURN_SOFTMAX, DROPOUT, ALIBI> \
         <<<blockDim, nullptr, aclStream>>>(                                                  \
             fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice,               \
             oDevice, softmaxLseDevice, qSeqDevice, kvSeqDevice,                              \
-            workspaceDevice, tilingDevice, kNewDevice, vNewDevice);
+            workspaceDevice, tilingDevice, alibiSlopesDevice, kNewDevice, vNewDevice);
 
 // BOOL_SWITCH-style helper (idea from static_switch.h in flash-attention): each
 // branch fixes the runtime bool as a named constexpr flag, so the dispatch
@@ -72,6 +72,7 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     const bool has_softcap = a.has_softcap;
     const bool return_softmax = a.return_softmax;
     const bool has_dropout = a.has_dropout;
+    const bool has_alibi = (a.alibiSlopesDevice != nullptr);
     uint8_t *qDevice = a.qDevice;
     uint8_t *kDevice = a.kDevice;
     uint8_t *vDevice = a.vDevice;
@@ -85,6 +86,7 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
     uint8_t *kvSeqDevice = a.kvSeqDevice;
     uint8_t *workspaceDevice = a.workspaceDevice;
     uint8_t *tilingDevice = a.tilingDevice;
+    uint8_t *alibiSlopesDevice = a.alibiSlopesDevice;
     (void)flashDecodeFlag;
 
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
@@ -92,7 +94,9 @@ void launch_fwd_impl(const FwdLaunchArgs &a) {
             FWD_BOOL_SWITCH(has_softcap, HasSoftcap, {
                 FWD_BOOL_SWITCH(return_softmax, ReturnSoftmax, {
                     FWD_BOOL_SWITCH(has_dropout, HasDropout, {
-                        FWD_KERNEL_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap, ReturnSoftmax, HasDropout);
+                        FWD_BOOL_SWITCH(has_alibi, HasAlibi, {
+                            FWD_KERNEL_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap, ReturnSoftmax, HasDropout, HasAlibi);
+                        });
                     });
                 });
             });

@@ -53,6 +53,7 @@ struct FAInferTilingData {
     float scaleValue;
     float softcapValue;
     float dropoutValue;
+    int64_t alibiSlopesBatchStride;
     uint64_t padding1;
     uint64_t padding2;
     uint32_t padding3;
@@ -93,6 +94,7 @@ struct FAInferTilingData {
     float get_scaleValue() const { return scaleValue; }
     float get_softcapValue() const { return softcapValue; }
     float get_dropoutValue() const { return dropoutValue; }
+    int64_t get_alibiSlopesBatchStride() const { return alibiSlopesBatchStride; }
     uint64_t get_padding1() const { return padding1; }
     uint64_t get_padding2() const { return padding2; }
     uint32_t get_padding3() const { return padding3; }
@@ -129,6 +131,7 @@ struct FAInferTilingData {
     void set_scaleValue(float value) { scaleValue = value; }
     void set_softcapValue(float value) { softcapValue = value; }
     void set_dropoutValue(float value) { dropoutValue = value; }
+    void set_alibiSlopesBatchStride(int64_t value) { alibiSlopesBatchStride = value; }
     void set_padding1(uint64_t value) { padding1 = value; }
     void set_padding2(uint64_t value) { padding2 = value; }
     void set_padding3(uint32_t value) { padding3 = value; }

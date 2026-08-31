@@ -7,6 +7,12 @@ import torch
 CASE_SEED = 42
 
 
+def make_alibi_slopes(batch_size, num_heads):
+    """Create the standard ALiBi slope table [batch_size, num_heads] on CPU fp32."""
+    slopes = torch.tensor([0.5 / (2 ** h) for h in range(num_heads)], dtype=torch.float32)
+    return slopes.unsqueeze(0).repeat(batch_size, 1)
+
+
 def make_random_tensor(
     shape,
     data_type,
