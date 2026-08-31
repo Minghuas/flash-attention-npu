@@ -291,7 +291,7 @@ public:
     // LSE has at most one float vector (64 elements) per sub-core.  Keep the
     // elementwise log(sum) + max in registers, then materialize it in LM for
     // Brcb and the existing block-aligned GM store path.
-    __simd_vf__ inline
+    __simd_vf__ static inline
     void ComputeLse(__ubuf__ float *glUb, __ubuf__ float *gmUb,
                            __ubuf__ float *lmUb, uint32_t rowCount)
     {
@@ -405,7 +405,7 @@ public:
     }
     
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void RescaleFunc(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *dmUb,
+    __simd_vf__ static inline void RescaleFunc(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *dmUb,
                                         uint32_t row, uint32_t col, uint32_t rowStride,
                                         uint32_t tailCols)
     {
@@ -489,7 +489,7 @@ public:
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void RescaleFuncLastNotFirst(__ubuf__ T *goUb, __ubuf__ T *loUb,
+    __simd_vf__ static inline void RescaleFuncLastNotFirst(__ubuf__ T *goUb, __ubuf__ T *loUb,
                                         __ubuf__ T *dmUb, __ubuf__ T *glUb,
                                         uint32_t row, uint32_t col, uint32_t rowStride,
                                         uint32_t tailCols)
@@ -609,7 +609,7 @@ public:
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void DivFuncLastAndFirst(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *glUb,
+    __simd_vf__ static inline void DivFuncLastAndFirst(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *glUb,
                                                 uint32_t row, uint32_t col, uint32_t rowStride,
                                                 uint32_t tailCols)
     {

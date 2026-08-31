@@ -203,18 +203,18 @@ public:
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             }
         } else {
             if (n > 64) {
                 ComputeScaleAndMax<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMax64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             }
         }
 
@@ -297,45 +297,45 @@ public:
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Zero>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::One>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Two>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Three>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, false, MAligendTileNum::Four>(
                     sAddr, lastMaxAddr, lastMaxStartAddr, pAddr, lastSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             }
         } else {
             if (mAligned16TileNum == 0) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Zero>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 1) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::One>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 2) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Two>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else if (mAligned16TileNum == 3) {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Three>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxDn<ElementInput, ElementOutput, true, MAligendTileNum::Four>(
                     sAddr, nowMaxAddr, lastMaxAddr, pAddr, nowSumAddr, mRound, m, tailN, mFirstTile, scaleValue, 64, blockStride, nRound,
-                    expMaxUbAddr, lastSumAddr);
+                    expMaxUbAddr, lastSumAddr, rescaleThreshold);
             }
         }
         
@@ -473,18 +473,18 @@ public:
         if (isFirstKvSTile) {
             if (n > 64) {
                 ComputeScaleAndMaxMask<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxMask64<ElementInput, ElementOutput, false>(
-                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, lastMaxAddr, lastMaxStartAddr, lastMaxStartAddr, pAddr, lastSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             }
         } else {
             if (n > 64) {
                 ComputeScaleAndMaxMask<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             } else {
                 ComputeScaleAndMaxMask64<ElementInput, ElementOutput, true>(
-                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound);
+                    sAddr, nowMaxAddr, nowMaxStartAddr, lastMaxStartAddr, pAddr, nowSumAddr, maskUbAddr, m, nLoops, tailN, nPadding, scaleValue, 128, blockStride, nRound, rescaleThreshold);
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(ubSBufId);
@@ -534,8 +534,8 @@ private:
     };
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMax(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void ComputeScaleAndMax(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -639,8 +639,8 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMax64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void ComputeScaleAndMax64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+        __ubuf__ ElementS *expSumUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -732,8 +732,8 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMaxMask(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void ComputeScaleAndMaxMask(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -867,8 +867,8 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate>
-    __simd_vf__ inline void ComputeScaleAndMaxMask64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
-        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride)
+    __simd_vf__ static inline void ComputeScaleAndMaxMask64(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *newMaxUbStart, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+        __ubuf__ ElementS *expSumUb, __ubuf__ ElementMask *maskUb, uint16_t m, uint16_t nLoops, uint32_t tailN, uint32_t nPadding, ElementInput dScale, uint16_t S2BaseSize, uint32_t blockStride, uint32_t repeatStride, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> minVreg;
@@ -970,9 +970,9 @@ private:
     }
 
     template <typename ElementS, typename ElementP, bool isUpdate, MAligendTileNum mTileNum>
-    __simd_vf__ inline void ComputeScaleAndMaxDn(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
+    __simd_vf__ static inline void ComputeScaleAndMaxDn(__ubuf__ ElementS *srcUb, __ubuf__ ElementS *newMaxUb, __ubuf__ ElementS *LastMaxUbStart, __ubuf__ ElementP *expUb,
         __ubuf__ ElementS *expSumUb, uint16_t mRound, uint16_t m, uint32_t tailN, uint32_t mFirstTile, ElementInput dScale, uint16_t S2BaseSize, 
-        uint32_t blockStride, uint32_t repeatStride, __ubuf__ float *expMaxUb, __ubuf__ ElementS *lastExpSumUb)
+        uint32_t blockStride, uint32_t repeatStride, __ubuf__ float *expMaxUb, __ubuf__ ElementS *lastExpSumUb, float rescaleThreshold)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> src0Vreg;
@@ -1233,7 +1233,7 @@ private:
     }
 
     template <typename ElementS>
-    __simd_vf__ inline void CastExpSumAndExpMax(__ubuf__ float *sumUb, __ubuf__ float *maxUb,
+    __simd_vf__ static inline void CastExpSumAndExpMax(__ubuf__ float *sumUb, __ubuf__ float *maxUb,
         __ubuf__ ElementS *expSumUb, __ubuf__ ElementS *nowMaxUb,
         uint16_t mLoops, uint32_t tailM)
     {
@@ -1280,7 +1280,7 @@ private:
     }
 
     template <typename ElementS>
-    __simd_vf__ inline void UpdateExpSumAndExpMax(__ubuf__ float *sumUb, __ubuf__ float *expMaxUb,
+    __simd_vf__ static inline void UpdateExpSumAndExpMax(__ubuf__ float *sumUb, __ubuf__ float *expMaxUb,
         __ubuf__ float *maxUb, __ubuf__ ElementS *expSumUb, __ubuf__ ElementS *nowMaxUb,
         uint16_t mLoops, uint32_t tailM)
     {

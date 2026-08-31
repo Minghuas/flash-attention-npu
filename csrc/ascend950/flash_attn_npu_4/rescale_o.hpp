@@ -229,7 +229,7 @@ public:
         }
     }
 
-    __simd_vf__ inline
+    __simd_vf__ static inline
     void ComputeLse(__ubuf__ float *glUb, __ubuf__ float *gmUb,
                            __ubuf__ float *lmUb, uint32_t rowCount)
     {
@@ -331,7 +331,7 @@ public:
     }
     
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void RescaleFuncGeneric(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *dmUb,
+    __simd_vf__ static inline void RescaleFuncGeneric(__ubuf__ T *goUb, __ubuf__ T *loUb, __ubuf__ T *dmUb,
                                                uint32_t row, uint32_t col, uint32_t rowStride,
                                                uint32_t tailCols)
     {
@@ -414,7 +414,7 @@ public:
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void RescaleFuncLastNotFirstGeneric(__ubuf__ T *goUb, __ubuf__ T *loUb,
+    __simd_vf__ static inline void RescaleFuncLastNotFirstGeneric(__ubuf__ T *goUb, __ubuf__ T *loUb,
                                                            __ubuf__ T *dmUb, __ubuf__ T *glUb,
                                                            uint32_t row, uint32_t col, uint32_t rowStride,
                                                            uint32_t tailCols)
@@ -510,7 +510,7 @@ public:
     }
 
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void DivFuncLastAndFirstGeneric(__ubuf__ T *goUb, __ubuf__ T *loUb,
+    __simd_vf__ static inline void DivFuncLastAndFirstGeneric(__ubuf__ T *goUb, __ubuf__ T *loUb,
                                                        __ubuf__ T *glUb, uint32_t row, uint32_t col,
                                                        uint32_t rowStride,
                                                        uint32_t tailCols)
@@ -615,7 +615,7 @@ public:
 
     // Skip variant of RescaleFunc: dm == 1 for all rows, so go = go + lo.
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void AddFunc(__ubuf__ T *goUb, __ubuf__ T *loUb,
+    __simd_vf__ static inline void AddFunc(__ubuf__ T *goUb, __ubuf__ T *loUb,
                                     uint32_t row, uint32_t col, uint32_t rowStride,
                                     uint32_t tailCols)
     {
@@ -688,7 +688,7 @@ public:
 
     // Skip variant of RescaleFuncLastNotFirst: go = (go + lo) / gl.
     template <typename T, uint32_t ColBlocks, bool HeadDimAligned64 = true>
-    __simd_vf__ inline void AddDivFuncLastNotFirst(__ubuf__ T *goUb, __ubuf__ T *loUb,
+    __simd_vf__ static inline void AddDivFuncLastNotFirst(__ubuf__ T *goUb, __ubuf__ T *loUb,
                                                    __ubuf__ T *glUb, uint32_t row,
                                                    uint32_t col, uint32_t rowStride,
                                                    uint32_t tailCols)
