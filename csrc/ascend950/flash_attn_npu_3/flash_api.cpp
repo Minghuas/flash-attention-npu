@@ -45,14 +45,10 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args,
         ACL_CHECK(aclrtCreateEvent(&events.metadataDone));
     }
 
-    // AICPU 启动参数必须跨函数保持有效（启动后仍可能异步读取 args），
-    // 且 RunOpApiV2 可能在其它线程执行回调，所以赋值放在回调内进行。
-    static thread_local FAMetadataArgs metaArgs;
+    FAMetadataArgs metaArgs = args;
     auto metadata_task = [curHandle, aicpuHandle,
                           inputReady = events.inputReady,
-                          metadataDone = events.metadataDone,
-                          args]() -> int {
-        metaArgs = args;
+                          metadataDone = events.metadataDone, metaArgs]() mutable -> int {
         ACL_CHECK(aclrtRecordEvent(inputReady, curHandle));
         ACL_CHECK(aclrtStreamWaitEvent(aicpuHandle, inputReady));
         ComputeFAMetadata<<<1, nullptr, aicpuHandle>>>(&metaArgs, sizeof(metaArgs));

@@ -458,7 +458,7 @@ mha_fwd(at::Tensor q,
         qDev, kDev, vDev, maskDevice, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
         wsDev, tilDev};
-    auto launch_fa_infer = [&]() -> int {
+    auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;
     };
