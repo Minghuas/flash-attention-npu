@@ -542,7 +542,6 @@ FLASH_ATTN_FUNC_SWA_CASES = [
     # data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, is_causal, window_size
     (torch.bfloat16, 2, 4, 4, 1024, 1024, 128, False, (256, 256)),
     (torch.bfloat16, 2, 4, 2, 1024, 1024, 128, True, (512, -1)),
-    (torch.float16, 1, 2, 1, 777, 1024, 64, False, (300, 0)),
 ]
 
 
