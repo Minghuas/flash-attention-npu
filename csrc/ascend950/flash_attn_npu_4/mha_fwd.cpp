@@ -10,7 +10,7 @@
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
  *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
  *   ❌ SWA / window_size != (-1, -1)
- *   ❌ num_splits > 1 (FlashDecode)
+ *   ✅ num_splits (FlashDecode for paged KV + TND)
  *   ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
  *   ❌ softcap
  */
@@ -19,6 +19,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <type_traits>
 #include <vector>
 #include <c10/core/Device.h>
 #include <torch/extension.h>
@@ -99,8 +100,8 @@ mha_fwd(at::Tensor q,
     TORCH_CHECK(softcap == 0.0f, "950 backend (v4) does not support softcap");
     TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
                 "950 backend (v4) does not support SWA");
-    TORCH_CHECK(num_splits == 0 || num_splits == 1,
-                "950 backend (v4) only supports num_splits=0 or 1");
+    TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
+                "950 backend (v4) requires num_splits in [0, ", blockDim, "]");
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(),
                 "950 backend (v4) does not support pack_gqa");
 
@@ -110,6 +111,12 @@ mha_fwd(at::Tensor q,
     const bool paged_KV    = page_table_.has_value();
     const bool is_varlen_q = cu_seqlens_q_.has_value();
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
+
+    if (num_splits > 1) {
+        TORCH_CHECK(paged_KV && is_varlen_q,
+                    "950 backend (v4) num_splits>1 requires paged KV cache and "
+                    "TND varlen query");
+    }
 
     at::Tensor cu_seqlens_q, cu_seqlens_k, page_table, seqlens_k;
 
@@ -242,6 +249,30 @@ mha_fwd(at::Tensor q,
     }
     at::Tensor seqlens_k_cpu = seqlens_k.to(at::Device(at::kCPU));
 
+    int64_t min_q_seqlen = std::numeric_limits<int64_t>::max();
+    int64_t max_q_seqlen = 0;
+    int64_t max_kv_seqlen = 0;
+    const int32_t *q_cu_ptr = is_varlen_q ?
+        cu_seqlen_q_cpu.data_ptr<int32_t>() : nullptr;
+    const int32_t *kv_len_ptr = seqlens_k_cpu.data_ptr<int32_t>();
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const int64_t q_len = is_varlen_q ?
+            static_cast<int64_t>(q_cu_ptr[batch_idx + 1]) - q_cu_ptr[batch_idx] :
+            seqlen_q;
+        const int64_t kv_len = kv_len_ptr[batch_idx];
+        TORCH_CHECK(q_len > 0 && kv_len > 0,
+                    "950 backend (v4) requires positive Q and KV lengths");
+        min_q_seqlen = std::min(min_q_seqlen, q_len);
+        max_q_seqlen = std::max(max_q_seqlen, q_len);
+        max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
+    }
+    const bool fd_shape_supported = paged_KV && is_varlen_q &&
+        min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
+    // The tiler applies the small-task gate after building the same merged
+    // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
+    // which would over-count GQA/MQA tasks and incorrectly disable FD.
+    const bool flash_decode = num_splits != 1 && fd_shape_supported;
+
     // ============================================================
     // 7. Build FAInferContext + run host-side tiling
     // ============================================================
@@ -259,8 +290,12 @@ mha_fwd(at::Tensor q,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
         return_lse,
         is_varlen_q);
+    ctx.flashDecodeFlag = flash_decode;
+    ctx.numSplits = static_cast<uint32_t>(num_splits);
 
     FAInferTilingData tilingData{};
+    static_assert(std::is_trivially_copyable<FAInferTilingData>::value,
+                  "FAInferTilingData must remain a trivially-copyable Device ABI");
     {
         optiling::FAInferTiling tiler(ctx);
         tiler.SetCoreNum(blockDim);
@@ -279,6 +314,7 @@ mha_fwd(at::Tensor q,
     auto workspace = at::empty(
         {static_cast<int64_t>(tilingData.workSpaceSize)},
         at::device(at::kPrivateUse1).dtype(at::kByte));
+    const bool flashDecodeEnabled = tilingData.flashDecodeFlag != 0U;
 
     at::Tensor softmaxlse = at::empty({0}, at::device(at::kPrivateUse1).dtype(at::kFloat));
     if (return_lse && is_varlen_q) {
@@ -290,6 +326,11 @@ mha_fwd(at::Tensor q,
     }
     if (return_lse) {
         softmaxlse.fill_(std::numeric_limits<float>::infinity());
+    }
+    at::Tensor fd_lse;
+    if (flashDecodeEnabled && !return_lse) {
+        fd_lse = at::empty({num_heads, sizes[0]},
+                           at::device(at::kPrivateUse1).dtype(at::kFloat));
     }
 
     // ============================================================
@@ -315,7 +356,9 @@ mha_fwd(at::Tensor q,
     auto kDev = static_cast<uint8_t*>(k.data_ptr());
     auto vDev = static_cast<uint8_t*>(v.data_ptr());
     auto oDev = static_cast<uint8_t*>(out.data_ptr());
-    auto lseDev = return_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
+    auto lseDev = return_lse
+        ? static_cast<uint8_t*>(softmaxlse.data_ptr())
+        : (flashDecodeEnabled ? static_cast<uint8_t*>(fd_lse.data_ptr()) : oDev);
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
 
@@ -357,13 +400,15 @@ mha_fwd(at::Tensor q,
         maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
 
-    const bool enableDN =
-        (!is_causal) && (head_size_q <= 256) && (head_size_v <= 256);
+    const bool enableDN = !flashDecodeEnabled && (!is_causal) &&
+        (head_size_q <= 256) && (head_size_v <= 256);
+    const uint32_t launchBlockDim = flashDecodeEnabled ?
+        tilingData.fdActiveCoreNum : blockDim;
 
     const FwdLaunchArgs fwdArgs{
         is_bf16, fmt, mask_category, paged_KV,
-        enableDN, return_lse,
-        blockDim, aclStream,
+        enableDN, return_lse, flashDecodeEnabled,
+        tilingData.fdCombineBlockDim, launchBlockDim, aclStream,
         qDev, kDev, vDev, maskDev, blockTableDev,
         oDev, lseDev, qSeqDev, kvSeqDev,
         wsDev, tilDev};

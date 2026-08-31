@@ -12,6 +12,8 @@
 #ifndef TILINGDATA_H
 #define TILINGDATA_H
 
+#include <cstdint>
+
 struct coreNode {
     int startBIdx;
     int startN1Idx;
@@ -34,6 +36,23 @@ struct splitNode {
     int splitNum;
     int64_t lseTaskOffset;
     int64_t oTaskOffset;
+};
+
+constexpr uint32_t MAX_FD_ACTIVE_CORE_NUM = 32U;
+constexpr uint32_t MAX_FD_COMBINE_TASK_NUM = 32U;
+
+struct FdDecodeSchedule {
+    int32_t baseTaskStart;
+    int32_t baseTaskEnd;
+    int32_t firstKvTileStart;
+    int32_t lastKvTileEnd;
+};
+
+struct FdCombineSchedule {
+    int32_t baseTask;
+    int32_t firstCore;
+    int32_t partialStart;
+    int32_t partialCount;
 };
 
 struct FAInferTilingData {
@@ -70,6 +89,25 @@ struct FAInferTilingData {
     uint32_t needCoreNum;
     coreNode coreInfo[25];
     splitNode splitInfo[25];
+    uint32_t cacheLayout = 0U; // 0: ND, 1: NZ
+
+    uint32_t flashDecodeFlag;
+    uint32_t splitMode;
+    uint32_t requestedNumSplits;
+    uint32_t fdActiveCoreNum;
+    uint32_t fdBaseTaskNum;
+    uint32_t fdCombineTaskNum;
+    uint32_t fdPartialTaskNum;
+    uint32_t fdPartialCapacity;
+    uint32_t fdRowCapacity;
+    uint32_t fdLseSubStride;
+    uint32_t fdCombineBlockDim;
+    uint32_t fdReserved;
+    uint64_t fdPartialLseOffset;
+    uint64_t fdPartialOOffset;
+    uint64_t fdWorkspaceEnd;
+    FdDecodeSchedule fdDecodeSchedules[MAX_FD_ACTIVE_CORE_NUM];
+    FdCombineSchedule fdCombineSchedules[MAX_FD_COMBINE_TASK_NUM];
 
     int64_t qSeqlenAligned;
     int64_t kvSeqlenAligned;
@@ -117,6 +155,9 @@ struct FAInferTilingData {
     uint64_t get_splitOTotalSize() const { return splitOTotalSize; }
     uint32_t get_totalSplitNodeNum() const { return totalSplitNodeNum; }
     uint32_t get_needCoreNum() const { return needCoreNum; }
+    uint32_t get_flashDecodeFlag() const { return flashDecodeFlag; }
+    uint32_t get_fdActiveCoreNum() const { return fdActiveCoreNum; }
+    uint32_t get_fdCombineBlockDim() const { return fdCombineBlockDim; }
 
     // Setter functions
     void set_numHeads(uint32_t value) { numHeads = value; }
@@ -144,12 +185,14 @@ struct FAInferTilingData {
     void set_sparseMode(int32_t value) { sparseMode = value; }
     void set_globalWindowSize(uint32_t value) { globalWindowSize = value; }
     void set_localWindowSize(uint32_t value) { localWindowSize = value; }
+    void set_cacheLayout(uint32_t value) { cacheLayout = value; }
     void set_preToken(int64_t value) { preToken = value; }
     void set_nextToken(int64_t value) { nextToken = value; }
     void set_splitLseTotalSize(uint64_t value) { splitLseTotalSize = value; }
     void set_splitOTotalSize(uint64_t value) { splitOTotalSize = value; }
     void set_totalSplitNodeNum(uint32_t value) { totalSplitNodeNum = value; }
     void set_needCoreNum(uint32_t value) { needCoreNum = value; }
+    void set_flashDecodeFlag(uint32_t value) { flashDecodeFlag = value; }
 
     int64_t get_qSeqlenAligned() const { return qSeqlenAligned; }
     void set_qSeqlenAligned(int64_t value) { qSeqlenAligned = value;}
