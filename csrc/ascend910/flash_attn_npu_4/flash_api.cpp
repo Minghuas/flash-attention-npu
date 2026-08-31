@@ -10,6 +10,7 @@
 // the fa_split host helper, and FAG tiling (fag_tiling.cpp) for mha_bwd.
 #include "tilingdata.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "torch_npu/csrc/framework/OpCommand.h"
 #include "acl/acl.h"
 #include "runtime/rt_ffts.h"
 // kernel_operator.h (AscendC) defines GM_ADDR; catlass/catlass.hpp defines the
@@ -382,6 +383,17 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     }
     if (is_varlen_kv) {
         seqlenk_gpu_tensor = cu_seqlens_k;
+    } else if (!paged_KV && is_varlen_q) {
+        at::Tensor sk_cpu = seqlens_k.to(at::Device(at::kCPU));
+        const int32_t* sk = static_cast<const int32_t *>(sk_cpu.data_ptr());
+        at::Tensor cu_cpu = at::zeros({batch_size + 1}, at::device(c10::kCPU).dtype(at::kInt));
+        int32_t* cu = static_cast<int32_t *>(cu_cpu.data_ptr());
+        int32_t acc = 0;
+        for (int32_t i = 0; i < batch_size; i++) {
+            acc += sk[i];
+            cu[i + 1] = acc;
+        }
+        seqlenk_gpu_tensor = cu_cpu.to(at::Device(at::kPrivateUse1));
     } else {
         seqlenk_gpu_tensor = seqlens_k;
     }
@@ -425,11 +437,15 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     fwd_args.kvSeqDevice = kvSeqDevice;
     fwd_args.workspaceDevice = workspaceDevice;
     fwd_args.tilingDevice = tilingDevice;
-    if (is_varlen_q) {
-        launch_fwd<true>(fwd_args);
-    } else {
-        launch_fwd<false>(fwd_args);
-    }
+    auto launch_fa_infer = [fwd_args, is_varlen_q, seqlenk_gpu_tensor]() -> int {
+        if (is_varlen_q) {
+            launch_fwd<true>(fwd_args);
+        } else {
+            launch_fwd<false>(fwd_args);
+        }
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
     return {out, softmaxlse};
 }
 

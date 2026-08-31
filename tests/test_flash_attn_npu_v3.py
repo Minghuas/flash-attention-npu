@@ -131,6 +131,27 @@ test_cases = [
     # Additional negative-side windows: (508,-256) and (-128,864)
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, "BSND", False, 508, -256, 0.0, 0, False),
     (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, "BSND", False, -128, 864, 0.0, 0, False),
+    # SWA Sq>>Sk (empty-prefix / neg-empty / overlong-wR). 
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 0, 128, False, "TND", False, 8, -1, 0.0, 0, False),
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 0, 128, False, "BSND", False, 8, -1, 0.0, 0, False),
+    (torch.bfloat16, 1, 8, 8, 64, 1, 64, 0, 128, False, "TND", False, 0, -1, 0.0, 0, False),
+    (torch.bfloat16, 1, 8, 8, 64, 1, 64, 0, 128, False, "BSND", False, 0, -1, 0.0, 0, False),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 0, 128, False, "TND", False, 23, -1, 0.0, 0, False),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 0, 128, False, "BSND", False, 23, -1, 0.0, 0, False),
+    # 2) negative right window with empty prefix (EndLen<=0)
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 0, 128, False, "TND", False, 3, -3, 0.0, 0, False),
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 0, 128, False, "BSND", False, 3, -3, 0.0, 0, False),
+    # 3) overlong wR (>=Sk collapses to infinite, then to Sk)
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 0, 128, False, "TND", False, 0, 2, 0.0, 0, False),
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 0, 128, False, "BSND", False, 0, 2, 0.0, 0, False),
+    # 4) GQA + medium Sq>>Sk
+    (torch.float16, 2, 16, 4, 256, 8, 32, 0, 128, False, "TND", False, 4, -1, 0.0, 0, False),
+    (torch.bfloat16, 2, 16, 4, 256, 8, 32, 0, 128, False, "BSND", False, 4, -1, 0.0, 0, False),
+    # 5) paged Sq>>Sk SWA (TND equal-len)
+    (torch.bfloat16, 2, 8, 2, 128, 4, 64, 1, 128, False, "TND", False, 2, -1, 0.0, 0, False),
+    # 6) Sk>>Sq left-infinite band (complement; no empty prefix)
+    (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "TND", False, -1, 100, 0.0, 0, False),
+    (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "BSND", False, -1, 100, 0.0, 0, False),
     # AppendKV
     (torch.bfloat16, 1, 32, 4, 1, 2048, 128, 1, 128, False, "BSND", False, -1, -1, 0.0, 0, True),
     (torch.bfloat16, 2, 16, 2, 1, 4096, 128, 1, 128, True, "BSND", False, -1, -1, 0.0, 0, True),

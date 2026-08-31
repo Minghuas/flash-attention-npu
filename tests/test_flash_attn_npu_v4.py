@@ -300,6 +300,24 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 1024, 1024, 128, 1, 128, True, "TND", True, 512, 0, 0),
     (torch.bfloat16, 2, 6, 6, 512, 512, 128, 1, 128, False, "BSND", False, 508, -256, 0),
     (torch.float16, 2, 6, 6, 512, 512, 128, 1, 128, True, "BSND", False, -128, 864, 0),
+    # SWA Sq>>Sk (empty-prefix / neg-empty / overlong-wR).
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 0, 128, False, "BSND", False, 8, -1, 0),
+    (torch.bfloat16, 4, 1, 1, 512, 32, 16, 1, 128, False, "TND", False, 8, -1, 0),
+    (torch.bfloat16, 1, 8, 8, 64, 1, 64, 0, 128, False, "BSND", False, 0, -1, 0),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 0, 128, False, "BSND", False, 23, -1, 0),
+    (torch.float16, 2, 8, 8, 255, 64, 128, 1, 128, False, "TND", False, 23, -1, 0),
+    # 2) negative right window with empty prefix (EndLen<=0)
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 0, 128, False, "BSND", False, 3, -3, 0),
+    (torch.bfloat16, 1, 8, 4, 512, 7, 16, 1, 128, False, "TND", False, 3, -3, 0),
+    # 3) overlong wR (>=Sk collapses to infinite, then to Sk)
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 0, 128, False, "BSND", False, 0, 2, 0),
+    (torch.bfloat16, 2, 4, 2, 1024, 1, 16, 1, 128, False, "TND", False, 0, 2, 0),
+    # 4) GQA + medium Sq>>Sk
+    (torch.bfloat16, 2, 16, 4, 256, 8, 32, 0, 128, False, "BSND", False, 4, -1, 0),
+    (torch.float16, 2, 16, 4, 256, 8, 32, 1, 128, False, "TND", False, 4, -1, 0),
+    # 5) Sk>>Sq left-infinite band (complement; no empty prefix)
+    (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 0, 128, False, "BSND", False, -1, 100, 0),
+    (torch.bfloat16, 1, 4, 4, 7, 2048, 64, 1, 128, False, "TND", False, -1, 100, 0),
 ]
 @pytest.mark.parametrize("data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits", test_cases)
 def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv_seqlen, head_size, cache_mode, block_size, is_causal, layout, is_varied, window_size_left, window_size_right, num_splits):
@@ -403,9 +421,7 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     bwd_supported = layout == "TND" and cache_mode == 0 and num_splits <= 1 and "Ascend950" not in name
     cu_seqlens_k_for_api = new_kv_seqlen_list if bwd_supported else None
     max_seqlen_k_for_api = kv_seqlen if bwd_supported else None
-    cache_seqlens_for_api = None if bwd_supported else (
-        new_kv_seqlen_list if (layout == "TND" and cache_mode == 0) else kv_seqlen_list
-    )
+    cache_seqlens_for_api = None if bwd_supported else kv_seqlen_list
     out_out, softmax_lse, *rest = flash_attn_varlen_func(
         query,
         key_cache,
