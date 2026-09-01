@@ -589,6 +589,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             )
             seqused_k = maybe_contiguous(seqused_k)
 
+        fwd_max_seqlen_k = max_seqlen_k
         if scheduler_metadata is None and not disable_scheduler_metadata and cu_seqlens_q is not None:
             batch_size = cu_seqlens_q.shape[0] - 1
             num_heads = q.shape[1]
@@ -601,10 +602,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             metadata_max_seqlen_k = max_seqlen_k
             if metadata_max_seqlen_k is None and page_table is not None and k.dim() == 4:
-                # Paged KV: KV length is bounded by the page-table capacity
-                # (max_num_blocks_per_seq * page_block_size), matching the
-                # kvSeqlenBound used by mha_fwd when consuming metadata.
-                metadata_max_seqlen_k = page_table.shape[-1] * k.shape[1]
+                # Paged KV: normalize the SWA window against the actual max KV
+                # seqlen (not the page capacity), matching the host tiling /
+                # golden rule "both sides vs actual seqlen_k". Otherwise a
+                # finite window smaller than the page capacity but larger than
+                # the actual seqlen fails to collapse and yields a wrong mask.
+                metadata_max_seqlen_k = int(cache_seqlens.max().item())
+                fwd_max_seqlen_k = metadata_max_seqlen_k
             scheduler_metadata = get_scheduler_metadata(
                 batch_size,
                 max_seqlen_q,
@@ -637,7 +641,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q,
             seqused_k,
             max_seqlen_q,
-            max_seqlen_k,
+            fwd_max_seqlen_k,
             min_seqlen_k,
             page_table,
             gather_kv_indices,

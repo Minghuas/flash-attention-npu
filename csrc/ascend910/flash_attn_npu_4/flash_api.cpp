@@ -315,7 +315,13 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         if (is_varlen_kv) {
             kvSeqlenBound = max_seqlen_k_.has_value() ? max_seqlen_k_.value() : 0;
         } else if (paged_KV) {
-            kvSeqlenBound = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
+            // Prefer the actual max KV seqlen supplied by the metadata producer
+            // (get_scheduler_metadata collapses the window against it); fall back
+            // to the page capacity only when it is unavailable. This must match
+            // the bound used when the metadata was generated, otherwise the
+            // hasMask / buffer-layout check below would disagree.
+            kvSeqlenBound = max_seqlen_k_.has_value() ? max_seqlen_k_.value()
+                : static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
         } else {
             kvSeqlenBound = k.size(1);
         }
