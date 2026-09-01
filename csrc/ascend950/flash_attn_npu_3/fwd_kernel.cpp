@@ -385,12 +385,16 @@ public:
                     leftPoint_R = kvSeqlenI - qSeqlenI + wR;
                     windowSizeRightStartLen = qSTileStart + leftPoint_R;
                     windowSizeRightEndLen = qSTileStart + qSTileLen + leftPoint_R;
-                    int32_t noSkipI = AscendC::Std::min(
-                        kvSeqlenI, RoundUp(windowSizeRightEndLen, T));
-                    noSkipI = (noSkipI <= 0) ? kvSeqlenI : noSkipI;
-                    noSkipKvS = static_cast<uint32_t>(noSkipI);
-                    kvSLoopNumI = static_cast<int32_t>(CeilDiv(noSkipI, T));
-                    notNextMask = false;
+                    if (windowSizeRightEndLen <= 0) {
+                        noSkipKvS = 0;
+                        kvSLoopNumI = 0;
+                    } else {
+                        int32_t noSkipI = AscendC::Std::min(
+                            kvSeqlenI, RoundUp(windowSizeRightEndLen, T));
+                        noSkipKvS = static_cast<uint32_t>(noSkipI);
+                        kvSLoopNumI = static_cast<int32_t>(CeilDiv(noSkipI, T));
+                        notNextMask = false;
+                    }
                 } else {
                     noSkipKvS = static_cast<uint32_t>(kvSeqlenI);
                     kvSLoopNumI = static_cast<int32_t>(CeilDiv(kvSeqlenI, T));
@@ -408,7 +412,10 @@ public:
                 kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
             }
 
-            uint32_t fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
+            uint32_t fullyMaskedRowsPerHead = 0;
+            if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
+                fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
+            }
 
             bool emptySpan = (kvSLoopNum == 0);
             if constexpr (maskCategory == MaskCategory::MASK_SWA) {

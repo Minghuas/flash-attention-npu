@@ -204,6 +204,29 @@ public:
                               uint32_t colStride, uint32_t fullyMaskedRowsPerHead)
     {
         auto gO = gOTensor.data();
+        // zero fully-masked Q rows in UB (causal Sq>Sk).
+        if (fullyMaskedRowsPerHead != 0U) {
+            uint32_t groupRow = rowStart;
+            uint32_t ubRowOffset = 0U;
+            uint32_t remainingRows = rowCount;
+            while (remainingRows > 0U) {
+                uint32_t localS = groupRow % qSBlockSize;
+                uint32_t rowsThisHead = qSBlockSize - localS;
+                rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
+                if (fullyMaskedRowsPerHead > localS) {
+                    uint32_t maskedRows = fullyMaskedRowsPerHead - localS;
+                    maskedRows = maskedRows < rowsThisHead ? maskedRows : rowsThisHead;
+                    AscendC::Duplicate(goUbTensor16[ubRowOffset * colStride],
+                        static_cast<ElementO>(0), maskedRows * colStride);
+                }
+                groupRow += rowsThisHead;
+                ubRowOffset += rowsThisHead;
+                remainingRows -= rowsThisHead;
+            }
+            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        }
+        // scatter O rows to per-head GM addresses.
         uint32_t groupRow = rowStart;
         uint32_t ubRowOffset = 0U;
         uint32_t remainingRows = rowCount;
@@ -212,12 +235,6 @@ public:
             uint32_t localS = groupRow % qSBlockSize;
             uint32_t rowsThisHead = qSBlockSize - localS;
             rowsThisHead = rowsThisHead < remainingRows ? rowsThisHead : remainingRows;
-            if (fullyMaskedRowsPerHead > localS) {
-                uint32_t maskedRows = fullyMaskedRowsPerHead - localS;
-                maskedRows = maskedRows < rowsThisHead ? maskedRows : rowsThisHead;
-                AscendC::Duplicate(goUbTensor16[ubRowOffset * colStride],
-                    static_cast<ElementO>(0), maskedRows * colStride);
-            }
             AscendC::DataCopyPad(
                 gO[head * embedV + localS * outputStride],
                 goUbTensor16[ubRowOffset * colStride],
