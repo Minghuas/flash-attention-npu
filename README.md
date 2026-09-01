@@ -14,7 +14,7 @@ FlashAttention significantly improves training and inference efficiency for mode
 
 ### Prerequisites
 
-- Hardware: Ascend 910B / 910C NPU
+- Hardware: Ascend 910B / 910C / 950 NPU
 - OS: Linux
 - Software:
   - CANN >= 8.5.0
@@ -24,22 +24,31 @@ FlashAttention significantly improves training and inference efficiency for mode
 ```bash
 pip install packaging psutil
 ```
-
-### Installation 
-
-1. Set environment variables:
+- CANN environment variables
 ```bash
-source /usr/local/Ascend/cann/set_env.sh
+source [PATH_TO_ASCEND_HOME]/cann/set_env.sh
+# e.g.:
+# source /usr/local/Ascend/cann/set_env.sh
 ```
 
-2. Clone the repository:
+### Installation
+
+#### Quick Install
+
+```bash
+pip install flash-attn-npu --no-build-isolation
+```
+
+#### Build from Source
+
+1. Clone the repository:
 ```bash
 git clone https://github.com/MinghuasLab/flash-attention-npu.git
 cd flash-attention-npu
 git submodule update --init --recursive
 ```
 
-3. Build and install:
+2. Build and install:
 
 ```bash
 python setup.py install
@@ -58,16 +67,29 @@ FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
 FLASH_ATTN_BUILD_VERSION=v4 python setup.py install
 ```
 
+  Build for specific NPU:
+
+```bash
+# Build 910 only
+FLASH_ATTN_BUILD_NPU=910 python setup.py install
+
+# Build 950 only
+FLASH_ATTN_BUILD_NPU=950 python setup.py install
+```
+
 ## Testing
 
 Run test scripts:
 
 ```bash
 # Test FlashAttention v2
-pytest -q -s tests/test_flash_attn_npu.py
+pytest -q -s tests/test_flash_attn_npu_2.py
 
 # Test FlashAttention v3
 pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# Test FlashAttention v4
+pytest -q -s tests/test_flash_attn_npu_v4.py
 ```
 
 ## Memory Checking with msSanitizer
@@ -759,8 +781,8 @@ def flash_attn_varlen_func(
 | MQA/GQA | ✅ | ✅ |
 | Paged KV Cache | ✅ | ✅ |
 | Rotary Positional Embedding (RoPE) | - | - |
-| ALiBi | - | - |
-| Softcapping | - | - |
+| ALiBi | ✅ | - |
+| Softcapping | ✅ | ✅ |
 | FP8 Quantization | - | - |
 | Variable-length Sequences | ✅ | ✅ |
 
@@ -773,10 +795,10 @@ def flash_attn_varlen_func(
 | Sliding Window Attention | ✅ | ✅ |
 | MQA/GQA | ✅ | ✅ |
 | Backward Pass | ✅ | ✅ |
-| ALiBi | - | - |
-| Softcapping | - | - |
+| ALiBi | ✅ | - |
+| Softcapping | ✅ | ✅ |
 | FP8 Quantization | - | - |
-| Dropout | - | - |
+| Dropout | ✅ | - |
 
 #### flash_attn_varlen_func
 | Feature | v2 | v3 | v4 |
@@ -788,11 +810,11 @@ def flash_attn_varlen_func(
 | MQA/GQA | ✅ | ✅ | ✅ |
 | Backward Pass | ✅ | ✅ | ✅ |
 | Variable-length Sequences | ✅ | ✅ | ✅ |
-| Paged KV Cache | - | - | ✅ |
-| ALiBi | - | - | - |
-| Softcapping | - | - | - |
+| Paged KV Cache | ✅ | ✅ | ✅ |
+| ALiBi | ✅ | - | - |
+| Softcapping | ✅ | ✅ | ✅ |
 | FP8 Quantization | - | - | - |
-| Dropout | - | - | - |
+| Dropout | ✅ | - | - |
 
 
 ## License

@@ -14,9 +14,9 @@ FlashAttention 通过分块计算和内存感知算法提升训练和推理效�
 
 ### 环境要求
 
-- 硬件: 昇腾 910B / 910C NPU
+- 硬件: 昇腾 910B / 910C / 950 NPU
 - 系统: Linux
-- 软件: 
+- 软件:
   - CANN >= 8.5.0
   - PyTorch >= 2.1.0
   - torch_npu >= 2.1.0 (与Pytorch版本相同)
@@ -24,21 +24,31 @@ FlashAttention 通过分块计算和内存感知算法提升训练和推理效�
 ```bash
 pip install packaging psutil
 ```
+- 设置 CANN 环境变量
+```bash
+source [PATH_TO_ASCEND_HOME]/cann/set_env.sh
+# 例如:
+# source /usr/local/Ascend/cann/set_env.sh
+```
 
 ### 安装步骤
 
-1. 设置环境变量：
+#### 快速安装
+
 ```bash
-source /usr/local/Ascend/cann/set_env.sh
+pip install flash-attn-npu --no-build-isolation
 ```
-2. 拉取源码：
+
+#### 从源码编译
+
+1. 拉取源码：
 ```bash
 git clone https://github.com/MinghuasLab/flash-attention-npu.git
 cd flash-attention-npu
 git submodule update --init --recursive
 ```
 
-3. 编译安装：
+2. 编译安装：
 
 ```bash
 python setup.py install
@@ -57,13 +67,23 @@ FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
 FLASH_ATTN_BUILD_VERSION=v4 python setup.py install
 ```
 
+  编译面向特定NPU的版本：
+
+```bash
+# 仅编译 910 版本
+FLASH_ATTN_BUILD_NPU=910 python setup.py install
+
+# 仅编译 950 版本
+FLASH_ATTN_BUILD_NPU=950 python setup.py install
+```
+
 ## 测试
 
 运行测试脚本：
 
 ```bash
 # 测试 FlashAttention v2
-pytest -q -s tests/test_flash_attn_npu.py
+pytest -q -s tests/test_flash_attn_npu_2.py
 
 # 测试 FlashAttention v3
 pytest -q -s tests/test_flash_attn_npu_v3.py
@@ -709,51 +729,52 @@ def flash_attn_varlen_func(
 ## 特性
 
 #### flash_attn_with_kvcache
-| 特性 | v2 | v3 |
-|------|----|----|
-| FP16 (float16) | ✅ | ✅ |
-| BF16 (bfloat16) | ✅ | ✅ |
+
+| 特性                | v2 | v3 |
+| ------------------- | -- | -- |
+| FP16 (float16)      | ✅ | ✅ |
+| BF16 (bfloat16)     | ✅ | ✅ |
 | 因果注意力 (Causal) | ✅ | ✅ |
-| 滑动窗口注意力 | ✅ | ✅ |
-| MQA/GQA | ✅ | ✅ |
-| 分页 KV 缓存 | ✅ | ✅ |
-| 旋转位置编码 (RoPE) | - | - |
-| ALiBi | - | - |
-| Softcapping | - | - |
-| FP8 量化 | - | - |
-| 变长序列 | ✅ | ✅ |
+| 滑动窗口注意力      | ✅ | ✅ |
+| MQA/GQA             | ✅ | ✅ |
+| 分页 KV 缓存        | ✅ | ✅ |
+| 旋转位置编码 (RoPE) | -  | -  |
+| ALiBi               | ✅  | -  |
+| Softcapping         | ✅ | ✅ |
+| FP8 量化            | -  | -  |
+| 变长序列            | ✅ | ✅ |
 
 #### flash_attn_func
-| 特性 | v2 | v3 |
-|------|----|----|
-| FP16 (float16) | ✅ | ✅ |
-| BF16 (bfloat16) | ✅ | ✅ |
+
+| 特性                | v2 | v3 |
+| ------------------- | -- | -- |
+| FP16 (float16)      | ✅ | ✅ |
+| BF16 (bfloat16)     | ✅ | ✅ |
 | 因果注意力 (Causal) | ✅ | ✅ |
-| 滑动窗口注意力 | ✅ | ✅ |
-| MQA/GQA | ✅ | ✅ |
-| 反向传播 | ✅ | ✅ |
-| ALiBi | - | - |
-| Softcapping | - | - |
-| FP8 量化 | - | - |
-| Dropout | - | - |
+| 滑动窗口注意力      | ✅ | ✅ |
+| MQA/GQA             | ✅ | ✅ |
+| 反向传播            | ✅ | ✅ |
+| ALiBi               | ✅  | -  |
+| Softcapping         | ✅ | ✅ |
+| FP8 量化            | -  | -  |
+| Dropout             | ✅ | -  |
 
 #### flash_attn_varlen_func
-| 特性 | v2 | v3 | v4 |
-|------|----|----|----|
-| FP16 (float16) | ✅ | ✅ | ✅ |
-| BF16 (bfloat16) | ✅ | ✅ | ✅ |
+
+| 特性                | v2 | v3 | v4 |
+| ------------------- | -- | -- | -- |
+| FP16 (float16)      | ✅ | ✅ | ✅ |
+| BF16 (bfloat16)     | ✅ | ✅ | ✅ |
 | 因果注意力 (Causal) | ✅ | ✅ | ✅ |
-| 滑动窗口注意力 | ✅ | ✅ | ✅ |
-| MQA/GQA | ✅ | ✅ | ✅ |
-| 反向传播 | ✅ | ✅ | ✅ |
-| 变长序列 | ✅ | ✅ | ✅ |
-| 分页 KV 缓存 | - | - | ✅ |
-| ALiBi | - | - | - |
-| Softcapping | - | - | - |
-| FP8 量化 | - | - | - |
-| Dropout | - | - | - |
-
-
+| 滑动窗口注意力      | ✅ | ✅ | ✅ |
+| MQA/GQA             | ✅ | ✅ | ✅ |
+| 反向传播            | ✅ | ✅ | ✅ |
+| 变长序列            | ✅ | ✅ | ✅ |
+| 分页 KV 缓存        | ✅ | ✅  | ✅ |
+| ALiBi               | ✅  | -  | -  |
+| Softcapping         | ✅ | ✅ | ✅ |
+| FP8 量化            | -  | -  | -  |
+| Dropout             | ✅ | -  | -  |
 
 ## 许可证
 
