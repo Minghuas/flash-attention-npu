@@ -3,7 +3,8 @@
 import torch
 
 from tests.common.attention_ref import cached_ref_flash_attention_pair
-from tests.common.golden_cache import get_or_compute_golden
+from tests.common.compare import assert_fa_close
+from tests.common.golden_cache import get_or_compute_golden, register_retry
 
 
 def test_golden_cache_is_disabled_by_default(tmp_path, monkeypatch):
@@ -51,6 +52,30 @@ def test_golden_cache_miss_hit_and_refresh(tmp_path, monkeypatch):
 
     monkeypatch.setenv("GOLDEN_CACHE_REFRESH", "1")
     assert get_or_compute_golden(**kwargs)["out"].item() == 2
+    assert calls["count"] == 2
+
+
+def test_cached_mismatch_recomputes_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOLDEN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GOLDEN_CACHE_MODE", "cache")
+    calls = {"count": 0}
+
+    def compute():
+        calls["count"] += 1
+        return {"out": torch.tensor([2.0 if calls["count"] > 1 else 1.0])}
+
+    kwargs = dict(
+        nodeid="tests/example.py::test_retry",
+        metadata={"seed": 0}, inputs={"q": torch.ones(1)},
+        compute_fn=compute, expected_keys=("out",),
+    )
+    get_or_compute_golden(**kwargs)
+    values, status = get_or_compute_golden(**kwargs, return_status=True)
+    assert status == "hit"
+    register_retry(values, lambda: get_or_compute_golden(**kwargs, force_refresh=True))
+    assert_fa_close(torch.tensor([2.0]), values["out"], values["out"], name="out")
+    assert calls["count"] == 2
+    assert not __import__("tests.common.golden_cache", fromlist=["retry_cached_value"]).retry_cached_value(values["out"])
     assert calls["count"] == 2
 
 

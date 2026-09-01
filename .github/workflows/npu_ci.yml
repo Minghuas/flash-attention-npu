@@ -1,12 +1,12 @@
 name: NPU CI
 
-# 手动 NPU CI。PR 新建/push 不会自动跑, 由仓库 Admin 通过:
+# 手动 NPU CI。PR 新建/push 不会自动跑, 可通过以下 GitHub 入口触发:
 #   1. Actions 页面 Run workflow (workflow_dispatch, 可选 workers)
-#   2. PR 评论 /run-npu-ci [quick|full] [workers=<n>] [arch=910|950|both]
-#      例如: /run-npu-ci quick workers=2 arch=910
+#   2. PR 评论 /run-npu-ci [workers=<n>] [arch=910|950|both]
+#      例如: /run-npu-ci workers=2 arch=910
 #      不带 workers= 则默认 2
 #      不带 arch= 则默认 both (950 和 910B 都跑)
-# quick 任何人可触发; full 仅仓库 Admin。
+# GitHub 上所有触发均强制执行 full；原 quick 用户也可触发。
 #
 # 状态检查名: NPU CI / 手动验证
 # runner 标签: self-hosted, linux, arm64, npu, flash-attention-npu
@@ -22,7 +22,7 @@ on:
         description: "CI 模式"
         required: true
         type: choice
-        default: quick
+        default: full
         options:
           - quick
           - full
@@ -97,17 +97,12 @@ jobs:
           fi
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
 
-          # 解析 ci_mode (评论: /run-npu-ci [quick|full])
-          if [ "$EVENT_NAME" = "issue_comment" ]; then
-            ci_mode="quick"
-            if echo "$COMMENT_BODY" | grep -Eq '/run-npu-ci[[:space:]]+full'; then ci_mode="full"; fi
-            if echo "$COMMENT_BODY" | grep -Eq '/run-npu-ci[[:space:]]+quick'; then ci_mode="quick"; fi
-          else
-            ci_mode="$CI_MODE_INPUT"
-          fi
+          # GitHub 触发统一执行 full；保留旧参数仅为兼容已有调用。
+          ci_mode="full"
+          echo "GitHub trigger forces CI_MODE=full (requested=${CI_MODE_INPUT:-comment})"
           echo "ci_mode=$ci_mode" >> "$GITHUB_OUTPUT"
 
-          # 解析 workers 和 arch (评论: /run-npu-ci quick workers=2 arch=910)
+          # 解析 workers 和 arch (评论: /run-npu-ci workers=2 arch=910)
           # workflow_dispatch 从 inputs 取, issue_comment 从评论 body 解析
           if [ "$EVENT_NAME" = "issue_comment" ]; then
             workers="$(echo "$COMMENT_BODY" | grep -oE 'workers=[0-9]+' | head -1 | cut -d= -f2- || true)"
@@ -142,11 +137,7 @@ jobs:
           perm="$(gh api "repos/$repo/collaborators/$actor/permission" --jq '.permission' 2>/dev/null || echo none)"
           ci_mode="${{ steps.resolve.outputs.ci_mode }}"
           echo "actor=$actor permission=$perm ci_mode=$ci_mode"
-          # quick: 任何人可触发; full: 仅 Admin (full 跑全量含 bwd, 资源消耗大)
-          if [ "$ci_mode" = "full" ] && [ "$perm" != "admin" ]; then
-            echo "::error::Only repo admins can trigger /run-npu-ci full ($actor has '$perm'). quick 任何人可触发。"
-            exit 1
-          fi
+          echo "GitHub trigger authorized for full CI ($actor has '$perm')"
 
       - name: Check existing NPU CI status for this commit
         id: check
