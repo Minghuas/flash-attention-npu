@@ -404,7 +404,19 @@ def flash_attn_with_kvcache(
         )
         cache_seqlens = _maybe_contiguous(cache_seqlens)
 
-    if scheduler_metadata is None:
+    # FlashDecode schedules depend on the runtime KV lengths and are produced
+    # by the host tiler.  Keep the upstream metadata path for normal FA, but
+    # do not pre-build metadata for explicit FD or for the narrow auto-FD
+    # candidate shape.
+    auto_fd_candidate = (
+        num_splits == 0
+        and page_table is not None
+        and cu_seqlens_q is not None
+        and max_seqlen_q is not None
+        and max_seqlen_q <= 16
+    )
+    use_host_tiling = num_splits > 1 or auto_fd_candidate
+    if scheduler_metadata is None and not use_host_tiling:
         if cu_seqlens_q is not None:
             if max_seqlen_q is None:
                 raise ValueError(

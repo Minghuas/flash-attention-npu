@@ -7,6 +7,7 @@
 #include "fa_metadata_args.h"
 #include "tilingdata.h"
 #include <cstdint>
+#include <cstring>
 
 namespace {
 constexpr uint32_t Q_TILE_CEIL = 128;
@@ -54,6 +55,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
     const bool hasMask = metaArgs->maskType != 0;
     FAInferTilingData *tilingData = reinterpret_cast<FAInferTilingData *>(
         metaArgs->metaOutAddr + fa_metadata::TilingOffset(hasMask));
+    // metaOutAddr points to raw device memory, so C++ member initializers are
+    // not executed. Clear the complete structure to keep newly added fields
+    // (including Flash Decoding flags and schedules) disabled by default.
+    std::memset(tilingData, 0, sizeof(FAInferTilingData));
     const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 

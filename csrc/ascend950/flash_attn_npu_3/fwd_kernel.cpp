@@ -106,6 +106,12 @@ public:
         gO.SetGlobalBuffer((__gm__ ElementO *)params.o);
         AscendC::GlobalTensor<float> gLse;
         gLse.SetGlobalBuffer((__gm__ float *)params.lse);
+        AscendC::GlobalTensor<float> gPartialLse;
+        gPartialLse.SetGlobalBuffer((__gm__ float *)(
+            params.workSpace + faiTilingData->fdPartialLseOffset));
+        AscendC::GlobalTensor<ElementO> gPartialO;
+        gPartialO.SetGlobalBuffer((__gm__ ElementO *)(
+            params.workSpace + faiTilingData->fdPartialOOffset));
         AscendC::GlobalTensor<ElementMask> gMask;
         gMask.SetGlobalBuffer((__gm__ ElementMask *)params.mask);
         //tiling data
@@ -143,6 +149,10 @@ public:
         pL1BufNum_ = faiTilingData->pL1BufNum;
         windowSizeLeft_ = faiTilingData->windowSizeLeft;
         windowSizeRight_ = faiTilingData->windowSizeRight;
+        flashDecodeFlag_ = faiTilingData->flashDecodeFlag;
+        fdCombineTaskNum_ = faiTilingData->fdCombineTaskNum;
+        fdRowCapacity_ = faiTilingData->fdRowCapacity;
+        fdLseSubStride_ = faiTilingData->fdLseSubStride;
 
         AscendC::LocalTensor<ElementP> l1PTensor[MAX_CROSS_CORE_BUF_STAGES];
         AscendC::LocalTensor<ElementS> ubSTensor[UB_S_BUF_STAGES];
@@ -253,7 +263,26 @@ public:
         if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
             kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
         }
-        for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum_; taskIdx += coreNum) {
+        uint32_t taskBegin = coreIdx;
+        uint32_t taskEnd = totalTaskNum_;
+        uint32_t taskStep = coreNum;
+        int32_t fdBaseTaskStart = -1;
+        int32_t fdBaseTaskEnd = -1;
+        int32_t fdFirstKvTileStart = -1;
+        int32_t fdLastKvTileEnd = -1;
+        if (flashDecodeFlag_ != 0U) {
+            fdBaseTaskStart = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskStart;
+            fdBaseTaskEnd = faiTilingData->fdDecodeSchedules[coreIdx].baseTaskEnd;
+            fdFirstKvTileStart = faiTilingData->fdDecodeSchedules[coreIdx].firstKvTileStart;
+            fdLastKvTileEnd = faiTilingData->fdDecodeSchedules[coreIdx].lastKvTileEnd;
+            taskBegin = static_cast<uint32_t>(fdBaseTaskStart);
+            taskEnd = static_cast<uint32_t>(fdBaseTaskEnd);
+            taskStep = 1U;
+        }
+        uint32_t pipelineTileBase = 0U;
+        uint64_t pipelineL0AStageBase = 0U;
+        uint64_t pipelineL0BStageBase = 0U;
+        for (uint32_t taskIdx = taskBegin; taskIdx < taskEnd; taskIdx += taskStep) {
             while (taskIdx >= curTotalTaskNum) {
                 ++curBatch;
                 preTotalTaskNum = curTotalTaskNum;
@@ -274,23 +303,29 @@ public:
                 if constexpr (kvFormat == Format::TND && kvcacheType == CacheMode::normalCache) {
                     kvSeqlen = static_cast<int64_t>(gActualKvseqlen.GetValue(curBatch + 1) - gActualKvseqlen.GetValue(curBatch));
                 }
-                uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize,
-                    embedV_ > 128U);
+                uint32_t curQNBlockTile = GetQNBlockTile(
+                    static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
                 uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
                 uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
-                curTotalTaskNum += (qSeqlen + qBaseTile_ - 1) / qBaseTile_ * qNTaskNum;
+                curTotalTaskNum +=
+                    (qSeqlen + qBaseTile_ - 1) / qBaseTile_ * qNTaskNum;
             }
             uint32_t taskIdxCurBatch = taskIdx - preTotalTaskNum;
-            uint32_t curQNBlockTile = GetQNBlockTile(static_cast<uint32_t>(qSeqlen), groupSize,
-                embedV_ > 128U);
+            uint32_t qSTileIdx;
+            uint32_t kvHeadIdx;
+            uint32_t qNStartIdx;
+            uint32_t qNBlockSize;
+            uint32_t curQNBlockTile = GetQNBlockTile(
+                static_cast<uint32_t>(qSeqlen), groupSize, embedV_ > 128U);
             uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
             uint32_t qNTaskNum = qNBlockNumPerGroup * kvHeads_;
-            uint32_t qSTileIdx = taskIdxCurBatch / qNTaskNum;
+            qSTileIdx = taskIdxCurBatch / qNTaskNum;
             uint32_t qNBlockIdx = taskIdxCurBatch - qSTileIdx * qNTaskNum;
             uint32_t qNBlockIdxInGroup = qNBlockIdx % qNBlockNumPerGroup;
-            uint32_t kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
-            uint32_t qNStartIdx = kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
-            uint32_t qNBlockSize = AscendC::Std::min(
+            kvHeadIdx = qNBlockIdx / qNBlockNumPerGroup;
+            qNStartIdx =
+                kvHeadIdx * groupSize + qNBlockIdxInGroup * curQNBlockTile;
+            qNBlockSize = AscendC::Std::min(
                 curQNBlockTile, groupSize - qNBlockIdxInGroup * curQNBlockTile);
             int64_t gmOffsetQ = 0;
             int64_t gmOffsetK = 0;
@@ -434,8 +469,36 @@ public:
 #endif
                 continue;
             }
-
-            const uint32_t kvSLoopCount = kvSLoopNum - kvStart;
+            uint32_t kvSplitStart = kvStart;
+            uint32_t kvSplitEnd = kvSLoopNum;
+            bool writePartial = false;
+            uint32_t partialId = 0U;
+            if (flashDecodeFlag_ != 0U) {
+                if (taskIdx == static_cast<uint32_t>(fdBaseTaskStart)) {
+                    kvSplitStart = static_cast<uint32_t>(fdFirstKvTileStart);
+                }
+                if (taskIdx + 1U == static_cast<uint32_t>(fdBaseTaskEnd)) {
+                    kvSplitEnd = static_cast<uint32_t>(fdLastKvTileEnd);
+                }
+                kvSplitEnd = AscendC::Std::min(kvSplitEnd, kvSLoopNum);
+                kvSplitStart = AscendC::Std::min(kvSplitStart, kvSplitEnd);
+                for (uint32_t combineIdx = 0; combineIdx < fdCombineTaskNum_; ++combineIdx) {
+                    const int32_t combineBaseTask =
+                        faiTilingData->fdCombineSchedules[combineIdx].baseTask;
+                    if (combineBaseTask == static_cast<int32_t>(taskIdx)) {
+                        writePartial = true;
+                        partialId = static_cast<uint32_t>(
+                            faiTilingData->fdCombineSchedules[combineIdx].partialStart +
+                            static_cast<int32_t>(coreIdx) -
+                            faiTilingData->fdCombineSchedules[combineIdx].firstCore);
+                        break;
+                    }
+                }
+            }
+            const uint32_t kvSLoopCount = kvSplitEnd - kvSplitStart;
+            if (kvSLoopCount == 0U) {
+                continue;
+            }
 #ifdef __DAV_CUBE__
             uint32_t qShapeCol = strideQ;
             uint32_t kShapeCol = strideK;
@@ -471,8 +534,11 @@ public:
             auto gmOLayoutTla = tla::MakeLayout<ElementO, LayoutO>(qBaseTile_, oShapeCol);
             auto gmOTensorTla = tla::MakeTensor(gO[gmOffsetO], gmOLayoutTla, Arch::PositionGM{});
 #endif
-            for (uint32_t kvSTileRelIdx = 0; kvSTileRelIdx < kvSLoopCount + PRE_LAUNCH; kvSTileRelIdx++) {
-                const uint32_t kvSTileIdx = kvStart + kvSTileRelIdx;
+            for (uint32_t kvSTileRelIdx = 0;
+                 kvSTileRelIdx < kvSLoopCount + PRE_LAUNCH; ++kvSTileRelIdx) {
+                const uint32_t kvSTileIdx = kvSplitStart + kvSTileRelIdx;
+                const uint32_t pipelineTileSeq = flashDecodeFlag_ != 0U ?
+                    pipelineTileBase + kvSTileRelIdx : kvSTileRelIdx;
                 if (kvSTileRelIdx < kvSLoopCount) {
                     if (kvSTileIdx == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdx * kvBaseTile_;
@@ -480,7 +546,7 @@ public:
                         kvSTileSizeAct = kvBaseTile_;
                     }
                     GemmCoord actualBlockShapeQK{rowNum, kvSTileSizeAct, embed_};
-                    uint32_t ubSBufId = kvSTileRelIdx % UB_S_OTMP_BUF_STAGES;
+                    uint32_t ubSBufId = pipelineTileSeq % UB_S_OTMP_BUF_STAGES;
                     int64_t stride = 64;
                     auto ubSLayoutTla = tla::MakeLayout<ElementS, LayoutS>(qkRowNumRound, RoundUp(kvSTileSizeAct, ubSRoundTile));
                     auto ubSLayoutTlaDN = tla::MakeLayout<ElementS, LayoutS>(RoundUp(kvSTileSizeAct, 16), 64);
@@ -490,9 +556,11 @@ public:
                     Arch::CrossCoreFlag qkReadyFlag(qkReadyFlagId);
 #ifdef __DAV_CUBE__
                     uint64_t prefixSumL0AStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileRelIdx, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopCount, true);
+                        kvSTileRelIdx, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopCount, true) +
+                        (flashDecodeFlag_ != 0U ? pipelineL0AStageBase : 0U);
                     uint64_t prefixSumL0BStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileRelIdx, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopCount, true);
+                        kvSTileRelIdx, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopCount, true) +
+                        (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     if constexpr (IsDN) {
                         blockMmadQK(
                             gmKTensorTlaDN, ubSTensorTlaDN,
@@ -513,7 +581,7 @@ public:
                             gBlockTable[blockBOffset],
                             actualBlockShapeQK,
                             blockSize_,
-                            kvSTileIdx, kvSTileRelIdx, 0, kvHeads_,
+                            kvSTileIdx, pipelineTileSeq, 0, kvHeads_,
                             kvNumTokens,
                             kvBaseTile_, 0, 0, 0,
                             qSBlockSize, 
@@ -522,11 +590,11 @@ public:
                             prefixSumL0AStages, 
                             prefixSumL0BStages);
                     }
-                    if (kvSTileRelIdx == kvSLoopCount - 1) {
+                    if (kvSTileRelIdx == kvSLoopCount - 1U) {
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
                     }
 #endif
-                    uint32_t l1PBufId = kvSTileRelIdx % pL1BufNum_;
+                    uint32_t l1PBufId = pipelineTileSeq % pL1BufNum_;
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
                     auto l1PLayoutTla = tla::MakeLayout<ElementP, Catlass::layout::zN>(rowNum, kvSTileSizeAct);
@@ -646,33 +714,36 @@ public:
                 }
                 if (kvSTileRelIdx >= PRE_LAUNCH) {
                     uint32_t kvSTileRelIdxNow = kvSTileRelIdx - PRE_LAUNCH;
-                    uint32_t kvSTileIdxNow = kvStart + kvSTileRelIdxNow;
+                    uint32_t kvSTileIdxNow = kvSplitStart + kvSTileRelIdxNow;
+                    uint32_t pipelineTileSeqNow = flashDecodeFlag_ != 0U ?
+                        pipelineTileBase + kvSTileRelIdxNow : kvSTileRelIdxNow;
                     if (kvSTileIdxNow == kvSLoopNum - 1) {
                         kvSTileSizeAct = noSkipKvS - kvSTileIdxNow * kvBaseTile_;
                     } else {
                         kvSTileSizeAct = kvBaseTile_;
                     }
                     GemmCoord actualBlockShapePV{rowNum, embedV_, kvSTileSizeAct};
-                    uint32_t ubOTmpBufId = kvSTileRelIdxNow % UB_S_OTMP_BUF_STAGES;
+                    uint32_t ubOTmpBufId = pipelineTileSeqNow % UB_S_OTMP_BUF_STAGES;
                     uint32_t pvReadyFlagId = ubOTmpBufId + UB_S_OTMP_BUF_STAGES + pL1BufNum_;
 #ifdef __DAV_CUBE__
-                    uint32_t l1PBufId = kvSTileRelIdxNow % pL1BufNum_;
-                    uint32_t pvRowNumRound = rowNumRound;
-                    auto ubOTmpLayoutTla = tla::MakeLayout<ElementOTmp, LayoutOTmp>(pvRowNumRound, embedVRound);
+                    uint32_t l1PBufId = pipelineTileSeqNow % pL1BufNum_;
+                    auto ubOTmpLayoutTla = tla::MakeLayout<ElementOTmp, LayoutOTmp>(rowNumRound, embedVRound);
                     auto ubOTmpTensorTla = tla::MakeTensor(ubOTmpTensor[ubOTmpBufId],
                         ubOTmpLayoutTla, Arch::PositionUB{});
                     uint32_t softmaxReadyFlagId = l1PBufId + UB_S_OTMP_BUF_STAGES;
                     Arch::CrossCoreFlag softmaxReadyFlag(softmaxReadyFlagId);
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint64_t prefixSumL0AStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileRelIdxNow, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopCount, false);
+                        kvSTileRelIdxNow, qkL0ATotalStages_, pvL0ATotalStages_, kvSLoopCount, false) +
+                        (flashDecodeFlag_ != 0U ? pipelineL0AStageBase : 0U);
                     uint64_t prefixSumL0BStages = CalcCrossqkpvPrefixSumL0ABStages(
-                        kvSTileRelIdxNow, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopCount, false);
+                        kvSTileRelIdxNow, qkL0BTotalStages_, pvL0BTotalStages_, kvSLoopCount, false) +
+                        (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     blockMmadPV(
                         gmVTensorTla, ubOTmpTensorTla, gBlockTable[blockBOffset],
                         actualBlockShapePV,
                         blockSize_,
-                        kvSTileIdxNow, kvSTileRelIdxNow, 0, kvHeads_,
+                        kvSTileIdxNow, pipelineTileSeqNow, 0, kvHeads_,
                         kvNumTokens,
                         kvBaseTile_, 0, 0, 0,
                         softmaxReadyFlag, pvReadyFlag,
@@ -681,7 +752,7 @@ public:
 #endif
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
-                    uint32_t curTileMod = kvSTileRelIdxNow % (PRE_LAUNCH + 1);
+                    uint32_t curTileMod = pipelineTileSeqNow % (PRE_LAUNCH + 1);
                     uint32_t fmRowsPerHead = fullyMaskedRowsPerHead;
                     int32_t swaDelStartRow = 0;
                     int32_t swaDelEndRow = 0;
@@ -696,7 +767,7 @@ public:
                     }
                     epilogueRescaleO.template operator()<LseMode>(
                         gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
-                        curTileMod, kvSTileRelIdxNow,
+                        curTileMod, pipelineTileSeqNow,
                         (kvSTileRelIdxNow == 0),
                         (kvSTileRelIdxNow == kvSLoopCount - 1),
                         pvReadyFlag, IsDN,
@@ -705,10 +776,18 @@ public:
                         lseHeadStride,
                         static_cast<uint32_t>(strideO),
                         swaDelStartRow, swaDelEndRow,
-                        swaQSeqlen, swaQSTileStart);
+                        swaQSeqlen, swaQSTileStart,
+                        gPartialO, gPartialLse,
+                        writePartial && !IsDN, partialId,
+                        fdRowCapacity_, fdLseSubStride_);
 #endif
                 }
             }
+            pipelineTileBase += kvSLoopCount;
+            pipelineL0AStageBase += static_cast<uint64_t>(kvSLoopCount) *
+                (qkL0ATotalStages_ + pvL0ATotalStages_);
+            pipelineL0BStageBase += static_cast<uint64_t>(kvSLoopCount) *
+                (qkL0BTotalStages_ + pvL0BTotalStages_);
         }
         ReleaseSyncFlags<4, 4, 4>();
     }
@@ -847,7 +926,7 @@ public:
                 KvSTileIdx * singleqkL0Stages :
                 KvSTileIdx * singleqkL0Stages + (KvSTileIdx - PRE_LAUNCH) * singlepvL0Stages;
         } else {
-            prefixSumStages = (KvSTileIdx < kvSLoopNum - PRE_LAUNCH) ?
+            prefixSumStages = (KvSTileIdx + PRE_LAUNCH < kvSLoopNum) ?
                 (KvSTileIdx + 1 + PRE_LAUNCH) * singleqkL0Stages + KvSTileIdx * singlepvL0Stages:
                 kvSLoopNum * singleqkL0Stages + KvSTileIdx * singlepvL0Stages;
         }
@@ -868,6 +947,10 @@ private:
     uint32_t maxNumBlocksPerBatch_;
     uint32_t blockSize_;
     uint32_t numBlocks_;
+    uint32_t flashDecodeFlag_;
+    uint32_t fdCombineTaskNum_;
+    uint32_t fdRowCapacity_;
+    uint32_t fdLseSubStride_;
 
     uint32_t qBaseTile_;
     uint32_t kvBaseTile_;
