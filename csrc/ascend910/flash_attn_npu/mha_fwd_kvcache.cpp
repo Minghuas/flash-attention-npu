@@ -361,11 +361,10 @@ namespace SplitFuse {
                     }
                 }
             } else if (flashDecodeFlag == 0U) {
+                uint32_t curBatchTmp = 0;
+                uint32_t preTotalTaskNumTmp = 0;
+                uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
                 for (uint32_t taskIdx = coreIdx; taskIdx < totalTaskNum; taskIdx += uint32_t(coreNum)) {
-                    uint32_t curBatchTmp = 0;
-                    uint32_t preTotalTaskNumTmp = 0;
-                    uint32_t curTotalTaskNumTmp = firstBatchTaskNum;
-
                     while (taskIdx >= curTotalTaskNumTmp) {
                         ++curBatchTmp;
                         preTotalTaskNumTmp = curTotalTaskNumTmp;
@@ -542,11 +541,8 @@ namespace SplitFuse {
                         // Capacity-aligned cache: cache batch occupies [BIdx * kvCacheSeqlen, ...).
                         prevKvSeqlenSum = BIdx * kvCacheSeqlen;
                     } else {
-                        // Mirror mha_fwd_kvcache_2.cpp semantics: per-batch K/V step
-                        // uses each batch's actual kvSeqlen (prefix sum across batches).
-                        for (uint32_t b = 0; b < BIdx; b++) {
-                            prevKvSeqlenSum += static_cast<uint32_t>(gActualKvseqlen.GetValue(b));
-                        }
+                        // BSND K seqlens are not variable, just multiply by the batch index to get the offset.
+                        prevKvSeqlenSum = static_cast<uint32_t>(gActualKvseqlen.GetValue(0)) * BIdx;
                     }
                 }
             }
