@@ -431,10 +431,12 @@ def flash_attn_with_kvcache(
             page_size = None
             num_blocks = None
             max_blocks = None
-        if page_table is not None:
+        if cache_seqlens is not None:
+            max_seqlen_k_bound = int(cache_seqlens.max().item())
+        elif page_table is not None:
             max_seqlen_k_bound = max_blocks * page_size
         elif cu_seqlens_q is not None:
-            max_seqlen_k_bound = k_cache.shape[0]  # TND 3D non-paged: total_tokens bound
+            max_seqlen_k_bound = k_cache.shape[0]  # TND 3D non-paged fallback
         else:
             max_seqlen_k_bound = k_cache.shape[1]
         scheduler_metadata = get_scheduler_metadata(

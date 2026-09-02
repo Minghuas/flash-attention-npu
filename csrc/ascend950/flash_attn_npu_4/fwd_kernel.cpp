@@ -344,7 +344,11 @@ public:
             }
 
             uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
-            uint32_t fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
+
+            uint32_t fullyMaskedRowsPerHead = 0;
+            if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
+                fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
+            }
             if (kvSLoopNum == 0) {
 #ifdef __DAV_VEC__
                 initOutputs.template operator()<LseMode>(
