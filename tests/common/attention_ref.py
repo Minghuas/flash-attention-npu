@@ -3,7 +3,7 @@ import os
 
 import torch
 
-from tests.common.golden_cache import get_or_compute_golden
+from tests.common.golden_cache import get_or_compute_golden, register_retry
 """
   Shared FlashAttention NPU reference / golden implementation.
 
@@ -331,15 +331,14 @@ def cached_ref_flash_attention_pair(
         )
         return dict(zip(("out_ref", "lse_ref", "out_pt", "lse_pt"), values))
 
-    values = get_or_compute_golden(
-        nodeid=nodeid or _current_nodeid(),
-        metadata=case_metadata,
-        inputs=inputs,
-        compute_fn=compute,
-        expected_keys=("out_ref", "lse_ref", "out_pt", "lse_pt"),
-        source_files=[__file__],
-        test_source_files=_golden_test_source_files(),
+    cache_args = dict(
+        nodeid=nodeid or _current_nodeid(), metadata=case_metadata, inputs=inputs,
+        compute_fn=compute, expected_keys=("out_ref", "lse_ref", "out_pt", "lse_pt"),
+        source_files=[__file__], test_source_files=_golden_test_source_files(),
     )
+    values, status = get_or_compute_golden(**cache_args, return_status=True)
+    if status == "hit":
+        register_retry(values, lambda: get_or_compute_golden(**cache_args, force_refresh=True))
     return tuple(values[name] for name in ("out_ref", "lse_ref", "out_pt", "lse_pt"))
 
 
@@ -380,15 +379,15 @@ def cached_autograd_grads(nodeid, outputs, refs, dout, *, metadata=None, inputs=
             "dq_pt": dq_pt, "dk_pt": dk_pt, "dv_pt": dv_pt,
         }
 
-    values = get_or_compute_golden(
-        nodeid=nodeid,
-        metadata=case_metadata,
-        inputs=cache_inputs,
+    cache_args = dict(
+        nodeid=nodeid, metadata=case_metadata, inputs=cache_inputs,
         compute_fn=compute,
         expected_keys=("dq_ref", "dk_ref", "dv_ref", "dq_pt", "dk_pt", "dv_pt"),
-        source_files=[__file__],
-        test_source_files=_golden_test_source_files(),
+        source_files=[__file__], test_source_files=_golden_test_source_files(),
     )
+    values, status = get_or_compute_golden(**cache_args, return_status=True)
+    if status == "hit":
+        register_retry(values, lambda: get_or_compute_golden(**cache_args, force_refresh=True))
     return tuple(values[name] for name in ("dq_ref", "dk_ref", "dv_ref", "dq_pt", "dk_pt", "dv_pt"))
 
 

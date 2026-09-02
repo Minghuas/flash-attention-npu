@@ -2,7 +2,7 @@ name: NPU CI 默认状态
 
 # PR 新建/重开/ready/push 新 commit 时, 给 head commit 写入
 #   NPU CI / 手动验证  pending  "未执行"
-# 并在 PR 下发机器人评论, 提示可用 /run-npu-ci quick 触发。
+# 并在 PR 下发机器人评论, 提示可用 /run-npu-ci 触发 full CI。
 # 真正的 NPU CI 不会由此自动执行。
 #
 # 用 pull_request_target (而非 pull_request): fork PR 也能访问 secrets
@@ -48,9 +48,9 @@ jobs:
           fi
 
           if [ "$event" = "synchronize" ]; then
-            desc="未执行：commit 已变化，请重新触发 /run-npu-ci quick"
+            desc="未执行：commit 已变化，请重新触发 /run-npu-ci（full）"
           else
-            desc="未执行：评论 /run-npu-ci quick 触发 (任何人可触发)"
+            desc="未执行：评论 /run-npu-ci 触发 full CI (任何人可触发)"
           fi
 
           gh api --method POST "repos/$repo/statuses/$sha" \
@@ -70,9 +70,9 @@ jobs:
           event="${{ github.event.action }}"
 
           if [ "$event" = "synchronize" ]; then
-            hint="commit 已变化, 重新评论 \`/run-npu-ci quick\` 触发 NPU CI (任何人可触发)。"
+            hint="commit 已变化, 重新评论 \`/run-npu-ci\` 触发 full NPU CI (任何人可触发)。"
           else
-            hint="在下方评论 \`/run-npu-ci quick\` 触发 NPU CI (任何人); \`/run-npu-ci full\` 需 Admin。"
+            hint="在下方评论 \`/run-npu-ci\` 触发 full NPU CI (任何人可触发)。"
           fi
 
           marker="<!--npu-ci-bot-->"

@@ -25,6 +25,37 @@ import torch
 
 _FORMAT_VERSION = 1
 _DEFAULT_CACHE_DIR = "/var/cache/flash-attention-npu/golden_cache"
+_RETRY_HANDLERS: dict[int, Callable[[], bool]] = {}
+
+
+def register_retry(values: Mapping[str, torch.Tensor], refresh_fn: Callable[[], Mapping[str, torch.Tensor]]) -> None:
+    """Associate cached tensors with a one-shot refresh callback."""
+    used = False
+
+    def retry() -> bool:
+        nonlocal used
+        if used:
+            return False
+        used = True
+        refreshed = refresh_fn()
+        for name, value in values.items():
+            value.copy_(refreshed[name].to(device=value.device, dtype=value.dtype))
+        for value in values.values():
+            _RETRY_HANDLERS.pop(id(value), None)
+        return True
+
+    for value in values.values():
+        _RETRY_HANDLERS[id(value)] = retry
+
+
+def retry_cached_value(value: torch.Tensor) -> bool:
+    current = value
+    while isinstance(current, torch.Tensor):
+        handler = _RETRY_HANDLERS.get(id(current))
+        if handler is not None:
+            return handler()
+        current = getattr(current, "_base", None)
+    return False
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -218,7 +249,9 @@ def get_or_compute_golden(
     expected_keys: tuple[str, ...],
     source_files: list[str] | tuple[str, ...] | None = None,
     test_source_files: list[str] | tuple[str, ...] | None = None,
-) -> dict[str, torch.Tensor]:
+    force_refresh: bool = False,
+    return_status: bool = False,
+) -> dict[str, torch.Tensor] | tuple[dict[str, torch.Tensor], str]:
     """Load a case artifact or compute and atomically persist it.
 
     ``compute_fn`` is called only on a miss, a damaged artifact, or when
@@ -226,7 +259,8 @@ def get_or_compute_golden(
     tensors on a cache hit and retain the caller's tensors on a miss.
     """
     if not _cache_enabled():
-        return dict(compute_fn())
+        result = dict(compute_fn())
+        return (result, "disabled") if return_status else result
 
     value_names = sorted(set(expected_keys))
     if len(value_names) != len(expected_keys):
@@ -262,12 +296,12 @@ def get_or_compute_golden(
         / f"case_{case_hash}.tar.gz"
     )
 
-    refresh = _env_bool("GOLDEN_CACHE_REFRESH")
+    refresh = force_refresh or _env_bool("GOLDEN_CACHE_REFRESH")
     if not refresh and artifact.is_file():
         try:
             result = _load_artifact(artifact, case_metadata)
             print(f"[golden-cache] hit {nodeid}")
-            return result
+            return (result, "hit") if return_status else result
         except Exception as exc:  # cache is an optimization, never a test failure
             warnings.warn(
                 f"golden cache read failed for {nodeid}: {exc}; recomputing",
@@ -290,7 +324,8 @@ def get_or_compute_golden(
             f"golden cache write failed for {nodeid}: {exc}; continuing",
             RuntimeWarning,
         )
-    return values
+    status = "refresh" if refresh else "miss"
+    return (values, status) if return_status else values
 
 
-__all__ = ["get_or_compute_golden", "input_digest"]
+__all__ = ["get_or_compute_golden", "input_digest", "register_retry", "retry_cached_value"]
