@@ -54,17 +54,11 @@ inline bool shape_supported(int64_t seqlen_q, int64_t seqlen_k, int64_t num_head
     if (head_size > 128) {
         return false;
     }
-    // 照搬 TilingB::IsCapable（tiling_general.cpp:3137-3150）：
-    //   HIGH_PERF_SUPPORT_S2_BASIC = 128；blockBSizeLimit_ = 64K 元素 × 2B
-    int64_t alignedS1 = (seqlen_q + 15) / 16 * 16;
-    int64_t alignedS2 = (seqlen_k + 15) / 16 * 16;
-    if (alignedS2 > 128) {
-        return false;
-    }
-    int64_t n2g = num_heads;  // N2×G = q 头数（N2=kv头 × G=组数）
-    if (n2g * alignedS1 * alignedS2 * static_cast<int64_t>(dtype_size) > 128 * 1024) {
-        return false;
-    }
+    // [v3.4] 放宽：去掉了参考实现的 N2×G×alignedS1×alignedS2×dtype ≤ 128KB 闸门。
+    // 该条是 TilingB::IsCapable 为 BATCH_LESS_THAN_L1（batch 数据驻留 L1）设的预算——
+    // 我们的 Pingpong 引擎逐 tile 装载（L1 用量与 S 无关，每 tile 就是 128×128 级），
+    // 不吃这个约束。保留的硬约束仅为 max(Sq,Sk)≤128（引擎 M/N 维 L1 装载上限）+ D≤128。
+    // 效果：H24/s64（192KB）、H8/s128（256KB）、H24/s128（768KB）等形状进入 SplitB 覆盖。
     return true;
 }
 

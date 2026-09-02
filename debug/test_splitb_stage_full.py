@@ -8,7 +8,7 @@
   ⇒ S_raw[b,h,s,j] = (b+1)(h+1)(s+1)(j+1)/64（小整数乘积，肉眼可验）
   ⇒ O[b,s,h,d]   = m(b,h,s) + (d+1)/128，m∈[1,32]（每行常数偏移 + 通道斜坡）
 
-kernel 侧（--dump 开启 FLASH_ATTN_SPLITB_DUMP；--multi-core 切多核；dump 全核可用，#44.46）：
+kernel 侧（--dump 开启 FLASH_ATTN_SPLITB_DUMP；--single-core 切单核（v3.4 默认多核）；dump 全核可用，#44.46）：
     desc=100+b  段1末  S 整区（float 视图；S 会被 P 原地覆盖，仅此时可读）
     desc=200+b  段2末  同一整区（half 视图 = P 未归一 exp）
     desc=300    kernel末 workspace 整区（float 视图 = OTmp + stats 终态）
@@ -426,13 +426,13 @@ def compare_all(records, iters, ref, softmax_only=False):
 
 
 # ---------------- 跑 kernel（同进程：env 必须在 import 前设置） ----------------
-def run_kernel(iters, softmax_only=False, multi_core=False, debug=False, dump=False):
+def run_kernel(iters, softmax_only=False, single_core=False, debug=False, dump=False):
     """跑 iters 轮 kernel；dump 输出走本进程 stdout（由调用方捕获/重定向）。"""
     os.environ["FLASH_ATTN_FORCE_SPLITB"] = "1"
     if softmax_only:
         os.environ["FLASH_ATTN_SPLITB_SOFTMAX_ONLY"] = "1"
-    if multi_core:
-        os.environ["FLASH_ATTN_SPLITB_MULTI_CORE"] = "1"
+    if single_core:
+        os.environ["FLASH_ATTN_SPLITB_SINGLE_CORE"] = "1"
     if debug:
         os.environ["FLASH_ATTN_SPLITB_DEBUG"] = "1"    # 设备 [SB] printf + host 调试输出
     if dump:
@@ -486,8 +486,8 @@ def main():
     ap.add_argument("--dim", type=int, default=64)
     ap.add_argument("--softmax-only", action="store_true",
                     help="只跑段1+段2（FLASH_ATTN_SPLITB_SOFTMAX_ONLY）：S 来自真实 QK，跳过 PV/DO")
-    ap.add_argument("--multi-core", action="store_true",
-                    help="设 FLASH_ATTN_SPLITB_MULTI_CORE：usedCoreNum=min(B,aicNum)（与 dump 解耦，#44.46）")
+    ap.add_argument("--single-core", action="store_true",
+                    help="设 FLASH_ATTN_SPLITB_SINGLE_CORE：单核模式（v3.4 起默认多核）")
     ap.add_argument("--debug", action="store_true",
                     help="设 FLASH_ATTN_SPLITB_DEBUG：设备 [SB] printf + host 调试输出")
     ap.add_argument("--dump", action="store_true",
@@ -511,12 +511,12 @@ def main():
     # 同进程捕获读不到完整数据 → 本步只跑 kernel，由用户 tee 收集日志；
     # 第二步 --log FILE 解析比对。
     flags = "".join([" --" + f for f, on in (("softmax-only", args.softmax_only),
-                                             ("multi-core", args.multi_core),
+                                             ("single-core", args.single_core),
                                              ("debug", args.debug),
                                              ("dump", args.dump)) if on])
     print("[RUN] 开始跑 kernel：请用 `python debug/test_splitb_stage_full.py --batch %d --iters %d%s "
           "2>&1 | tee debug/log/t4x.log` 收集日志，随后 --log 比对" % (B, args.iters, flags), flush=True)
-    run_kernel(args.iters, args.softmax_only, args.multi_core, args.debug, args.dump)
+    run_kernel(args.iters, args.softmax_only, args.single_core, args.debug, args.dump)
     if not args.dump:
         print("[RUN] 提示：未开 --dump，日志中无 DumpTensor 记录，--log 比对将无数据（仅验证运行/正确性靠 O 张量外部校验）")
     print("[RUN] 完成。执行：python debug/test_splitb_stage_full.py --batch %d --iters %d --log <日志文件>"

@@ -47,3 +47,6 @@ CLAUDE.md
 *.log
 debug/test_softmax_playground
 debug/test_softmax_playground_O0
+*.csv
+perf/results/profile/*
+*.toml

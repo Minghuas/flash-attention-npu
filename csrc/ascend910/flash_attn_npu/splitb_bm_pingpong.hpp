@@ -203,6 +203,45 @@ public:
         (*this)(gmA, layoutA, gmB, layoutB, gmC, layoutC, actualShape);
     }
 
+    /// [SplitB O1] GQA 组内 B 面（K/V）L1 驻留：kv 头 tile 固定驻留 B 槽 0，跨组内
+    /// q 头复用（省 G-1 次 GM→L1 拷贝；prof 实证 MTE2 为 cube 核第一忙管道）。
+    /// 事件纪律（HardEvent 单 bit set 语义，收支严格平衡，#44.53g 教训）：
+    ///   setBResident（每组一次）：Wait<MTE1_MTE2>(ID2) 后拷贝；不 Set——"数据有效"
+    ///     旗标由各头的 re-arm 承担
+    ///   operator()（每头）：起始 Set<MTE2_MTE1>(ID2) re-arm → 首 (k,n) tile Wait 消费
+    ///     → 末 tile Set<MTE1_MTE2>(ID2)（供下一头/下一组的 wait 消费）
+    ///   waitBResidentPrev（组内 g>0 头调用前）：Wait<MTE1_MTE2>(ID2)，消费上一头
+    ///     末 tile 的释放
+    ///   收支：每组 waits=1(load)+(G-1)(prev)=G，sets=G（每头末 tile）→ 组内净零；
+    ///   launch 内最后一批末头的 +1 由 kernel drain Wait(ID2) 消费；槽 1（ID3）全程
+    ///   不用 → kernel 预置/排水须按 residentQK 跳过 ID3（孤儿预置 = 跨 launch 死锁）。
+    ///   限制：K≤L1TileShape::K（kTileCount==1，闸门内 D/Sk≤128 恒真；k 预取路径
+    ///   不支持驻留）。
+    CATLASS_DEVICE
+    void setBResident(AscendC::GlobalTensor<ElementB> const &gmB, LayoutB const &layoutB,
+                      uint32_t kActual, uint32_t nActual)
+    {
+        auto layoutBInL1 = LayoutBInL1::template MakeLayout<ElementB>(L1TileShape::K, L1TileShape::N);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+        auto layoutTileB = layoutB.GetTileLayout(MakeCoord(kActual, nActual));
+        copyGmToL1B(l1BTensorList[0], gmB, layoutBInL1, layoutTileB);
+        bResident_ = true;
+    }
+
+    /// [SplitB O1] 组内非首头的记账 Wait（见 setBResident 注释的收支表）
+    CATLASS_DEVICE
+    void waitBResidentPrev()
+    {
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[0]);
+    }
+
+    /// [SplitB O1] 组尾退出驻留（下一组或后续走回标准装载）
+    CATLASS_DEVICE
+    void clearBResident()
+    {
+        bResident_ = false;
+    }
+
     /// Perform a block-scoped matrix multiply-accumulate
     CATLASS_DEVICE
     void operator()(
@@ -229,14 +268,19 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1AEventList[l1ListId]);
         }
 
-        // load first matrix B tile from GM to L1
-        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[l1ListId]);
+        // load first matrix B tile from GM to L1（[O1] 驻留模式跳过拷贝——组内 K/V 已由
+        // setBResident 装入槽 0；本头 re-arm 补给"数据有效"旗标，收支见 setBResident 注释）
         auto layoutTileB = layoutB.GetTileLayout(MakeCoord(kActual, actualShape.n()));
-        copyGmToL1B(l1BTensorList[l1ListId], gmB, layoutBInL1, layoutTileB);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[l1ListId]);
+        if (bResident_) {
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[0]);
+        } else {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[l1ListId]);
+            copyGmToL1B(l1BTensorList[l1ListId], gmB, layoutBInL1, layoutTileB);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[l1ListId]);
+        }
 
         if constexpr (!ENABLE_UNIT_FLAG) {
-            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);  // FIXME: 为什么不用ping-pong，L0C的空间应该够用？
         }
 
         uint32_t mPartLoop = CeilDiv<L0TileShape::M>(mRound);
@@ -275,9 +319,9 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[l1ListIdNext]);
             }
 
-            // Get L1 tensor for current stage
+            // Get L1 tensor for current stage（[O1] B 面驻留时固定读槽 0，不随 l1ListId 轮转）
             auto l1ATensor = l1ATensorList[l1ListId];
-            auto l1BTensor = l1BTensorList[l1ListId];
+            auto l1BTensor = bResident_ ? l1BTensorList[0] : l1BTensorList[l1ListId];
 
             // Get the loop nums on L0
             uint32_t kPartLoop = CeilDiv<L0TileShape::K>(kActual);
@@ -324,7 +368,8 @@ public:
                         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0BEventList[l0BListId]);
                         // If the current tile is the first one on the k&n axis, wait for loading matrix B from GM to L1
                         if ((kPartIdx == 0) && (nPartIdx == 0)) {
-                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1BEventList[l1ListId]);
+                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(
+                                l1BEventList[bResident_ ? 0 : l1ListId]);
                         }
 
                         // Load current tile from L1 to L0B
@@ -332,7 +377,8 @@ public:
 
                         // If the current tile is the last one on the k&n axis, notify to load matrix B from GM to L1
                         if ((kPartIdx == kPartLoop - 1) && (nPartIdx == nPartLoop - 1)) {
-                            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1BEventList[l1ListId]);
+                            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(
+                                l1BEventList[bResident_ ? 0 : l1ListId]);
                         }
                         // Notify to do mmad
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
@@ -435,6 +481,9 @@ protected:
 
     // [v3.3] loadAPackedBSHD 预装标志（operator() 首次 A 装载据此跳过，调用末尾复位）
     bool aPrefilledA_{false};
+
+    // [O1] B 面驻留标志（setBResident 置位、clearBResident 复位；驻留槽恒 0）
+    bool bResident_{false};
 
     TileMmad tileMmad;
     CopyGmToL1A copyGmToL1A;

@@ -25,9 +25,6 @@
 
 namespace SplitB {
 
-// 构建标识（每次结构改动更新；运行时打印以确认二进制版本——devlog #22 溯源教训）
-constexpr const char *SPLITB_BUILD_TAG = "printf-v3 (devlog #42)";
-
 namespace {
 
 // ---------------- 照搬参考的常量（tiling_general.cpp 头部） ----------------
@@ -59,10 +56,6 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     const int64_t G = H / Hkv;      // GQA 组数
     const bool isBf16 = q.dtype() == at::kBFloat16;
     const int64_t dtypeSize = 2;    // fp16/bf16
-    const bool dbgEnv = getenv("FLASH_ATTN_SPLITB_DEBUG") != nullptr;   // host 调试输出总开关（#44.45；默认静默）
-    if (dbgEnv) {
-        printf("222 [splitb] ENTER mha_fwd_splitb (build=%s)\n", SPLITB_BUILD_TAG); fflush(stdout);
-    }
 
     // ---------------- 平台参数（aic 基数） ----------------
     auto *platform = platform_ascendc::PlatformAscendCManager::GetInstance();
@@ -102,7 +95,6 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     in.set_windowSizeLeft(window_size_left);
     in.set_windowSizeRight(window_size_right);
     in.set_isCausalFlag(is_causal ? 1 : 0);
-    in.set_debugFlag(dbgEnv ? 1 : 0);   // dbgEnv 定义见函数头部（#44.45）
     const bool smOnlyEnv = getenv("FLASH_ATTN_SPLITB_SOFTMAX_ONLY") != nullptr;
     in.set_softmaxOnly(smOnlyEnv ? 1 : 0);
     const bool dumpEnv = getenv("FLASH_ATTN_SPLITB_DUMP") != nullptr;
@@ -128,11 +120,10 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
 
     // ---------------- 核间切分（aic 基数；参考为 aiv 基数——D7 因地制宜项） ----------------
     const int64_t totalSize = bOuterSize;
-    // 核数由 MULTI_CORE 独立控制（devlog #44.46，与 debug/dump/smOnly 解耦——少核也
-    // 可 dump）：未设 → 单核（调试期默认，防输出串扰）；已设 → min(B, aicNum) 多核。
-    // kernel dump 门已放开到全核（desc 按全局 boIdx 跨核唯一；VEC 侧 AIV0-only 防双份）。
-    const bool multiCoreEnv = getenv("FLASH_ATTN_SPLITB_MULTI_CORE") != nullptr;
-    const int64_t usedCoreNum = multiCoreEnv ? std::min(totalSize, static_cast<int64_t>(aicNum)) : 1;
+    // [v3.4] 默认多核（生产语义）；FLASH_ATTN_SPLITB_SINGLE_CORE=1 时才单核（调试用：
+    // 输出不串扰/断点友好）。原 FLASH_ATTN_SPLITB_MULTI_CORE 已废弃（语义反转）。
+    const bool singleCoreEnv = getenv("FLASH_ATTN_SPLITB_SINGLE_CORE") != nullptr;
+    const int64_t usedCoreNum = singleCoreEnv ? 1 : std::min(totalSize, static_cast<int64_t>(aicNum));
     const int64_t splitFactorSize = CeilDivI(totalSize, usedCoreNum);
     const int64_t coreNum = CeilDivI(totalSize, splitFactorSize);
 
@@ -169,14 +160,6 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     const int64_t perCoreBytes = AlignUpI(perCoreElems * 4, GM_ALIGN);
     const int64_t workSpaceSize = perCoreBytes * coreNum;
     (void)dtypeSize;
-    if (dbgEnv) {
-        printf("666 [splitb host] B=%lld Sq=%lld Sk=%lld H=%lld Hkv=%lld D=%lld | qNBlockTile=%lld "
-               "nTilePerBatch=%lld colsPad=%lld coreNum=%lld splitF=%lld wsBytes=%lld\n",
-               (long long)B, (long long)Sq, (long long)Sk, (long long)H, (long long)Hkv, (long long)D,
-               (long long)qNBlockTile, (long long)nTilePerBatch, (long long)alignedS2,
-               (long long)coreNum, (long long)splitFactorSize, (long long)workSpaceSize);
-        fflush(stdout);
-    }
     at::Tensor workspace_tensor =
         at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
 
@@ -191,9 +174,6 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     uint32_t fftsLen = 0;
     rtError_t rtErr = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
     TORCH_CHECK(rtErr == 0, "splitb: rtGetC2cCtrlAddr failed, ret=", rtErr);
-    if (dbgEnv) {
-        printf("999 [splitb] ffts ok addr=%llx len=%u\n", (unsigned long long)fftsAddr, fftsLen); fflush(stdout);
-    }
 
     // ---------------- launch ----------------
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -219,15 +199,7 @@ void mha_fwd_splitb(at::Tensor &q, const at::Tensor &k, const at::Tensor &v, at:
     fwd_args.kvSeqDevice = nullptr;
     fwd_args.workspaceDevice = static_cast<uint8_t *>(workspace_tensor.data_ptr());
     fwd_args.tilingDevice = static_cast<uint8_t *>(tiling_gpu_tensor.data_ptr());
-    if (dbgEnv) {
-        printf("1000 [splitb] pre-launch blockDim=%u dtype=%s mask(c=%d,l=%d) sc=%d\n",
-               fwd_args.blockDim, isBf16 ? "bf16" : "fp16", (int)fwd_args.is_causal,
-               (int)fwd_args.is_local, (int)fwd_args.has_softcap); fflush(stdout);
-    }
     launch_fwd_splitb(fwd_args);
-    if (dbgEnv) {
-        printf("9999 [splitb] launch ENQUEUED (async)\n"); fflush(stdout);
-    }
 }
 
 }  // namespace SplitB

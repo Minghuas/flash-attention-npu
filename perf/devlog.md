@@ -2,6 +2,8 @@
 
 > 用途：记录开发过程中遇到的**所有** bug、报错、踩坑——根因分析与修复方案，
 > 避免遗漏、避免重犯。每解决一个问题即追加一条（用户要求，2026-08-16）。
+> **[已封存 2026-08-31]** 本文件含 #1-#47，不再追加（中后段条目插入位置较乱，
+> 检索请按编号 grep）——**新条目记入 [devlog2.md](devlog2.md)**（含当前状态快照）。
 > 格式：#序号｜分类｜现象｜根因｜修复｜预防
 > 关联：设计文档 [design/splitb_integration.md](design/splitb_integration.md)；
 > 归档（范式 A）[archive/ascendc-matmul-paradigm-v2/](archive/ascendc-matmul-paradigm-v2/)
@@ -810,6 +812,29 @@ CopySGmToUb 同款问题的镜像）。修复 = Wait 后补 `PipeBarrier<PIPE_MT
 惯例，标量硬等 MTE1 排空）。若不愈的备选：L0A 槽 M_MTE1 set 早燃语义。分析器
 debug/analyze_t17.py（注意：890 须按 printf 头 sub/off/n 解析，按出现序猜会误报
 ——t17 首版教训）。
+
+**#47**｜**S4 前置清理：同步语句全量审计 + 冗余删除（用户指令，2026-08-31）**：
+逐条审计 splitb 全部同步（softmax/divout 通读 + kernel 预置/排水），三类处置：
+**①删除（冗余/死代码）**：divout ② Brcb→Div 之间的 `Set/Wait<MTE2_V>` 自配对（唯一
+行为性删除——两指令间无 MTE2 工作，MTE2 队列已空，Set 即时点火 Wait 即时通过 =
+功能 no-op；保留 Brcb→Div 的 PipeBarrier<PIPE_V> RAW 语义。若回归首先恢复此处）；
+kernel 事件预算收敛——CUBE 预置/排水从 {M_MTE1 0-7, FIX_M 0-1, MTE1_MTE2 0-7} 收敛
+到引擎实际在用 {M_MTE1 0-3, MTE1_MTE2 0-3}（unit-flag 模式 FIX_M 不使用；4-7 无
+消费者），VEC 从 {MTE3_V 0-4, MTE3_MTE2 0,2-6} 收敛到 {0-3}/{0,2}（Set/Wait 逐 ID
+镜像核对 ✓）；divout 的 dbgDescUb 尾参+dump 块（v3 已移除 dump 的残余接口）。
+**②保留（有实证依据）**：全部跨 tile 链（softmax MTE3_V 顶等待 #44.8、V_MTE3 双写
+覆盖 #44.6、divout MTE3_MTE2 WAR #44.40）；全部 #44.10 Scalar 发射乱序加固
+PipeBarrier；V 管道内 RAW 屏障；evId 分域（见 ③）。**③过时注释清理**：softmax 头部
+0 行 stub 描述改为净返回（#44.53h 后的实况）；删 4 处过时 FIXME/死注释（tvUb 复用
+安全问题——注释里已有答案；"大概率不必分域 evId"——错误断言，分域是 #44.24 实证
+必需；2 处被注释掉的 PipeBarrier；"参数不一致"）；snake_case 循环计数器统一
+camelCase（qN_idx→qNIdx、vdiv_idx→vDivIdx）。**evId 分域答疑（用户问"FAInfer 为何
+不用"）**：实证 FAInfer 裸用 pingpongFlag（online_softmax.hpp:1049）不分域；机理 =
+HardEvent 核级共享 + 双 AIV 异步标量流入共享管线序不定 → 同 ID 下 AIV1 的 Set 可
+放行 AIV0 的 Wait（#44.24 b1t0 s8-15 半程读指纹实证）；FAInfer 未炸最可能为时序
+掩蔽（同 l1A 故事：靠余量不靠结构）——[需文档核对]：HardEvent 标志位核级共享的
+架构确认。**[需 NPU 验证]**：全量回归（MHA/GQA/守卫/多核）+ bench 抽点零漂移
+（对照 bench_v3_h8d64_mc.csv 的 b1024/s32=3.185ms）。
 
 **#46.11**｜**循环不变量外提（用户审查驱动，2026-08-31）**：用户问 StageQK 循环内
 AOperandBSHD 三变量是否全固定。分析：strideQ 恒定；qSBlockSize 外层尾块才变（闸门下

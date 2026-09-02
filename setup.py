@@ -40,6 +40,7 @@ BASE_WHEEL_URL = (
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_NPU_BUILD = os.getenv("FLASH_ATTENTION_SKIP_NPU_BUILD", "FALSE") == "TRUE"
 DEBUG_MODE = os.getenv("DEBUG_MODE", "FALSE") == "TRUE"
+PROFILE_MODE = os.getenv("PROFILE_MODE", "FALSE") == "TRUE"
 
 # FLASH_ATTN_BUILD_VERSION selects which API generations to build:
 #   "v2"   build flash_attn_npu.flash_attn_npu     (910B/C only)
@@ -105,6 +106,10 @@ class BishengBuildExt(build_ext):
 
         extra_includes = []
         extra_defines = []
+        # [SplitB 性能] ENABLE_DEBUG 编译宏：默认关闭（内核 debug printf 零标量开销）；
+        # FLASH_ATTN_ENABLE_DEBUG=1 时定义，设备侧 [SB] 探针才编译进内核。
+        if os.environ.get("FLASH_ATTN_ENABLE_DEBUG") == "1":
+            extra_defines.append("-DENABLE_DEBUG")
         if is_ascend950:
             version_dir = "flash_attn_npu_3"  # fallback
             for part in src_norm.split("/"):
@@ -178,7 +183,7 @@ class BishengBuildExt(build_ext):
             "-ltorch_npu",
             "-ltiling_api",
             "-lplatform",
-            "-g" if DEBUG_MODE else ""
+            "-g" if DEBUG_MODE or PROFILE_MODE else ""
         ]
 
         # NOTE: ccache is intentionally NOT supported. bisheng requires `-x asc`
@@ -192,7 +197,10 @@ class BishengBuildExt(build_ext):
 
         # compile_common = [*compiler, "-O2", *compile_arch_flags, "-fPIC", "-std=c++17",
         #                   abi_flag, *include_flags]
-        compile_common = [*compiler, *(["-O0", "-g3"] if DEBUG_MODE else ["-O2"]), *compile_arch_flags, "-fPIC", "-std=c++17",
+        compile_common = [*compiler, 
+                          *(["-O0", "-g3"] if DEBUG_MODE else ["-O2"]), 
+                          *(["-g"] if PROFILE_MODE and not DEBUG_MODE else []),
+                          *compile_arch_flags, "-fPIC", "-std=c++17",
                           abi_flag, *include_flags]
         
         self._toolchains[ext_name] = (compiler, compile_common, link_arch_flags, link_flags)
@@ -222,6 +230,7 @@ class BishengBuildExt(build_ext):
             "bisheng",
             # "-O2",
             *(["-O0", "-g3"] if DEBUG_MODE else ["-O2"]),
+            *(["-g"] if PROFILE_MODE and not DEBUG_MODE else []),
             "-std=c++17",
             "-fvisibility=default",
             "-fvisibility-inlines-hidden",

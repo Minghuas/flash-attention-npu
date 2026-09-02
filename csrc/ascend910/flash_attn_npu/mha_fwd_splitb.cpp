@@ -53,6 +53,20 @@
 using namespace Catlass;
 using namespace KernelCommon;
 
+// [SplitB 性能] SB_DEBUG_PRINTF：编译期门控的设备 printf。默认（未定义 ENABLE_DEBUG）
+// 展开为空——debugFlag 分支的标量开销完全消失；FLASH_ATTN_ENABLE_DEBUG=1 构建时才
+// 编译进 [SB] 探针（setup.py 注入 -DENABLE_DEBUG）。
+#ifdef ENABLE_DEBUG
+#define SB_DEBUG_PRINTF(...)                    \
+    do {                                        \
+        if (debugFlag) {                        \
+            AscendC::printf(__VA_ARGS__);       \
+        }                                       \
+    } while (0)
+#else
+#define SB_DEBUG_PRINTF(...) do { } while (0)
+#endif
+
 namespace SplitB {
 
     template <
@@ -147,12 +161,19 @@ namespace SplitB {
             gLse.SetGlobalBuffer((__gm__ float *)params.lse);
 
             uint32_t coreIdx = AscendC::GetBlockIdx();
+            // [O1] B 面驻留条件（形状派生，全核一致）：GQA 且未打包（qNBlockTile==1）。
+            // 预置/排水按此跳过 B 槽 1（ID3）——驻留模式槽 1 全程不用，预置会成跨
+            // launch 孤儿（#44.53g）。推导见 ComputeResidentQK()。
+            residentQK = ComputeResidentQK();
 #ifdef __DAV_C220_CUBE__
             // ① 硬件事件预置：引擎首次 Wait 依赖"已释放"初态（S3 实测教训）。
             //    [#47 清理收敛] CUBE 侧唯一事件消费者 = Pingpong 引擎（presetEvents=false，
             //    宿主接管），在用 ID：MTE1_MTE2{0..3}（l1A/l1B 槽）+ M_MTE1{0..3}（l0A/l0B 槽）；
-            //    其 MTE2_MTE1/MTE1_M 为调用内自配对（免预置）；FIX_M 在 unit-flag 模式不使用。
-            //    预置与末尾 drain 严格镜像（事件收支 launch 内闭合，#44.53g）。
+            //    其 MTE2_MTE1/MTE1_M 为调用内自配对（免预置）。
+            //    [unit_flag=false 挂死修复] FIX_M：unit_flag=true 不使用（#47 删）；
+            //    false 时引擎入口 WaitFlag<FIX_M>(ID0) + 末尾 SetFlag<FIX_M>(ID0)——
+            //    首次 Wait 需预置供票，末次 Set 由 drain 消费（收支 1:1 闭合）。
+            //    用引擎模板参数编译期判定（与 ENABLE_UNIT_FLAG 切换同步）。
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID2);
@@ -160,7 +181,12 @@ namespace SplitB {
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
             AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+            if (!residentQK) {   // [O1] 驻留模式槽 1 不用（见 setBResident 注释）
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+            }
+            if constexpr (!BlockMmadQK::ENABLE_UNIT_FLAG) {
+                AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+            }
             // ② [#46 v3] 通用 Pingpong 引擎（example 01 同款组装）：A/B 面 L1 双缓冲
             //    （l1A/BTensorList[STAGES=2]）+ 两向事件全保护 + 跨调用槽位轮转——
             //    t19 定罪的 l1A 竞态类结构性关闭。局部构造（引擎无默认构造器）；
@@ -240,18 +266,22 @@ namespace SplitB {
             GlobalTensorBundle globalTensors{
                 gQ, gK, gV, gS, gP, gOTmp, gStats, gO, gLse
             };
-            int64_t batchStart = static_cast<int64_t>(coreIdx) * splitFactorSize;
-            int64_t batchEnd = batchStart + splitFactorSize;
-            if (batchSize < batchEnd) {
-                batchEnd = batchSize;                                 // 末核尾裁剪
-            }
+            // [O7] 批区间余数摊平（替代单一尾块）：B 不整除核数时，余数 +1 分散到
+            // 前 R 核（每核 base 或 base+1 批），块间工作量差 ≤1 批。实测旧方案
+            // （ceil 均分 + 尾块裁剪：1024=19×52+36）块间时长不均衡 41.7%；
+            // 摊平后 ~2%。splitFactorSize 保留 ceil 语义（每核批数上限）。
+            const int64_t coreNumDerived = (batchSize + splitFactorSize - 1) / splitFactorSize;
+            const int64_t basePerCore = batchSize / coreNumDerived;
+            const int64_t remPerCore = batchSize % coreNumDerived;
+            const int64_t batchStart = static_cast<int64_t>(coreIdx) * basePerCore +
+                (static_cast<int64_t>(coreIdx) < remPerCore ? static_cast<int64_t>(coreIdx) : remPerCore);
+            const int64_t batchEnd = batchStart + basePerCore +
+                ((static_cast<int64_t>(coreIdx) < remPerCore) ? 1 : 0);
             const int64_t nBatches = (batchEnd > batchStart) ? (batchEnd - batchStart) : 0;
 
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u v%u enter: Batch range:(%u, %u) tile_nums=%u BBBBBBBBBBBBBBBBBBBBB\n",
-                                coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)batchStart, (uint32_t)batchEnd,
-                                curQNBlockNum * curQSBlockNum);
-            }
+            SB_DEBUG_PRINTF("[SB] c%u v%u enter: Batch range:(%u, %u) tile_nums=%u BBBBBBBBBBBBBBBBBBBBB\n",
+                coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)batchStart, (uint32_t)batchEnd,
+                curQNBlockNum * curQSBlockNum);
 
             // ==================== 批间错位流水（v2，devlog #45） ====================
             // 同步拓扑（mode 2 双 AIV 计数器，每批每 flag 收支 1:1）：
@@ -266,54 +296,38 @@ namespace SplitB {
                 // ① 发射新 QK（先发射后等待：QK(bo_t) ∥ softmax(bo_{t-1}) 是核心重叠；
                 //    S 槽(t%2) 覆写安全 = CUBE 迭代序已消费 softmaxReady(bo_{t-2})）
                 if (t < nBatches) {
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S1-QK 1111111111 bo=%u\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S1-QK 1111111111 bo=%u\n",
                                         coreIdx, (uint32_t)t, (uint32_t)boQK);
-                    }
                     StageQK(coreIdx, boQK, globalTensors, blockMmadQKEngine);
                     Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(qkReady);   // QK 全 tile 落 GM 后
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S1-QK 11111EEEEEEE bo=%u\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S1-QK 11111EEEEEEE bo=%u\n",
                                         coreIdx, (uint32_t)t, (uint32_t)boQK);
-                    }
                 }
                 // ② 消费 softmax(bo_{t-1})（PV 数据依赖；t∈[1,n] 共 n 次）
                 if (t >= 1 && t <= nBatches) {
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333331111 before wait softmaxReady (sm of bo=%u)\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S3-PV 333331111 before wait softmaxReady (sm of bo=%u)\n",
                                         coreIdx, (uint32_t)t, (uint32_t)boPV);
-                    }
                     Arch::CrossCoreWaitFlag(softmaxReady);
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333331111 after wait softmaxReady\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S3-PV 333331111 after wait softmaxReady\n",
                                         coreIdx, (uint32_t)t);
-                    }
                 }
                 // ③ 消费 divout(bo_{t-3})（OTmp 槽覆写保护；t∈[3,n+2] 共 n 次，
                 //    末 2 个哨兵迭代补齐尾部 doReady 收支，防跨 launch 计数泄漏）
                 if (t >= 3) {
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333332222 before wait doReady (do of bo=%u)\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S3-PV 333332222 before wait doReady (do of bo=%u)\n",
                                         coreIdx, (uint32_t)t, (uint32_t)(boPV - 2));
-                    }
                     Arch::CrossCoreWaitFlag(doReady);
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 333332222 after wait doReady\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S3-PV 333332222 after wait doReady\n",
                                         coreIdx, (uint32_t)t);
-                    }
                 }
                 // ④ 发射 PV(bo_{t-1})（t∈[1,n]）
                 if (t >= 1 && t <= nBatches) {
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 3333333333 bo=%u\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S3-PV 3333333333 bo=%u\n",
                                         coreIdx, (uint32_t)t, (uint32_t)boPV);
-                    }
                     StagePV(coreIdx, boPV, globalTensors, blockMmadPvEngine);
                     Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);   // PV 全 tile 落 GM 后
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u | pipe t=%u S3-PV 33333EEEEEEEEEEEE bo=%u\n",
+                    SB_DEBUG_PRINTF("[SB] c%u | pipe t=%u S3-PV 33333EEEEEEEEEEEE bo=%u\n",
                                         coreIdx, (uint32_t)t, (uint32_t)boPV);
-                    }
                 }
             }
 #endif
@@ -323,50 +337,36 @@ namespace SplitB {
                 const int64_t boDO = batchStart + t - 2;    // 本迭代 divout 目标批
                 // ① softmax(bo_{t-1})（t∈[1,n]）
                 if (t >= 1 && t <= nBatches) {
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u v%u | pipe t=%u S2-SM 222221111 before wait qkReady (qk of bo=%u)\n",
+                    SB_DEBUG_PRINTF("[SB] c%u v%u | pipe t=%u S2-SM 222221111 before wait qkReady (qk of bo=%u)\n",
                                         coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boSM);
-                    }
                     Arch::CrossCoreWaitFlag(qkReady);
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u v%u | pipe t=%u S2-SM 222221111 after wait qkReady\n",
+                    SB_DEBUG_PRINTF("[SB] c%u v%u | pipe t=%u S2-SM 222221111 after wait qkReady\n",
                                         coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t);
-                    }
                     StageSoftmax(coreIdx, boSM, globalTensors);
                     // PIPE_MTE3：全部 P/stats 拷贝落 GM 后才置位
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u v%u | pipe t=%u S2-SM END 22222EEEEEEE bo=%u\n",
+                    SB_DEBUG_PRINTF("[SB] c%u v%u | pipe t=%u S2-SM END 22222EEEEEEE bo=%u\n",
                                         coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boSM);
-                    }
                 }
                 // ② divout(bo_{t-2})（t∈[2,n+1]；doReady 由 CUBE 哨兵迭代消费）
                 if (t >= 2) {
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u v%u | pipe t=%u S4-DO 444441111 before wait pvReady (pv of bo=%u)\n",
+                    SB_DEBUG_PRINTF("[SB] c%u v%u | pipe t=%u S4-DO 444441111 before wait pvReady (pv of bo=%u)\n",
                                         coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boDO);
-                    }
                     Arch::CrossCoreWaitFlag(pvReady);
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u v%u | pipe t=%u S4-DO 444441111 after wait pvReady\n",
+                    SB_DEBUG_PRINTF("[SB] c%u v%u | pipe t=%u S4-DO 444441111 after wait pvReady\n",
                                         coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t);
-                    }
                     StageDivOut(coreIdx, boDO, globalTensors);
                     // OTmp 槽回收信号：O/LSE 落 GM 后才置位
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(doReady);
-                    if (debugFlag) {
-                        AscendC::printf("[SB] c%u v%u | pipe t=%u S4-DO 44444EEEEEEEEEEE bo=%u\n",
+                    SB_DEBUG_PRINTF("[SB] c%u v%u | pipe t=%u S4-DO 44444EEEEEEEEEEE bo=%u\n",
                                         coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)t, (uint32_t)boDO);
-                    }
                 }
             }
 #endif
 
-            if (debugFlag) {
-                AscendC::printf("[SB] c%u v%u exit: Batch range:(%u, %u) tile_nums=%u EEEEEEEEEEEEEEEEEEEEEE\n",
+            SB_DEBUG_PRINTF("[SB] c%u v%u exit: Batch range:(%u, %u) tile_nums=%u EEEEEEEEEEEEEEEEEEEEEE\n",
                                 coreIdx, AscendC::GetSubBlockIdx(), (uint32_t)batchStart, (uint32_t)batchEnd,
                                 curQNBlockNum * curQSBlockNum);
-            }
 
             // ---- 收尾：事件全量 drain（保证异步拷贝全部落盘；跨核 flag 已每批闭合） ----
 #ifdef __DAV_C220_CUBE__
@@ -376,8 +376,15 @@ namespace SplitB {
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID3);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
+            // [O1] 驻留模式下 ID2 消费末组末头遗留的 +1（收支闭合）；ID3 从未置位不 drain
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+            if (!residentQK) {
+                AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+            }
+            // [unit_flag=false 挂死修复] 消费末次引擎调用的 FIX_M Set（与预置镜像）
+            if constexpr (!BlockMmadQK::ENABLE_UNIT_FLAG) {
+                AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+            }
 #endif
 #ifdef __DAV_C220_VEC__
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
@@ -420,24 +427,57 @@ namespace SplitB {
             // 如 G=6/qN=4 → 4,2），非全循环常量，保留在循环内。
             LayoutK layoutB(static_cast<uint64_t>(strideK), static_cast<uint32_t>(kvSeqlen));
             for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
-                for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
-                    const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
-                    const uint64_t gmQ = static_cast<uint64_t>(boIdx) * qSeqlen * strideQ +
-                        static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile * strideQ +
-                        static_cast<uint64_t>(tg.qNStartIdx) * embed;
-                    const uint64_t gmK = static_cast<uint64_t>(boIdx) * kvSeqlen * strideK +
-                        static_cast<uint64_t>(tg.kvNIdx) * embed;
-                    const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                if (residentQK) {
+                    // [O1] 组主序 + K 驻留：kv 头外层、组内 q 头内层；组首 setBResident
+                    // 一次装载 K 至 B 槽 0，组内 q 头复用（省 G-1 次 GM→L1）。事件收支
+                    // 见 splitb_bm_pingpong.hpp setBResident 注释。
+                    for (uint32_t kvIdx = 0; kvIdx < static_cast<uint32_t>(kvHeads); ++kvIdx) {
+                        const uint64_t gmK = static_cast<uint64_t>(boIdx) * kvSeqlen * strideK +
+                            static_cast<uint64_t>(kvIdx) * embed;
+                        blockMmadQKEngine.setBResident(gK[gmK], layoutB,
+                                                       static_cast<uint32_t>(embed),
+                                                       static_cast<uint32_t>(kvSeqlen));
+                        for (uint32_t g = 0; g < static_cast<uint32_t>(groupSize); ++g) {
+                            const uint32_t qNBlockIdx = kvIdx * static_cast<uint32_t>(groupSize) + g;
+                            const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
+                            const uint64_t gmQ = static_cast<uint64_t>(boIdx) * qSeqlen * strideQ +
+                                static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile * strideQ +
+                                static_cast<uint64_t>(tg.qNStartIdx) * embed;
+                            const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                            if (g > 0) {
+                                blockMmadQKEngine.waitBResidentPrev();
+                            }
+                            typename BlockMmadQK::AOperandBSHD aOperand{
+                                tg.qSBlockSize, tg.qNBlockSize, static_cast<int64_t>(strideQ)};
+                            LayoutS layoutC(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
+                            GemmCoord actualShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
+                                                    static_cast<uint32_t>(embed)};
+                            blockMmadQKEngine(gQ[gmQ], aOperand, gK[gmK], layoutB, gS[sOff], layoutC,
+                                              actualShapeQK);
+                        }
+                        blockMmadQKEngine.clearBResident();
+                    }
+                } else {
+                    // 标准扁平循环（MHA / 打包 GQA：qNBlockIdx 为 tile 序非头序）
+                    for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
+                        const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
+                        const uint64_t gmQ = static_cast<uint64_t>(boIdx) * qSeqlen * strideQ +
+                            static_cast<uint64_t>(qSBlockIdx) * curQSBlockTile * strideQ +
+                            static_cast<uint64_t>(tg.qNStartIdx) * embed;
+                        const uint64_t gmK = static_cast<uint64_t>(boIdx) * kvSeqlen * strideK +
+                            static_cast<uint64_t>(tg.kvNIdx) * embed;
+                        const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
 
-                    // A：BSHD 操作数描述（[B,S,H,D] 头内行距 = H·D；引擎内自装，
-                    // GQA 打包/MHA 单头统一形态）；C：S 头块（行步长 colsPad）
-                    typename BlockMmadQK::AOperandBSHD aOperand{
-                        tg.qSBlockSize, tg.qNBlockSize, static_cast<int64_t>(strideQ)};
-                    LayoutS layoutC(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
-                    GemmCoord actualShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
-                                            static_cast<uint32_t>(embed)};
-                    blockMmadQKEngine(gQ[gmQ], aOperand, gK[gmK], layoutB, gS[sOff], layoutC,
-                                      actualShapeQK);
+                        // A：BSHD 操作数描述（[B,S,H,D] 头内行距 = H·D；引擎内自装，
+                        // GQA 打包/MHA 单头统一形态）；C：S 头块（行步长 colsPad）
+                        typename BlockMmadQK::AOperandBSHD aOperand{
+                            tg.qSBlockSize, tg.qNBlockSize, static_cast<int64_t>(strideQ)};
+                        LayoutS layoutC(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
+                        GemmCoord actualShapeQK{tg.rowNum, static_cast<uint32_t>(kvSeqlen),
+                                                static_cast<uint32_t>(embed)};
+                        blockMmadQKEngine(gQ[gmQ], aOperand, gK[gmK], layoutB, gS[sOff], layoutC,
+                                          actualShapeQK);
+                    }
                 }
             }
 #endif
@@ -505,22 +545,51 @@ namespace SplitB {
             // 即 BSHD 的 n 行跨步）。A/C 面描述依赖尾块（同段1注），保留在循环内。
             LayoutV layoutB(static_cast<uint32_t>(kvSeqlen), static_cast<uint64_t>(strideV));
             for (uint32_t qSBlockIdx = 0; qSBlockIdx < curQSBlockNum; ++qSBlockIdx) {
-                for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
-                    const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
-                    const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
-                    const uint64_t oOff = sOff + sTileElems;
-                    const uint64_t pOff = (batchBuf * tileNumPerBatch + tg.tileIdx) * pSlotElems * 2;
-                    const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
-                        static_cast<uint64_t>(tg.kvNIdx) * embed;
+                if (residentQK) {
+                    // [O1] 组主序 + V 驻留（与段1 K 驻留同款，事件收支见 fork 注释）
+                    for (uint32_t kvIdx = 0; kvIdx < static_cast<uint32_t>(kvHeads); ++kvIdx) {
+                        const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
+                            static_cast<uint64_t>(kvIdx) * embed;
+                        blockMmadPvEngine.setBResident(gV[gmV], layoutB,
+                                                       static_cast<uint32_t>(kvSeqlen),
+                                                       static_cast<uint32_t>(embed));
+                        for (uint32_t g = 0; g < static_cast<uint32_t>(groupSize); ++g) {
+                            const uint32_t qNBlockIdx = kvIdx * static_cast<uint32_t>(groupSize) + g;
+                            const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
+                            const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                            const uint64_t oOff = sOff + sTileElems;
+                            const uint64_t pOff = (batchBuf * tileNumPerBatch + tg.tileIdx) * pSlotElems * 2;
+                            if (g > 0) {
+                                blockMmadPvEngine.waitBResidentPrev();
+                            }
+                            LayoutP layoutA(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
+                            LayoutOTmp layoutC(tg.rowNum, static_cast<uint32_t>(embed), dPad);
+                            GemmCoord actualShapePV{tg.rowNum, static_cast<uint32_t>(embed),
+                                                    static_cast<uint32_t>(kvSeqlen)};
+                            blockMmadPvEngine(gP[pOff], layoutA, gV[gmV], layoutB, gOTmp[oOff], layoutC,
+                                              actualShapePV);
+                        }
+                        blockMmadPvEngine.clearBResident();
+                    }
+                } else {
+                    // 标准扁平循环（MHA / 打包 GQA）
+                    for (uint32_t qNBlockIdx = 0; qNBlockIdx < curQNBlockNum; ++qNBlockIdx) {
+                        const TileGeom tg = GetTileGeom(qSBlockIdx, qNBlockIdx);
+                        const uint64_t sOff = batchBase + tg.tileIdx * perTileElems;
+                        const uint64_t oOff = sOff + sTileElems;
+                        const uint64_t pOff = (batchBuf * tileNumPerBatch + tg.tileIdx) * pSlotElems * 2;
+                        const uint64_t gmV = static_cast<uint64_t>(boIdx) * kvSeqlen * strideV +
+                            static_cast<uint64_t>(tg.kvNIdx) * embed;
 
-                    // A = P 头槽 [rowNum,Sk]（workspace 布局，行步长 colsPad）；
-                    // C = OTmp（行步长 dPad）
-                    LayoutP layoutA(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
-                    LayoutOTmp layoutC(tg.rowNum, static_cast<uint32_t>(embed), dPad);
-                    GemmCoord actualShapePV{tg.rowNum, static_cast<uint32_t>(embed),
-                                            static_cast<uint32_t>(kvSeqlen)};
-                    blockMmadPvEngine(gP[pOff], layoutA, gV[gmV], layoutB, gOTmp[oOff], layoutC,
-                                      actualShapePV);
+                        // A = P 头槽 [rowNum,Sk]（workspace 布局，行步长 colsPad）；
+                        // C = OTmp（行步长 dPad）
+                        LayoutP layoutA(tg.rowNum, static_cast<uint32_t>(kvSeqlen), colsPad);
+                        LayoutOTmp layoutC(tg.rowNum, static_cast<uint32_t>(embed), dPad);
+                        GemmCoord actualShapePV{tg.rowNum, static_cast<uint32_t>(embed),
+                                                static_cast<uint32_t>(kvSeqlen)};
+                        blockMmadPvEngine(gP[pOff], layoutA, gV[gmV], layoutB, gOTmp[oOff], layoutC,
+                                          actualShapePV);
+                    }
                 }
             }
 #endif
@@ -575,6 +644,19 @@ namespace SplitB {
         }
 
     private:
+        // [O1] B 面驻留条件：GQA 且未打包（qNBlockTile==1——打包时同组 q 头已合并进
+        // 一个引擎调用，B 装载无冗余）。与下方几何段同公式（qS 单块 ∧ Sq 16 对齐），
+        // 但只需 qnTile，故独立成函数供预置块先行使用（预置在几何段之前）。
+        __aicore__ inline
+        bool ComputeResidentQK() const
+        {
+            const uint32_t qsTile = GetQSBlockTile(static_cast<uint32_t>(kvSeqlen));
+            const uint32_t qsNum = CeilDiv(static_cast<uint32_t>(qSeqlen), qsTile);
+            const uint32_t qnTile = (qsNum == 1U && (qSeqlen % 16 == 0)) ?
+                GetQNBlockTile(static_cast<uint32_t>(qSeqlen), static_cast<uint32_t>(groupSize)) : 1U;
+            return (groupSize > 1) && (qnTile == 1U);
+        }
+
         // tile 几何（v3.3：qN 打包；MHA 退化为此前的每头一 tile）
         __aicore__ inline
         TileGeom GetTileGeom(uint32_t qSBlockIdx, uint32_t qNBlockIdx) const
@@ -633,6 +715,9 @@ namespace SplitB {
         uint32_t curQSBlockTile;
         uint32_t curQSBlockNum;
 
+        // [O1] B 面驻留启用（形状派生：GQA 且 qNBlockTile==1）；预置/排水按此跳过 ID3
+        bool residentQK;
+
         Arch::Resource<ArchTag> resource;
         Arch::CrossCoreFlag qkReady{QK_READY_ID};
         Arch::CrossCoreFlag softmaxReady{SOFTMAX_READY_ID};
@@ -682,11 +767,12 @@ namespace SplitB {
         // submodule v1.6.1 逐行拷贝 + 生命周期定制；依赖库零改动）。A/B 面 L1 双缓冲，
         // ENABLE_UNIT_FLAG=true（unit flag copyout，example 01 实证组合）
         using DispatchPolicyBM = Gemm::MmadAtlasA2Pingpong<true>;
+        // using DispatchPolicyBM = Gemm::MmadAtlasA2Pingpong<false>;  // FIXME: 临时改为flase 2026年9月1日：测试发现导致FIXP指令周期数降低，但是整体性能变差。
         using QType = Gemm::GemmType<ElementQ, LayoutQ>;
         using KType = Gemm::GemmType<ElementK, LayoutK>;
         using SType = Gemm::GemmType<ElementS, LayoutS>;
         using L1TileShapeQK = GemmShape<128, 128, 128>;   // M≥rowNum、N≥Sk、K≥D（闸门均 ≤128）
-        using L0TileShapeQK = GemmShape<128, 128, 64>;
+        using L0TileShapeQK = GemmShape<128, 128, 64>;  // FIXME: K 维度只分64？太小了吧？为什么只用64，空间不够吗？
         using BlockMmadQK = SplitBBlockMmad<DispatchPolicyBM, L1TileShapeQK, L0TileShapeQK,
                                             QType, KType, SType>;
 
@@ -694,7 +780,7 @@ namespace SplitB {
         using VType = Gemm::GemmType<ElementV, LayoutV>;
         using OTmpType = Gemm::GemmType<ElementOTmp, LayoutOTmp>;
         using L1TileShapePV = GemmShape<128, 128, 128>;   // M≥rowNum、N≥D、K≥Sk
-        using L0TileShapePV = GemmShape<128, 128, 64>;
+        using L0TileShapePV = GemmShape<128, 128, 64>; 
         using BlockMmadPV = SplitBBlockMmad<DispatchPolicyBM, L1TileShapePV, L0TileShapePV,
                                             PType, VType, OTmpType>;
 
