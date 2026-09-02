@@ -226,7 +226,7 @@ public:
         uint32_t srcStride = (embedRound * sizeof(float) - blockLenAligned) / 32;
         if (proTokenNum != 0U) {
             AscendC::DataCopyPad(
-                gOutput[innerOGmOffset + proTokenIdx * oHiddenSize],
+                gOutput[innerOGmOffset + proTokenIdx * oHiddenSize_gmlo],
                 goUbTensor32[innerGOUbOffset],
                 AscendC::DataCopyExtParams(
                     proTokenNum, blockLen, srcStride, (oHiddenSize_gmlo - embed) * sizeof(float), 0));

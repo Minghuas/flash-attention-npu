@@ -110,6 +110,10 @@ test_cases = [
     (torch.bfloat16, 2, 6, 6, 64, 800, 80, 1, 128, True, "TND", True, 0, 256, 2.0, 1, False),
     (torch.bfloat16, 2, 6, 1, 1, 131072, 59, 1, 128, True, "TND", True, 542, 647, 2.0, 1, False),
     (torch.bfloat16, 2, 6, 3, 1, 339, 256, 1, 128, True, "TND", True, 542, 647, 0.0, 1, False),
+    # Flash Decode with the maximum supported head dim: minimum decode,
+    (torch.bfloat16, 1, 1, 1, 1, 4096, 256, 1, 128, False, "TND", True, -1, -1, 0.0, 0, False),
+    (torch.float16, 1, 8, 1, 16, 4096, 256, 1, 128, True, "TND", True, -1, -1, 0.0, 1, False),
+    (torch.bfloat16, 1, 8, 1, 1, 4096, 256, 1, 128, False, "TND", True, -1, -1, 0.0, 2, False),
     # Tiny head sizes: 1, 2, and 4
     (torch.bfloat16, 2, 6, 6, 256, 512, 1, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, False),
     (torch.bfloat16, 2, 6, 6, 256, 512, 2, 0, 128, True, "BSND", False, -1, -1, 0.0, 0, False),

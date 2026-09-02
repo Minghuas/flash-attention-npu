@@ -12,6 +12,8 @@
 namespace {
 constexpr uint32_t Q_TILE_CEIL = 128;
 constexpr uint32_t N_SPLIT_HELPER = 2;
+// Keep in sync with FaiKenel::MaskType::MASK_BAND.
+constexpr uint32_t MASK_TYPE_BAND = 2;
 
 inline uint32_t CeilDiv(uint32_t a, uint32_t b)
 {
@@ -120,6 +122,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadata(void *args)
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
         const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * bd) && (maxKvSeqlen >= 1024u);
         const bool fdFlag = (metaArgs->pagedKV != 0) && (metaArgs->isVarlen != 0) &&
+            (metaArgs->maskType != MASK_TYPE_BAND) &&
             (maxQ * groupSize <= 128u) && (maxQ <= 16u) &&
             (maxKvSeqlen >= 1024u) && (minQ > 0u) && (isLongSeq || isShortSeq);
         tilingData->flashDecodeFlag = fdFlag ? 1u : 0u;

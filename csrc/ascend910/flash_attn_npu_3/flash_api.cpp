@@ -396,7 +396,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         maskDevice = hasMask ? metaBase : nullptr;
         int64_t wsBase = static_cast<int64_t>(fa_metadata::WorkSpaceSize(blockDim));
         int64_t wsSplit = 0;
-        if (paged_KV && is_varlen_q) {
+        if (paged_KV && is_varlen_q && !is_local) {
             int64_t maxKvUpper = static_cast<int64_t>(max_num_blocks_per_seq) * page_block_size;
             int64_t kvSegUpper = maxKvUpper / 512 + 1;
             int64_t lseTasksUpper = static_cast<int64_t>(num_heads) * seqlen_q * kvSegUpper * 2;
@@ -516,7 +516,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             (maxKVSeqlenCalc >= 1024);
         TORCH_CHECK(num_splits <= 1 || (paged_KV && is_varlen_q),
                     "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
-        flashDecodeFlag = paged_KV && is_varlen_q && head_size_og <= 128 &&
+        flashDecodeFlag = paged_KV && is_varlen_q && !is_local &&
             (maxQSeqlenCalc * groupSize <= 128) && (maxQSeqlenCalc <= 16) &&
             (maxKVSeqlenCalc >= 1024) && (minQSeqlenCalc > 0) && (isLongSeq || isShortSeq);
         tiling_cpu_ptr->set_flashDecodeFlag(flashDecodeFlag ? 1U : 0U);
