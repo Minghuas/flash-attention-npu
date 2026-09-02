@@ -86,8 +86,8 @@ public:
         // Allocate UB space
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 8 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
 
+        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 10 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
@@ -102,7 +102,7 @@ public:
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GO_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
-        lse32_ubuf_tensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_TENSOR_OFFSET);
+        lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_TENSOR_OFFSET);
     }
 
     __aicore__ inline
@@ -140,6 +140,9 @@ public:
                 LSE_OUT_INI,
                 (end - start) * FLOAT_BLOCK_SIZE
             );
+            if (start == 0U) {
+                AscendC::Duplicate(lseUbTensor[start], LSE_OUT_INI, (end - start));
+            }
         }
         if (qNThisSubBlock == 0U && delEndRow != qSeqlen && qNSubBlockStartOffset < delEndRow) {
             uint32_t rowStart = qNSubBlockStartOffset;
@@ -150,6 +153,11 @@ public:
                 tvUbTensor[start * FLOAT_BLOCK_SIZE],
                 LSE_OUT_INI,
                 (end - start) * FLOAT_BLOCK_SIZE
+            );
+            AscendC::Duplicate(
+                lseUbTensor[start],
+                LSE_OUT_INI,
+                (end - start)
             );
         }
         if (qNThisSubBlock != 0U && delStartRow != 0 && qNSubBlockEnbdOffset >= delStartRow) {
@@ -531,15 +539,15 @@ public:
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Ln<float, false>(
-                        lse32_ubuf_tensor,
+                        lseUbTensor,
                         glUbTensor,
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Add<float, false>(
-                        lse32_ubuf_tensor,
-                        lse32_ubuf_tensor,
+                        lseUbTensor,
+                        lseUbTensor,
                         gmUbTensor,
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
@@ -548,7 +556,7 @@ public:
                     // *** lse_block = expand_to_block(lse)
                     AscendC::Brcb(
                         tvUbTensor.ReinterpretCast<uint32_t>(),
-                        lse32_ubuf_tensor.ReinterpretCast<uint32_t>(),
+                        lseUbTensor.ReinterpretCast<uint32_t>(),
                         CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                         AscendC::BrcbRepeatParams(1, 8));
                     InvalidLineLSEProcess(qNThisSubBlock, delStartRow, qSBlockIdx,
@@ -559,35 +567,46 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
 
-                    if (qNThisSubBlock == 0U) {
-                        if (splitParams.isSplitkv) {
+                    if (splitParams.isSplitkv) {
+                        // isSplitkv: per-head strided write to token-major gCombineLse. UNCHANGED.
+                        if (qNThisSubBlock == 0U) {
                             AscendC::DataCopyPad(
                                 splitParams.gCombineLse, tvUbTensor,
                                 AscendC::DataCopyExtParams(
                                     totalRowNum, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                         } else {
-                            AscendC::DataCopyPad(
-                                gLse, tvUbTensor,
-                                AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0, 0, 0));
-                        }
-                    } else {
-                        for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                            if (splitParams.isSplitkv) {
+                            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
                                 AscendC::DataCopyPad(
                                     splitParams.gCombineLse[qNIdx],
                                     tvUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
                                     AscendC::DataCopyExtParams(
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
-                            } else {
-                                // Final LSE is head-major (num_heads, total_q): head stride =
-                                // totalQTokens. The old `qNIdx * qSBlockSize` used the per-tile q
-                                // count as the head stride, packing heads too tightly whenever the
-                                // tile covers < totalQTokens q-tokens, so heads landed at the wrong
-                                // (head,q) and the true slots stayed unwritten (+inf).
+                            }
+                        }
+                    } else {
+                        if (qNThisSubBlock == 0U) {
+                            uint32_t qNSubBlockStartOffset = qSBlockIdx * VECTOR_SIZE + inRowOffsetThisSubBlock;
+                            uint32_t qNSubBlockEnbdOffset = totalRowNum + qNSubBlockStartOffset;
+                            if (delStartRow != 0 && qNSubBlockEnbdOffset >= delStartRow && qNSubBlockStartOffset <= delStartRow) {
                                 AscendC::DataCopyPad(
-                                    gLse[qNIdx * layoutLse.stride(0)],
-                                    tvUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
-                                    AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0, 0, 0));
+                                    gLse, tvUbTensor,
+                                    AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0, 0, 0));
+                            } else {
+                                AscendC::DataCopyPad(
+                                    gLse, lseUbTensor,
+                                    AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
+                            }
+                        } else {
+                            // multi-head: per-token gather (srcStride) + scatter (dstStride).
+                            uint32_t lseHeadStrideGm = layoutLse.stride(0);  // S_q, BNS/NT head stride
+                            for (uint32_t sIdx = 0; sIdx < qSBlockSize; sIdx++) {
+                                AscendC::DataCopyPad(
+                                    gLse[sIdx],
+                                    tvUbTensor[sIdx * FLOAT_BLOCK_SIZE],
+                                    AscendC::DataCopyExtParams(
+                                        qNThisSubBlock, sizeof(float),
+                                        qSBlockSize - 1,
+                                        (lseHeadStrideGm - 1) * sizeof(float), 0));
                             }
                         }
                     }
@@ -600,15 +619,15 @@ public:
                     if (isLastRowLoop) {
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Ln<float, false>(
-                            lse32_ubuf_tensor,
+                            lseUbTensor,
                             glUbTensor,
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Add<float, false>(
-                            lse32_ubuf_tensor,
-                            lse32_ubuf_tensor,
+                            lseUbTensor,
+                            lseUbTensor,
                             gmUbTensor,
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
@@ -616,7 +635,7 @@ public:
 
                         AscendC::Brcb(
                             tvUbTensor.ReinterpretCast<uint32_t>(),
-                            lse32_ubuf_tensor.ReinterpretCast<uint32_t>(),
+                            lseUbTensor.ReinterpretCast<uint32_t>(),
                             CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                             AscendC::BrcbRepeatParams(1, 8));
                         AscendC::PipeBarrier<PIPE_V>();
@@ -811,7 +830,7 @@ private:
     AscendC::LocalTensor<ElementOutput> goUbTensor16;
     AscendC::LocalTensor<float> goUbTensor32;
     AscendC::LocalTensor<float> gmUbTensor;
-    AscendC::LocalTensor<float> lse32_ubuf_tensor;
+    AscendC::LocalTensor<float> lseUbTensor;
 };
 
 }

@@ -745,11 +745,16 @@ namespace SplitFuse {
                                     false);
                             }
                         } else {
-                            uint32_t noMaskStackSeqNum = (triUp + 1) / MAX_KV_STACK_LEN;
+                            uint32_t lastNoMaskTile;
+                            if (triUp + 1U == kvSeqlen) {
+                                lastNoMaskTile = kvSLoopNumTotal - 1U;
+                            } else {
+                                lastNoMaskTile = (triUp + 1U) / MAX_KV_STACK_LEN - 1U;
+                            }
                             Arch::CrossCoreWaitFlag(qkReady);
                             int32_t lastNoMaskStackId;
                             if (flashDecodeFlag != 0U) {
-                                lastNoMaskStackId = (int32_t)noMaskStackSeqNum - 1 - (int32_t)kvStart;
+                                lastNoMaskStackId = (int32_t)lastNoMaskTile - (int32_t)kvStart;
                                 epilogueOnlineSoftmax(
                                     gP[gmOffsetP],
                                     gS[gmOffsetS],
@@ -770,7 +775,7 @@ namespace SplitFuse {
                                     layOutS,
                                     actualBlockShapeQK,
                                     (stackSeqCount == 0),
-                                    (stackSeqCount == noMaskStackSeqNum - 1),
+                                    (stackSeqCount == lastNoMaskTile),
                                     qSBlockSize,
                                     qNBlockSize,
                                     curStackTileMod,
@@ -1070,7 +1075,7 @@ namespace SplitFuse {
         using LayoutO = layout::RowMajor;
         using ElementLse = float;
         using LayoutLse = layout::RowMajor;
-        using ElementMask = int8_t;
+        using ElementMask = uint8_t;
         using LayoutMask = layout::RowMajor;
         using ElementOTmp = IntermCalcPrec;
         using LayoutOTmp = layout::RowMajor;
