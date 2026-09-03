@@ -147,6 +147,8 @@ public:
         kL1BufNum_ = faiTilingData->kL1BufNum;
         vL1BufNum_ = faiTilingData->vL1BufNum;
         pL1BufNum_ = faiTilingData->pL1BufNum;
+        windowSizeLeft_ = faiTilingData->windowSizeLeft;
+        windowSizeRight_ = faiTilingData->windowSizeRight;
         flashDecodeFlag_ = faiTilingData->flashDecodeFlag;
         fdCombineTaskNum_ = faiTilingData->fdCombineTaskNum;
         fdRowCapacity_ = faiTilingData->fdRowCapacity;
@@ -367,7 +369,18 @@ public:
             uint32_t qkRowNumRound = rowNumRound;
             uint32_t kvSTileSizeAct = kvBaseTile_;
 
+            uint32_t kvStart = 0;
             uint32_t noSkipKvS = static_cast<uint32_t>(kvSeqlen);
+            uint32_t kvSLoopNum = 0;
+            int32_t windowSizeLeftStartLen = 0;
+            int32_t windowSizeLeftEndLen = 0;
+            int32_t windowSizeRightStartLen = 0;
+            int32_t windowSizeRightEndLen = 0;
+            bool notPreMask = true;
+            bool notNextMask = true;
+            int32_t delStartRow = 0;
+            int32_t delEndRow = static_cast<int32_t>(qSeqlen);
+            const int32_t qSTileStart = static_cast<int32_t>(qSTileIdx * qBaseTile_);
             if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                 int64_t causalKvEnd = static_cast<int64_t>(qSTileIdx + 1U) * qBaseTile_
                     + kvSeqlen - qSeqlen;
@@ -375,15 +388,76 @@ public:
                     causalKvEnd = 0;
                 }
                 noSkipKvS = AscendC::Std::min((uint32_t)kvSeqlen, (uint32_t)causalKvEnd);
-            }
+                kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
+            } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+                const int32_t T = static_cast<int32_t>(kvBaseTile_);
+                // Window bounds are in Q-token space; use real S tile length, not rowNum (qS*qN).
+                const int32_t qSTileLen = static_cast<int32_t>(qSBlockSize);
+                const int32_t kvSeqlenI = static_cast<int32_t>(kvSeqlen);
+                const int32_t qSeqlenI = static_cast<int32_t>(qSeqlen);
+                const int32_t wL = static_cast<int32_t>(windowSizeLeft_);
+                const int32_t wR = static_cast<int32_t>(windowSizeRight_);
+                int32_t kvSLoopNumI = 0;
+                int32_t leftPoint_L = kvSeqlenI;
+                int32_t leftPoint_R = 0;
+                   
+                if (wL < 0 && (-wL) >= qSeqlenI) {
+                    kvStart = static_cast<uint32_t>(kvSeqlenI / T + 1);
+                } else if (wL != static_cast<int32_t>(SPARSE_MODE_INT_MAX)) {
+                    leftPoint_L = kvSeqlenI - qSeqlenI - wL;
+                    windowSizeLeftStartLen = qSTileStart + leftPoint_L;
+                    windowSizeLeftEndLen = qSTileStart + qSTileLen + leftPoint_L;
+                    kvStart = static_cast<uint32_t>(
+                        AscendC::Std::max(static_cast<int32_t>(0), windowSizeLeftStartLen) / T);
+                    notPreMask = false;
+                } else {
+                    kvStart = 0;
+                }
 
-            uint32_t kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
+                if (wR < 0 && (-wR) >= kvSeqlenI) {
+                    noSkipKvS = 0;
+                    kvSLoopNumI = 0;
+                } else if (wR != static_cast<int32_t>(SPARSE_MODE_INT_MAX)) {
+                    leftPoint_R = kvSeqlenI - qSeqlenI + wR;
+                    windowSizeRightStartLen = qSTileStart + leftPoint_R;
+                    windowSizeRightEndLen = qSTileStart + qSTileLen + leftPoint_R;
+                    if (windowSizeRightEndLen <= 0) {
+                        noSkipKvS = 0;
+                        kvSLoopNumI = 0;
+                    } else {
+                        int32_t noSkipI = AscendC::Std::min(
+                            kvSeqlenI, RoundUp(windowSizeRightEndLen, T));
+                        noSkipKvS = static_cast<uint32_t>(noSkipI);
+                        kvSLoopNumI = static_cast<int32_t>(CeilDiv(noSkipI, T));
+                        notNextMask = false;
+                    }
+                } else {
+                    noSkipKvS = static_cast<uint32_t>(kvSeqlenI);
+                    kvSLoopNumI = static_cast<int32_t>(CeilDiv(kvSeqlenI, T));
+                }
+                kvSLoopNum = static_cast<uint32_t>(kvSLoopNumI < 0 ? 0 : kvSLoopNumI);
+
+                if (windowSizeLeftEndLen > kvSeqlenI &&
+                    wL != static_cast<int32_t>(SPARSE_MODE_INT_MAX)) {
+                    delStartRow = kvSeqlenI - leftPoint_L;
+                } else if (windowSizeRightStartLen < 0 &&
+                           wR != static_cast<int32_t>(SPARSE_MODE_INT_MAX)) {
+                    delEndRow = -leftPoint_R;
+                }
+            } else {
+                kvSLoopNum = static_cast<uint32_t>(CeilDiv(noSkipKvS, static_cast<int64_t>(kvBaseTile_)));
+            }
 
             uint32_t fullyMaskedRowsPerHead = 0;
             if constexpr (maskCategory == MaskCategory::MASK_CAUSAL) {
                 fullyMaskedRowsPerHead = noSkipKvS < qSBlockSize ? qSBlockSize - noSkipKvS : 0;
             }
-            if (kvSLoopNum == 0) {
+
+            bool emptySpan = (kvSLoopNum == 0);
+            if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+                emptySpan = emptySpan || (kvStart >= kvSLoopNum);
+            }
+            if (emptySpan) {
 #ifdef __DAV_VEC__
                 initOutputs.template operator()<LseMode>(
                     gO[gmOffsetO],
@@ -396,7 +470,7 @@ public:
 #endif
                 continue;
             }
-            uint32_t kvSplitStart = 0U;
+            uint32_t kvSplitStart = kvStart;
             uint32_t kvSplitEnd = kvSLoopNum;
             bool writePartial = false;
             uint32_t partialId = 0U;
@@ -566,6 +640,51 @@ public:
                                 qSBlockSize,
                                 qNBlockSize);
                         }
+                    } else if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+                        auto gmMaskLayoutTla = tla::MakeLayout<ElementMask, LayoutMask>(2048, 2048);
+                        auto gmMaskTensorTla = tla::MakeTensor(gMask, gmMaskLayoutTla, Arch::PositionGM{});
+                        int32_t kvSStartIdxI = static_cast<int32_t>(kvSTileIdx * kvBaseTile_);
+                        int32_t kvSEndIdxI = kvSStartIdxI + static_cast<int32_t>(kvSTileSizeAct);
+                        bool doTriUPreMask = notPreMask ? false :
+                            (windowSizeLeftStartLen >= kvSStartIdxI && windowSizeLeftStartLen < kvSEndIdxI) ||
+                            (windowSizeLeftEndLen > kvSStartIdxI && windowSizeLeftEndLen <= kvSEndIdxI) ||
+                            (windowSizeLeftStartLen <= kvSStartIdxI && windowSizeLeftEndLen >= kvSEndIdxI);
+                        bool doTriUNextMask = notNextMask ? false :
+                            (windowSizeRightStartLen >= kvSStartIdxI && windowSizeRightStartLen < kvSEndIdxI) ||
+                            (windowSizeRightEndLen > kvSStartIdxI && windowSizeRightEndLen <= kvSEndIdxI) ||
+                            (windowSizeRightStartLen <= kvSStartIdxI && windowSizeRightEndLen >= kvSEndIdxI);
+                        if (doTriUPreMask || doTriUNextMask) {
+                            epilogueOnlineSoftmax(
+                                l1PTensorTla,
+                                gmMaskTensorTla,
+                                actualBlockShapeQK,
+                                (kvSTileRelIdx == 0),
+                                ubSBufId,
+                                l1PBufId,
+                                qkReadyFlag,
+                                softmaxReadyFlag,
+                                kvSStartIdxI,
+                                doTriUPreMask,
+                                doTriUNextMask,
+                                windowSizeLeftStartLen,
+                                windowSizeLeftEndLen,
+                                windowSizeRightStartLen,
+                                windowSizeRightEndLen,
+                                qSBlockSize,
+                                qNBlockSize,
+                                1u);
+                        } else {
+                            epilogueOnlineSoftmax(
+                                l1PTensorTla,
+                                actualBlockShapeQK,
+                                (kvSTileRelIdx == 0),
+                                ubSBufId,
+                                l1PBufId,
+                                qkReadyFlag,
+                                softmaxReadyFlag,
+                                qSBlockSize,
+                                qNBlockSize);
+                        }
                     } else {
                         if constexpr (IsDN) {
                             epilogueOnlineSoftmax(
@@ -635,16 +754,30 @@ public:
 #ifdef __DAV_VEC__
                     Arch::CrossCoreFlag pvReadyFlag(pvReadyFlagId);
                     uint32_t curTileMod = pipelineTileSeqNow % (PRE_LAUNCH + 1);
+                    uint32_t fmRowsPerHead = fullyMaskedRowsPerHead;
+                    int32_t swaDelStartRow = 0;
+                    int32_t swaDelEndRow = 0;
+                    uint32_t swaQSeqlen = 0;
+                    uint32_t swaQSTileStart = 0;
+                    if constexpr (maskCategory == MaskCategory::MASK_SWA) {
+                        fmRowsPerHead = 0U;
+                        swaDelStartRow = delStartRow;
+                        swaDelEndRow = delEndRow;
+                        swaQSeqlen = static_cast<uint32_t>(qSeqlen);
+                        swaQSTileStart = static_cast<uint32_t>(qSTileStart);
+                    }
                     epilogueRescaleO.template operator()<LseMode>(
                         gmOTensorTla, gLse[lseOffset], actualBlockShapePV,
                         curTileMod, pipelineTileSeqNow,
                         (kvSTileRelIdxNow == 0),
                         (kvSTileRelIdxNow == kvSLoopCount - 1),
                         pvReadyFlag, IsDN,
-                        fullyMaskedRowsPerHead,
+                        fmRowsPerHead,
                         qSBlockSize, qNBlockSize,
                         lseHeadStride,
                         static_cast<uint32_t>(strideO),
+                        swaDelStartRow, swaDelEndRow,
+                        swaQSeqlen, swaQSTileStart,
                         gPartialO, gPartialLse,
                         writePartial && !IsDN, partialId,
                         fdRowCapacity_, fdLseSubStride_);
@@ -839,6 +972,9 @@ private:
     uint32_t kL1BufNum_;
     uint32_t vL1BufNum_;
     uint32_t pL1BufNum_;
+
+    int64_t windowSizeLeft_ = 0;
+    int64_t windowSizeRight_ = 0;
 
     uint32_t qkL0ATotalStages_;
     uint32_t qkL0BTotalStages_;

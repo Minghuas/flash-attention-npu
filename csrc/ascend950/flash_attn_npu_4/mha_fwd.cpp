@@ -8,13 +8,14 @@
  *   ✅ Paged KV (page_table)
  *   ✅ MQA / GQA
  *   ✅ Varlen Q (cu_seqlens_q + max_seqlen_q)
- *   ❌ return_softmax_lse (lse always emitted; wrapper drops it on demand)
- *   ❌ SWA / window_size != (-1, -1)
+ *   ✅ return_softmax_lse
+ *   ✅ SWA / window_size (host normalize + MASK_SWA dispatch)
  *   ✅ num_splits (FlashDecode for paged KV + TND)
  *   ❌ pack_gqa, min_seqlen_k, gather_kv_indices, learnable_sink
  *   ❌ softcap
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -98,8 +99,6 @@ mha_fwd(at::Tensor q,
     TORCH_CHECK(!learnable_sink_.has_value(),
                 "950 backend (v4) does not support learnable_sink");
     TORCH_CHECK(softcap == 0.0f, "950 backend (v4) does not support softcap");
-    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
-                "950 backend (v4) does not support SWA");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v4) requires num_splits in [0, ", blockDim, "]");
     TORCH_CHECK(!pack_gqa_.has_value() || !pack_gqa_.value(),
@@ -266,7 +265,29 @@ mha_fwd(at::Tensor q,
         max_q_seqlen = std::max(max_q_seqlen, q_len);
         max_kv_seqlen = std::max(max_kv_seqlen, kv_len);
     }
-    const bool fd_shape_supported = paged_KV && is_varlen_q &&
+
+    // 6b. SWA / causal host normalize
+    if (max_kv_seqlen > 0 && window_size_left >= max_kv_seqlen) {
+        window_size_left = -1;
+    }
+    if (max_kv_seqlen > 0 && window_size_right >= max_kv_seqlen) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = (window_size_left < 0 && window_size_right == 0);
+    bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    if (is_local) {
+        if (window_size_left < 0) {
+            window_size_left = max_kv_seqlen;
+        }
+        if (window_size_right < 0) {
+            window_size_right = max_kv_seqlen;
+        }
+    }
+
+    const bool fd_shape_supported = !is_local && paged_KV && is_varlen_q &&
         min_q_seqlen > 0 && max_q_seqlen <= 16 && max_kv_seqlen >= 1024;
     // The tiler applies the small-task gate after building the same merged
     // Q-head tasks as the normal FA path.  Do not pre-gate with num_heads,
@@ -284,7 +305,11 @@ mha_fwd(at::Tensor q,
         is_varlen_q ? &cu_seqlen_q_cpu : nullptr,
         &seqlens_k_cpu,
         paged_KV, page_block_size, num_blocks, max_num_blocks_per_seq,
-        is_causal, is_varlen_q, is_bf16,
+        is_causal,
+        is_local,
+        /* window_size_left= */ is_local ? window_size_left : 0,
+        /* window_size_right= */ is_local ? window_size_right : 0,
+        is_varlen_q, is_bf16,
         batch_size, seqlen_q, num_heads, num_heads_k,
         head_size_q, head_size_v,
         softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))),
@@ -348,8 +373,10 @@ mha_fwd(at::Tensor q,
     // 10. Launch via launch_fwd
     // ============================================================
     const Format fmt = is_varlen_q ? Format::TND : Format::BSND;
-    const MaskCategory mask_category = is_causal ? MaskCategory::MASK_CAUSAL
-                                                 : MaskCategory::NO_MASK;
+    const MaskCategory mask_category =
+        is_local ? MaskCategory::MASK_SWA
+                 : (is_causal ? MaskCategory::MASK_CAUSAL
+                              : MaskCategory::NO_MASK);
 
     // device pointers
     auto qDev = static_cast<uint8_t*>(q.data_ptr());
@@ -393,14 +420,14 @@ mha_fwd(at::Tensor q,
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
     at::Tensor mask_cpu_tensor;
-    if (is_causal) {
+    if (is_causal || is_local) {
         mask_cpu_tensor = at::empty({2048, 2048}, at::device(c10::kCPU).dtype(at::kByte));
         mask_cpu_tensor = at::triu(at::ones_like(mask_cpu_tensor), 1);
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
         maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
 
-    const bool enableDN = !flashDecodeEnabled && (!is_causal) &&
+    const bool enableDN = !flashDecodeEnabled && (!is_causal) && (!is_local) &&
         (head_size_q <= 256) && (head_size_v <= 256);
     const uint32_t launchBlockDim = flashDecodeEnabled ?
         tilingData.fdActiveCoreNum : blockDim;

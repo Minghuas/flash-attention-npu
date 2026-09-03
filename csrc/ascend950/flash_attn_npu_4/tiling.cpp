@@ -35,7 +35,8 @@ namespace optiling{
 
     enum class MaskType : uint32_t {
         NO_MASK = 0,
-        MASK_SPEC = 1
+        MASK_SPEC = 1,
+        MASK_BAND = 2
     };
 
     enum class DataType : uint32_t {
@@ -57,6 +58,8 @@ namespace optiling{
         int64_t maxKvSeqlen = 0;
         int64_t preToken = 0;
         int64_t nextToken = 0;
+        int64_t windowSizeLeft = 0;
+        int64_t windowSizeRight = 0;
         int32_t sparseMode = 0;
         uint32_t maxNumBlocksPerBatch = 0;
         const int64_t *qSeqlenList{nullptr};
@@ -171,7 +174,9 @@ namespace optiling{
         faTilingData.requestedNumSplits = faInfo_.numSplits;
         faTilingData.set_preToken(static_cast<int64_t>(faInfo_.preToken));
         faTilingData.set_nextToken(static_cast<int64_t>(faInfo_.nextToken));
-        
+        faTilingData.set_windowSizeLeft(faInfo_.windowSizeLeft);
+        faTilingData.set_windowSizeRight(faInfo_.windowSizeRight);
+
         auto qBaseTile_ = GetQSBlockTile(faInfo_.maxKvSeqlen);
         auto kvBaseTile_ = BASE_KV_SIZE;
         auto embeddingSizeAligned16_ =
