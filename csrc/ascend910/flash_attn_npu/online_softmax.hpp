@@ -82,16 +82,18 @@ public:
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
 
-        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 10 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t LL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 11 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t ALIBI_WORK_UB_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t DROP_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 2 * UB_UINT8_VECTOR_SIZE;
+
+        constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t ALIBI_WORK_UB_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t LM_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t HM_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE + UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t LL_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE + 2 * UB_UINT8_VECTOR_SIZE;
+
+        constexpr uint32_t DROP_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE + 6 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t TV_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
@@ -117,6 +119,12 @@ public:
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
         alibiWorkUb = resource.ubBuf.template GetBufferByByte<float>(ALIBI_WORK_UB_OFFSET);
         dropUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(DROP_UB_TENSOR_OFFSET);
+    }
+
+    __aicore__ inline
+    void set_taskOffset(uint32_t curTaskMod)
+    {
+        taskOffset = curTaskMod * ((4 * UB_UINT8_VECTOR_SIZE) / sizeof(float));
     }
     
     __aicore__ inline
@@ -660,15 +668,15 @@ public:
             AscendC::Max<float, false>(
                 hmUbTensor[rowOffset],
                 lmUbTensor[rowOffset],
-                gmUbTensor[rowOffset],
+                gmUbTensor[taskOffset][rowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
             // *** dm = gm - hm
             AscendC::Sub<float, false>(
-                dmUbTensor[dmUbOffsetCurCycle],
-                gmUbTensor[rowOffset],
+                dmUbTensor[taskOffset][dmUbOffsetCurCycle],
+                gmUbTensor[taskOffset][rowOffset],
                 hmUbTensor[rowOffset],
                 (uint64_t)0,
                 1,
@@ -676,8 +684,8 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             // *** dm = exp(dm)
             AscendC::Exp<float, false>(
-                dmUbTensor[dmUbOffsetCurCycle],
-                dmUbTensor[dmUbOffsetCurCycle],
+                dmUbTensor[taskOffset][dmUbOffsetCurCycle],
+                dmUbTensor[taskOffset][dmUbOffsetCurCycle],
                 (uint64_t)0,
                 1,
                 AscendC::UnaryRepeatParams(1, 1, 8, 8));
@@ -686,7 +694,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         // *** gm = hm
         AscendC::DataCopy(
-            gmUbTensor[rowOffset],
+            gmUbTensor[taskOffset][rowOffset],
             hmUbTensor[rowOffset],
             AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
         AscendC::PipeBarrier<PIPE_V>();
@@ -776,7 +784,7 @@ public:
         if (isFirstStackTile) {
             // *** gl = ll
             AscendC::DataCopy(
-                glUbTensor[rowOffset],
+                glUbTensor[taskOffset][rowOffset],
                 llUbTensor[rowOffset],
                 AscendC::DataCopyParams(1, rowNumCurLoopRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::PipeBarrier<PIPE_V>();
@@ -784,17 +792,17 @@ public:
             SetVecMask(rowNumCurLoop);
             // *** gl = dm * gl
             AscendC::Mul<float, false>(
-                glUbTensor[rowOffset],
-                dmUbTensor[dmUbOffsetCurCycle],
-                glUbTensor[rowOffset],
+                glUbTensor[taskOffset][rowOffset],
+                dmUbTensor[taskOffset][dmUbOffsetCurCycle],
+                glUbTensor[taskOffset][rowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
             // *** gl = ll + gl
             AscendC::Add<float, false>(
-                glUbTensor[rowOffset],
-                glUbTensor[rowOffset],
+                glUbTensor[taskOffset][rowOffset],
+                glUbTensor[taskOffset][rowOffset],
                 llUbTensor[rowOffset],
                 (uint64_t)0,
                 1,
@@ -941,16 +949,6 @@ public:
         uint32_t columnNumPad = layoutOutput.stride(0);
         uint32_t sUbOffset = pingpongFlag * MAX_UB_S_ELEM_NUM;
         uint32_t dmUbOffsetCurCycle = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffset;
-
-        if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
-            if (isFirstStackTile && isFirstRowLoop) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
-            }
-        } else {
-            if (isFirstStackTile && isFirstRowLoop && isSplitKV) {
-                AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
-            }
-        }
 
         if constexpr (HAS_DROPOUT_) {
             uint32_t qNOffset = (rowOffsetIoGm / qSBlockSize) * strideDrop;
@@ -1563,6 +1561,7 @@ public:
 private:
     float scaleValue;
     float softcapValue;
+    uint32_t taskOffset;
     uint64_t gmOffsetPret;
     uint64_t stridePret;
     uint64_t gmOffsetDrop;

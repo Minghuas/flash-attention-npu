@@ -510,7 +510,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
         }
 
         uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
-        uint64_t PRELANCH_NUM = 3;
+        uint64_t PRELANCH_NUM = 2;
         uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
             4 * PRELANCH_NUM;
         uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
@@ -772,7 +772,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
 
         // set worksapce
         uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
-        uint64_t PRELANCH_NUM = 3;
+        uint64_t PRELANCH_NUM = 2;
         uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
             4 * PRELANCH_NUM;
         uint64_t smOnlineOutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
@@ -1107,7 +1107,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
             has_dropout ? static_cast<uint8_t*>(const_cast<void*>(drop_mask_npu_tensor.data_ptr())) : nullptr);
 
         uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;  // 工作空间块大小 ，每次计算128 * 512
-        uint64_t PRELANCH_NUM = 3;
+        uint64_t PRELANCH_NUM = 2;
 
         uint64_t mm1OutSize = static_cast<uint64_t>(blockDim) * WORKSPACE_BLOCK_SIZE_DB *
             4 * PRELANCH_NUM;

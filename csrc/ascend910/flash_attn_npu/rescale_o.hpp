@@ -88,12 +88,12 @@ public:
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 8 * UB_UINT8_BLOCK_SIZE;
 
-        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 10 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t LSE_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t GM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t LSE_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 2 * UB_UINT8_VECTOR_SIZE;
+
+        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
 
         dropoutValue = dropoutValue_;
 
@@ -103,9 +103,14 @@ public:
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementOutput>(GO_UB_TENSOR_OFFSET);
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GO_UB_TENSOR_OFFSET);
-        hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         lseUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_UB_TENSOR_OFFSET);
+    }
+
+    __aicore__ inline
+    void set_taskOffset(uint32_t curTaskMod)
+    {
+        taskOffset = curTaskMod * ((4 * UB_UINT8_VECTOR_SIZE) / sizeof(float));
     }
 
     __aicore__ inline
@@ -144,7 +149,7 @@ public:
                 (end - start) * FLOAT_BLOCK_SIZE
             );
             if (start == 0U) {
-                AscendC::Duplicate(lseUbTensor[start], LSE_OUT_INI, (end - start));
+                AscendC::Duplicate(lseUbTensor[taskOffset][start], LSE_OUT_INI, (end - start));
             }
         }
         if (qNThisSubBlock == 0U && delEndRow != qSeqlen && qNSubBlockStartOffset < delEndRow) {
@@ -158,7 +163,7 @@ public:
                 (end - start) * FLOAT_BLOCK_SIZE
             );
             AscendC::Duplicate(
-                lseUbTensor[start],
+                lseUbTensor[taskOffset][start],
                 LSE_OUT_INI,
                 (end - start)
             );
@@ -307,7 +312,7 @@ public:
         if (!isFirstStackTile) {
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
-                dmUbTensor[dmUbOffsetCurStackTile].ReinterpretCast<uint32_t>(),
+                dmUbTensor[taskOffset][dmUbOffsetCurStackTile].ReinterpretCast<uint32_t>(),
                 curRowNumRound / FLOAT_BLOCK_SIZE,
                 AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
@@ -366,7 +371,7 @@ public:
             // *** gl_block = expand_to_block(gl)
             AscendC::Brcb(
                 tvUbTensor.ReinterpretCast<uint32_t>(),
-                glUbTensor.ReinterpretCast<uint32_t>()[rowOffsetLoop],
+                glUbTensor[taskOffset].ReinterpretCast<uint32_t>()[rowOffsetLoop],
                 curRowNumRound / FLOAT_BLOCK_SIZE,
                 AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
@@ -528,16 +533,16 @@ public:
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Ln<float, false>(
-                        lseUbTensor,
-                        glUbTensor,
+                        lseUbTensor[taskOffset],
+                        glUbTensor[taskOffset],
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                     AscendC::PipeBarrier<PIPE_V>();
                     AscendC::Add<float, false>(
-                        lseUbTensor,
-                        lseUbTensor,
-                        gmUbTensor,
+                        lseUbTensor[taskOffset],
+                        lseUbTensor[taskOffset],
+                        gmUbTensor[taskOffset],
                         (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
@@ -545,7 +550,7 @@ public:
                     // *** lse_block = expand_to_block(lse)
                     AscendC::Brcb(
                         tvUbTensor.ReinterpretCast<uint32_t>(),
-                        lseUbTensor.ReinterpretCast<uint32_t>(),
+                        lseUbTensor[taskOffset].ReinterpretCast<uint32_t>(),
                         CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                         AscendC::BrcbRepeatParams(1, 8));
                     InvalidLineLSEProcess(qNThisSubBlock, delStartRow, qSBlockIdx,
@@ -582,7 +587,7 @@ public:
                                     AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0, 0, 0));
                             } else {
                                 AscendC::DataCopyPad(
-                                    gLse, lseUbTensor,
+                                    gLse, lseUbTensor[taskOffset],
                                     AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
                             }
                         } else {
@@ -599,7 +604,6 @@ public:
                             }
                         }
                     }
-                    AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
                 }
             } else {
                 // FD SplitKV must still write partial LSE even when LSE_MODE != OUT_ONLY,
@@ -608,23 +612,23 @@ public:
                     if (isLastRowLoop) {
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Ln<float, false>(
-                            lseUbTensor,
-                            glUbTensor,
+                            lseUbTensor[taskOffset],
+                            glUbTensor[taskOffset],
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                         AscendC::PipeBarrier<PIPE_V>();
                         AscendC::Add<float, false>(
-                            lseUbTensor,
-                            lseUbTensor,
-                            gmUbTensor,
+                            lseUbTensor[taskOffset],
+                            lseUbTensor[taskOffset],
+                            gmUbTensor[taskOffset],
                             (uint64_t)0, CeilDiv(totalRowNum, FLOAT_VECTOR_SIZE),
                             AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                         AscendC::PipeBarrier<PIPE_V>();
 
                         AscendC::Brcb(
                             tvUbTensor.ReinterpretCast<uint32_t>(),
-                            lseUbTensor.ReinterpretCast<uint32_t>(),
+                            lseUbTensor[taskOffset].ReinterpretCast<uint32_t>(),
                             CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                             AscendC::BrcbRepeatParams(1, 8));
                         AscendC::PipeBarrier<PIPE_V>();
@@ -645,7 +649,6 @@ public:
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
                         }
-                        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID4);
                     }
                 }
             }
@@ -811,9 +814,9 @@ public:
 
 private:
     float dropoutValue;
+    uint32_t taskOffset;
     AscendC::LocalTensor<float> loUbTensor;
     AscendC::LocalTensor<float> dmUbTensor;
-    AscendC::LocalTensor<float> hmUbTensor;
     AscendC::LocalTensor<float> glUbTensor;
     AscendC::LocalTensor<float> tvUbTensor;
     AscendC::LocalTensor<ElementOutput> goUbTensor16;

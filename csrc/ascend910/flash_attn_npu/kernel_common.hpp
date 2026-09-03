@@ -12,7 +12,7 @@ namespace KernelCommon {
     constexpr uint32_t QK_READY_ID = 1;
     constexpr uint32_t SOFTMAX_READY_ID = 2;
     constexpr uint32_t PV_READY_ID = 3;
-    constexpr uint32_t PRE_LAUNCH = 2;
+    constexpr uint32_t PRE_LAUNCH = 1;
     constexpr uint32_t N_SPLIT_HELPER = 2;
     constexpr uint32_t MAX_KV_STACK_LEN = 512;
     constexpr uint32_t Q_TILE_CEIL = 128;
