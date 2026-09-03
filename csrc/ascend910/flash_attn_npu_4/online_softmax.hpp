@@ -74,7 +74,7 @@ public:
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK_UB_PREMASK_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
+        constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
@@ -85,17 +85,15 @@ public:
         constexpr uint32_t GL_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 12 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 13 * UB_UINT8_VECTOR_SIZE;
 
-        constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
-
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;
         rescaleThreshold = rescaleThreshold_;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
         maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
-        maskUbTensorUint8 = resource.ubBuf.template GetBufferByByte<uint8_t>(MASK_UB_TENSOR_OFFSET);
         maskUbTensor16 = resource.ubBuf.template GetBufferByByte<half>(MASK16_UB_TENSOR_OFFSET);
         maskUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(MASK32_UB_TENSOR_OFFSET);
+        softcapUbTensor = resource.ubBuf.template GetBufferByByte<float>(SOFTCAP_UB_TENSOR_OFFSET);
         lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
@@ -103,8 +101,6 @@ public:
         llUbTensor = resource.ubBuf.template GetBufferByByte<float>(LL_UB_TENSOR_OFFSET);
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
-        tempMaskTensor = resource.ubBuf.template GetBufferByByte<half>(MASK_UB_PREMASK_TENSOR_OFFSET);
-        softcapUbTensor = resource.ubBuf.template GetBufferByByte<float>(SOFTCAP_UB_TENSOR_OFFSET);
     }
 
     template <typename T>
@@ -410,27 +406,14 @@ public:
 
     __aicore__ inline void OperatePreMaskUb(uint32_t rowNumCurLoop, uint32_t columnNumRound)
     {
-        UpCastMask<half, ElementMask>(
-            maskUbTensor16,
-            maskUbTensor,
-            rowNumCurLoop,
-            columnNumRound
-        );
-        AscendC::CompareScalar(
-            maskUbTensorUint8,
-            maskUbTensor16,
-            static_cast<half>(1.0),
-            AscendC::CMPMODE::NE,
-            REPEAT_SIZE_IN_BYTE / sizeof(half),
-            (rowNumCurLoop * columnNumRound + HALF_VECTOR_SIZE - 1) / HALF_VECTOR_SIZE,
-            AscendC::UnaryRepeatParams(1, 1, 8, 8)
-        );
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Duplicate<half>(tempMaskTensor, static_cast<half>(1), rowNumCurLoop * columnNumRound);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Select(maskUbTensor16, maskUbTensorUint8, tempMaskTensor, static_cast<half>(0), AscendC::SELMODE::VSEL_TENSOR_SCALAR_MODE, rowNumCurLoop * columnNumRound);
-        AscendC::PipeBarrier<PIPE_V>();
+        UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
         UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
+        uint32_t repeatTimes = CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE);
+        AscendC::UnaryRepeatParams repeatParams(1, 1, 8, 8);
+        AscendC::Adds<float, false>(maskUbTensor32, maskUbTensor32, -1.0f, (uint64_t)0, repeatTimes, repeatParams);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Abs<float, false>(maskUbTensor32, maskUbTensor32, (uint64_t)0, repeatTimes, repeatParams);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void OperateNextMaskUb(uint32_t rowNumCurLoop, uint32_t columnNumRound)
@@ -463,13 +446,14 @@ public:
         uint32_t proTokenIdx, uint32_t proTokenNum,
         uint32_t integralHeadNum, uint32_t epiTokenNum, bool isNextMask)
     {
+        uint32_t maskRowLen = RoundUp(columnNum, (uint32_t)8) * sizeof(ElementMask);
         uint32_t innerUbRowOffset = isNextMask ? MAX_UB_S_ELEM_NUM : 0;
         if (proTokenNum != 0) {
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask[proTokenIdx * maskStride],
                 AscendC::DataCopyExtParams(
-                    proTokenNum, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
+                    proTokenNum, maskRowLen,
+                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
             innerUbRowOffset += proTokenNum * columnNumRound;
         }
@@ -477,8 +461,8 @@ public:
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask,
                 AscendC::DataCopyExtParams(
-                    tokenNumPerHead, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
+                    tokenNumPerHead, maskRowLen,
+                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
             innerUbRowOffset += tokenNumPerHead * columnNumRound;
         }
@@ -486,8 +470,8 @@ public:
             AscendC::DataCopyPad(
                 maskUbTensor[innerUbRowOffset], gMask,
                 AscendC::DataCopyExtParams(
-                    epiTokenNum, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
+                    epiTokenNum, maskRowLen,
+                    (maskStride * sizeof(ElementMask)) - maskRowLen, 0, 0),
                 AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
         }
     }
@@ -565,7 +549,7 @@ public:
             CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
             AscendC::UnaryRepeatParams(1, 1, 8, 8));
         AscendC::PipeBarrier<PIPE_V>();
-        if (maskColumnRound == columnNumRound) {
+        if (maskColumnRound == columnNumRound && addMaskUbOffset == 0U) {
             AscendC::Add<float, false>(
                 lsUbTensor[sUbOffset],
                 lsUbTensor[sUbOffset],
@@ -574,7 +558,8 @@ public:
                 CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
         } else {
-            uint32_t loop = maskColumnRound / FLOAT_VECTOR_SIZE;
+            uint32_t maskAddNum = AscendC::Std::min(maskColumnRound, columnNumRound - addMaskUbOffset);
+            uint32_t loop = maskAddNum / FLOAT_VECTOR_SIZE;
             for (uint32_t i = 0; i < loop; i++) {
                 AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
                     lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
@@ -587,8 +572,8 @@ public:
                         columnNumRound / FLOAT_BLOCK_SIZE,
                         maskColumnRound / FLOAT_BLOCK_SIZE));
             }
-            if (maskColumnRound % FLOAT_VECTOR_SIZE > 0) {
-                SetVecMask(maskColumnRound % FLOAT_VECTOR_SIZE);
+            if (maskAddNum % FLOAT_VECTOR_SIZE > 0) {
+                SetVecMask(maskAddNum % FLOAT_VECTOR_SIZE);
                 AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
                     lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
                     maskUbTensor32[loop * FLOAT_VECTOR_SIZE],
@@ -1033,22 +1018,20 @@ public:
         uint32_t maskOffsetThisSubBlock = (qNBlockSize == 1) ?
             rowOffsetThisSubBlock : 0;
 
-        // calc mask shift in gm
         uint32_t gmOffsetMaskRow;
         uint32_t gmOffsetMaskColumn;
         uint32_t maskColumn;
         uint32_t addMaskUbOffset;
-        if (triUp >= static_cast<int64_t>(kvSStartIdx)) {
-            uint32_t triUpRoundDown = RoundDown(
-                static_cast<uint32_t>(triUp), BLOCK_SIZE_IN_BYTE);
-            gmOffsetMaskRow = static_cast<uint32_t>(triUp) - triUpRoundDown;
+        int64_t diagColLocal = triUp - static_cast<int64_t>(kvSStartIdx);
+        if (diagColLocal >= 0) {
+            uint32_t diagU = static_cast<uint32_t>(diagColLocal);
+            addMaskUbOffset = RoundDown(diagU, BLOCK_SIZE_IN_BYTE);
+            gmOffsetMaskRow = diagU - addMaskUbOffset;
             gmOffsetMaskColumn = 0;
-            maskColumn = kvSEndIdx - triUpRoundDown;
-            addMaskUbOffset = triUpRoundDown - kvSStartIdx;
+            maskColumn = columnNum - addMaskUbOffset;
         } else {
             gmOffsetMaskRow = 0;
-            gmOffsetMaskColumn = static_cast<uint32_t>(
-                static_cast<int64_t>(kvSStartIdx) - triUp);
+            gmOffsetMaskColumn = static_cast<uint32_t>(-diagColLocal);
             maskColumn = columnNum;
             addMaskUbOffset = 0;
         }
@@ -1402,7 +1385,6 @@ private:
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
     AscendC::LocalTensor<ElementMask> maskUbTensor;
-    AscendC::LocalTensor<uint8_t> maskUbTensorUint8;
     AscendC::LocalTensor<half> maskUbTensor16;
     AscendC::LocalTensor<float> maskUbTensor32;
     AscendC::LocalTensor<float> lmUbTensor;
@@ -1411,7 +1393,6 @@ private:
     AscendC::LocalTensor<float> dmUbTensor;
     AscendC::LocalTensor<float> llUbTensor;
     AscendC::LocalTensor<float> tvUbTensor;
-    AscendC::LocalTensor<half> tempMaskTensor;
     AscendC::LocalTensor<float> glUbTensor;
     AscendC::LocalTensor<float> softcapUbTensor;
 };
