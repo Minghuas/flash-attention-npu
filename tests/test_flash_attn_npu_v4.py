@@ -345,8 +345,6 @@ def test_fa_kvcache_ops(data_type, batch_size, num_heads, kv_heads, q_seqlen, kv
     if not (1 <= head_size <= 256):
         pytest.skip("head_size must be in [1, 256]")
 
-    if "Ascend950" in name and (window_size_left != -1 or window_size_right != -1):
-        pytest.skip("Ascend950 does not support SWA")
     if is_varied and layout != "TND":
         pytest.skip("is_varied requires TND (varlen-q) layout")
     block_size = 128
