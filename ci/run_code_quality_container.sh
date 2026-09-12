@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Build the hardware-independent quality image and run the common checker in it.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+QUALITY_IMAGE="${QUALITY_IMAGE:-flash-attention-npu-quality:local}"
+QUALITY_BASE_IMAGE="${QUALITY_BASE_IMAGE:-python:3.11-slim}"
+
+if ! command -v docker >/dev/null 2>&1; then
+    echo "[code-quality] docker is required for the container entry point" >&2
+    exit 1
+fi
+
+docker build --network host \
+    --build-arg "BASE_IMAGE=$QUALITY_BASE_IMAGE" \
+    -f "$REPO_ROOT/ci/Dockerfile.code_quality" \
+    -t "$QUALITY_IMAGE" \
+    "$REPO_ROOT"
+
+docker run --rm \
+    --network host \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp/quality-home \
+    -v "$REPO_ROOT:/workspace" \
+    -w /workspace \
+    "$QUALITY_IMAGE" \
+    ci/code_quality.sh "$@"
