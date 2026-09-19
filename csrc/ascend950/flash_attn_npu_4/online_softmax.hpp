@@ -794,14 +794,14 @@ private:
         Four = 4
     };
 
-    __simd_callee__ static inline void ApplySoftcap(AscendC::Reg::RegTensor<float> &srcVreg, AscendC::Reg::RegTensor<float> &softcapVreg, AscendC::Reg::MaskReg &maskVreg, float softcapValue) {
+    __simd_callee__ static inline void ApplySoftcap(RegTensor<float> &srcVreg, RegTensor<float> &softcapVreg, MaskReg &maskVreg, float softcapValue) {
         using namespace AscendC::MicroAPI;
         Maxs(srcVreg, srcVreg, -8.8f, maskVreg);
         Muls(srcVreg, srcVreg, -2.0f, maskVreg);
         Exp(srcVreg, srcVreg, maskVreg);
         Adds(srcVreg, srcVreg, 1.0f, maskVreg);
         Duplicate(softcapVreg, 2 * softcapValue);
-        static constexpr AscendC::Reg::DivSpecificMode mode = {AscendC::Reg::MaskMergeMode::ZEROING, true};
+        static constexpr DivSpecificMode mode = {MaskMergeMode::ZEROING, true};
         Div<float, &mode>(srcVreg, softcapVreg, srcVreg, maskVreg);
         Adds(srcVreg, srcVreg, -softcapValue, maskVreg);
     }
