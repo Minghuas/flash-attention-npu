@@ -6,19 +6,45 @@
 #ifndef FLASH_ATTN_DEVICE_TRIU_MASK_H
 #define FLASH_ATTN_DEVICE_TRIU_MASK_H
 
+#include <mutex>
+#include <vector>
+
 #include <torch/extension.h>
+#include "torch_npu/csrc/core/npu/NPUFunctions.h"
+#include "torch_npu/csrc/core/npu/NPUGuard.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 
-// Build the 2048x2048 int8 triu(1) mask on the current device. The tensor is
-// a local per-call value and no host/device copy or AICPU work is involved.
+// Cached 2048x2048 int8 triu(1) mask, one tensor per visible NPU device.
+// The first call initializes every device in this process; later calls only
+// look up the current device. Callers only read the tensor. No host/device
+// copy or AICPU work is involved. Fills are launched on all devices first,
+// then each device is synchronized once so other streams cannot consume an
+// in-flight fill.
 inline at::Tensor MakeDeviceTriuMask()
 {
-    const c10::DeviceIndex idx = c10_npu::getCurrentNPUStream().device_index();
-    constexpr int64_t dim = 2048;
-    at::Tensor mask =
-        at::ones({dim, dim}, at::TensorOptions().dtype(at::kByte).device(at::Device(at::kPrivateUse1, idx)));
-    mask.triu_(/*diagonal=*/1);
-    return mask;
+    const auto idx = c10_npu::getCurrentNPUStream().device_index();
+
+    static std::once_flag once;
+    static std::vector<at::Tensor> masks;
+
+    std::call_once(once, []() {
+        const auto ndev = c10_npu::device_count();
+        masks.resize(static_cast<size_t>(ndev));
+        constexpr int64_t dim = 2048;
+        for (c10::DeviceIndex i = 0; i < ndev; ++i) {
+            c10_npu::NPUGuard guard(i);
+            at::Tensor mask =
+                at::ones({dim, dim}, at::TensorOptions().dtype(at::kByte).device(at::Device(at::kPrivateUse1, i)));
+            mask.triu_(/*diagonal=*/1);
+            masks[static_cast<size_t>(i)] = std::move(mask);
+        }
+        for (c10::DeviceIndex i = 0; i < ndev; ++i) {
+            c10_npu::NPUGuard guard(i);
+            c10_npu::getCurrentNPUStream().synchronize();
+        }
+    });
+
+    return masks[static_cast<size_t>(idx)];
 }
 
 #endif
