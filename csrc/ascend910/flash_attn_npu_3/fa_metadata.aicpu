@@ -8,6 +8,7 @@
 #include "fa_split.h"
 #include "tilingdata.h"
 #include <cstdint>
+#include <cstring>
 
 namespace {
 constexpr uint32_t Q_TILE_CEIL = 128;
@@ -43,10 +44,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     const int32_t *cuSeqlensQ = reinterpret_cast<const int32_t *>(metaArgs->cuSeqlensQAddr);
     const int32_t *seqlensK = reinterpret_cast<const int32_t *>(metaArgs->seqlensKAddr);
 
-    uint8_t *tilingBytes = reinterpret_cast<uint8_t *>(tilingData);
-    for (uint64_t i = 0; i < sizeof(FAInferTilingData); ++i) {
-        tilingBytes[i] = 0;
-    }
+    std::memset(tilingData, 0, sizeof(FAInferTilingData));
 
     tilingData->batch = metaArgs->batch;
     tilingData->numHeads = metaArgs->numHeads;
@@ -129,6 +127,8 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     const uint32_t groupSize = (metaArgs->numHeadsK == 0) ? 1u : (metaArgs->numHeads / metaArgs->numHeadsK);
     uint32_t totalTaskNum = 0;
     uint32_t firstBatchTaskNum = 0;
+    uint32_t maxQ = 0;
+    uint32_t minQ = 0xFFFFFFFFu;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (metaArgs->isVarlen != 0) {
@@ -137,28 +137,23 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
         const uint32_t curQNBlockTile = GetQNBlockTile(qSeqlen, groupSize);
         const uint32_t qNBlockNumPerGroup = CeilDiv(groupSize, curQNBlockTile);
         const uint32_t curQNBlockNum = qNBlockNumPerGroup * metaArgs->numHeadsK;
-        const uint32_t curQSBlockTile = Q_TILE_CEIL;
-        const uint32_t curQSBlockNum = CeilDiv(qSeqlen, curQSBlockTile);
+        const uint32_t curQSBlockNum = CeilDiv(qSeqlen, Q_TILE_CEIL);
         const uint32_t curTaskNum = curQNBlockNum * curQSBlockNum;
         if (batchIdx == 0) {
             firstBatchTaskNum = curTaskNum;
         }
         totalTaskNum += curTaskNum;
+        if (qSeqlen > maxQ) {
+            maxQ = qSeqlen;
+        }
+        if (qSeqlen < minQ) {
+            minQ = qSeqlen;
+        }
     }
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
     tilingData->totalTaskNum = totalTaskNum;
 
     {
-        uint32_t maxQ = 0;
-        uint32_t minQ = 0xFFFFFFFFu;
-        for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
-            uint32_t qLen = metaArgs->maxQSeqlen;
-            if (metaArgs->isVarlen != 0) {
-                qLen = static_cast<uint32_t>(cuSeqlensQ[batchIdx + 1] - cuSeqlensQ[batchIdx]);
-            }
-            if (qLen > maxQ) maxQ = qLen;
-            if (qLen < minQ) minQ = qLen;
-        }
         const uint32_t bd = metaArgs->blockDim;
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * bd) && (maxKvSeqlen >= bd * 512u);
