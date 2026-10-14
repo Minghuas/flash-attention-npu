@@ -942,63 +942,23 @@ namespace SplitFuse {
                     uint32_t kvSEndIdx = kvSStartIdx + desc.stackSeqTile;
                     epilogueOnlineSoftmax.set_gmOffsetPret(gmOffsetPret + kvSStartIdx);
                     epilogueOnlineSoftmax.set_gmOffsetDrop(gmOffsetDrop + kvSStartIdx / 8);
+
+                    int32_t kvSStartIdxI = static_cast<int32_t>(kvSStartIdx);
                     if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
                         int64_t triUp =
                             static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
-                        uint32_t triDown = static_cast<uint32_t>(noSkipKvS);
                         bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1U);
                         if (doTriUMask) {
-                            if (flashDecodeFlag != 0U) {
-                                epilogueOnlineSoftmax(
-                                    gP[gmOffsetP],
-                                    gS[gmOffsetS],
-                                    gMask,
-                                    layOutP,
-                                    layOutS,
-                                    layOutMask,
-                                    actualBlockShapeQK,
-                                    desc.firstStack,
-                                    qSBlockSize,
-                                    qNBlockSize,
-                                    curStackTileMod,
-                                    desc.taskStateSlot,
-                                    qkReady,
-                                    softmaxPingPongFlag,
-                                    triUp,
-                                    triDown,
-                                    kvSStartIdx,
-                                    kvSEndIdx,
-                                    isSplitKV,
-                                    qSBlockBaseIdx, 
-                                    qNBlockBaseIdx, 
-                                    qKSeqDiff,
-                                    slopesBatchOffset);
-                            } else {
-                                epilogueOnlineSoftmax(
-                                    gP[gmOffsetP],
-                                    gS[gmOffsetS],
-                                    gMask,
-                                    layOutP,
-                                    layOutS,
-                                    layOutMask,
-                                    actualBlockShapeQK,
-                                    desc.firstStack,
-                                    qSBlockSize,
-                                    qNBlockSize,
-                                    curStackTileMod,
-                                    desc.taskStateSlot,
-                                    qkReady,
-                                    softmaxPingPongFlag,
-                                    triUp,
-                                    triDown,
-                                    kvSStartIdx,
-                                    kvSEndIdx,
-                                    false,
-                                    qSBlockBaseIdx, 
-                                    qNBlockBaseIdx, 
-                                    qKSeqDiff,
-                                    slopesBatchOffset);
-                            }
+                            epilogueOnlineSoftmax(
+                                gP[gmOffsetP], gS[gmOffsetS], gMask,
+                                layOutP, layOutS, layOutMask,
+                                actualBlockShapeQK,
+                                desc.firstStack, 0,
+                                qSBlockSize, qNBlockSize, curStackTileMod, desc.taskStateSlot,
+                                qkReady, softmaxPingPongFlag,
+                                triUp, kvSStartIdxI, kvSEndIdx,
+                                false, false, 0, 0, false, false,
+                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
                         } else {
                             uint32_t lastNoMaskTile;
                             if (triUp + 1U == kvSeqlen) {
@@ -1011,48 +971,26 @@ namespace SplitFuse {
                                 lastNoMaskTile = kvStartOld +
                                     (triUp + 1U - kvSeqlenOld) / MAX_KV_STACK_LEN - 1U;
                             }
-                            int32_t lastNoMaskStackId;
+                            // Flash-decode stacks are indexed from kvStart.
+                            int32_t lastNoMaskStackId = static_cast<int32_t>(lastNoMaskTile);
                             if (flashDecodeFlag != 0U) {
-                                lastNoMaskStackId = (int32_t)lastNoMaskTile - (int32_t)kvStart;
-                                epilogueOnlineSoftmax(
-                                    gP[gmOffsetP],
-                                    gS[gmOffsetS],
-                                    layOutP,
-                                    layOutS,
-                                    actualBlockShapeQK,
-                                    desc.firstStack,
-                                    (stackSeqCount == lastNoMaskStackId),
-                                    qSBlockSize,
-                                    qNBlockSize,
-                                    curStackTileMod,
-                                    desc.taskStateSlot,
-                                    qkReady,
-                                    softmaxPingPongFlag,
-                                    isSplitKV, false, false, kvSStartIdx,
-                                    qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
-                            } else {
-                                epilogueOnlineSoftmax(
-                                    gP[gmOffsetP],
-                                    gS[gmOffsetS],
-                                    layOutP,
-                                    layOutS,
-                                    actualBlockShapeQK,
-                                    desc.firstStack,
-                                    (stackSeqCount == lastNoMaskTile),
-                                    qSBlockSize,
-                                    qNBlockSize,
-                                    curStackTileMod,
-                                    desc.taskStateSlot,
-                                    qkReady,
-                                    softmaxPingPongFlag,
-                                    false, false, false, kvSStartIdx,
-                                    qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
+                                lastNoMaskStackId -= static_cast<int32_t>(kvStart);
                             }
+                            epilogueOnlineSoftmax(
+                                gP[gmOffsetP], gS[gmOffsetS], gMask,
+                                layOutP, layOutS, layOutMask,
+                                actualBlockShapeQK,
+                                desc.firstStack, (stackSeqCount == lastNoMaskStackId),
+                                qSBlockSize, qNBlockSize, curStackTileMod, desc.taskStateSlot,
+                                qkReady, softmaxPingPongFlag,
+                                triUp, kvSStartIdxI, kvSEndIdx,
+                                false, false, 0, 0, false, false,
+                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
                         }
                     } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
                         // StartLen can be negative when Sq>>Sk; compare in int32 so
                         // it is not promoted against uint32 kvSStartIdx/kvSEndIdx.
-                        int32_t kvStartI = static_cast<int32_t>(kvSStartIdx);
+                        int32_t kvStartI = kvSStartIdxI;
                         int32_t kvEndI = static_cast<int32_t>(kvSEndIdx);
                         bool doTriUPreMask = (maskType != 2 || notPreMask) ? false :
                             (windowSizeLeftStartLen >= kvStartI && windowSizeLeftStartLen < kvEndI) ||
@@ -1067,97 +1005,46 @@ namespace SplitFuse {
                             startsWithMaskTile = true;
                             startsWithMaskThenNomaskFlag = true;
                             epilogueOnlineSoftmax(
-                                    gP[gmOffsetP],
-                                    gS[gmOffsetS],
-                                    gMask,
-                                    layOutP,
-                                    layOutS,
-                                    layOutMask,
-                                    actualBlockShapeQK,
-                                    desc.firstStack,
-                                    qSBlockSize,
-                                    qNBlockSize,
-                                    curStackTileMod,
-                                    desc.taskStateSlot,
-                                    qkReady,
-                                    softmaxPingPongFlag,
-                                    kvSStartIdx,
-                                    doTriUPreMask,
-                                    doTriUNextMask,
-                                    windowSizeLeftStartLen,
-                                    windowSizeLeftEndLen,
-                                    windowSizeRightStartLen,
-                                    windowSizeRightEndLen,
-                                    (flashDecodeFlag != 0U) ? isSplitKV : false,
-                                    qSBlockBaseIdx, 
-                                    qNBlockBaseIdx, 
-                                    qKSeqDiff,
-                                    slopesBatchOffset);
+                                gP[gmOffsetP], gS[gmOffsetS], gMask,
+                                layOutP, layOutS, layOutMask,
+                                actualBlockShapeQK,
+                                desc.firstStack, 0,
+                                qSBlockSize, qNBlockSize, curStackTileMod, desc.taskStateSlot,
+                                qkReady, softmaxPingPongFlag,
+                                0, kvSStartIdxI, 0,
+                                doTriUPreMask, doTriUNextMask,
+                                windowSizeLeftStartLen, windowSizeRightStartLen,
+                                false, false,
+                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
                         } else {
                             bool isLastNoMaskStackTile = (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
                             uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
                             uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile ? RoundUp(kvSeqlenLimit, MAX_KV_STACK_LEN) : RoundDown(kvSeqlenLimit, MAX_KV_STACK_LEN);
                             uint32_t noMaskStackSeqNum = (alignedKvSeqlenLimit - kvStart * MAX_KV_STACK_LEN) / MAX_KV_STACK_LEN;
                             epilogueOnlineSoftmax(
-                                gP[gmOffsetP],
-                                gS[gmOffsetS],
-                                layOutP,
-                                layOutS,
+                                gP[gmOffsetP], gS[gmOffsetS], gMask,
+                                layOutP, layOutS, layOutMask,
                                 actualBlockShapeQK,
-                                desc.firstStack,
-                                (stackSeqCount == noMaskStackSeqNum - 1),
-                                qSBlockSize,
-                                qNBlockSize,
-                                curStackTileMod,
-                                desc.taskStateSlot,
-                                qkReady,
-                                softmaxPingPongFlag,
-                                (flashDecodeFlag != 0U) ? isSplitKV : false,
-                                startsWithMaskTile,
-                                startsWithMaskThenNomaskFlag, 
-                                kvSStartIdx,
-                                qSBlockBaseIdx, 
-                                qNBlockBaseIdx, 
-                                qKSeqDiff,
-                                slopesBatchOffset);
+                                desc.firstStack, (stackSeqCount == noMaskStackSeqNum - 1),
+                                qSBlockSize, qNBlockSize, curStackTileMod, desc.taskStateSlot,
+                                qkReady, softmaxPingPongFlag,
+                                0, kvSStartIdxI, 0,
+                                false, false, 0, 0,
+                                startsWithMaskTile, startsWithMaskThenNomaskFlag,
+                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
                             startsWithMaskTile = false;
                         }
                     } else {
-                        if (flashDecodeFlag != 0U) {
-                            epilogueOnlineSoftmax(
-                                gP[gmOffsetP],
-                                gS[gmOffsetS],
-                                layOutP,
-                                layOutS,
-                                actualBlockShapeQK,
-                                desc.firstStack,
-                                0,
-                                qSBlockSize,
-                                qNBlockSize,
-                                curStackTileMod,
-                                desc.taskStateSlot,
-                                qkReady,
-                                softmaxPingPongFlag,
-                                isSplitKV, false, false, kvSStartIdx,
-                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
-                        } else {
-                            epilogueOnlineSoftmax(
-                                gP[gmOffsetP],
-                                gS[gmOffsetS],
-                                layOutP,
-                                layOutS,
-                                actualBlockShapeQK,
-                                desc.firstStack,
-                                0,
-                                qSBlockSize,
-                                qNBlockSize,
-                                curStackTileMod,
-                                desc.taskStateSlot,
-                                qkReady,
-                                softmaxPingPongFlag,
-                                false, false, false, kvSStartIdx,
-                                qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
-                        }
+                        epilogueOnlineSoftmax(
+                            gP[gmOffsetP], gS[gmOffsetS], gMask,
+                            layOutP, layOutS, layOutMask,
+                            actualBlockShapeQK,
+                            desc.firstStack, 0,
+                            qSBlockSize, qNBlockSize, curStackTileMod, desc.taskStateSlot,
+                            qkReady, softmaxPingPongFlag,
+                            0, kvSStartIdxI, 0,
+                            false, false, 0, 0, false, false,
+                            qSBlockBaseIdx, qNBlockBaseIdx, qKSeqDiff, slopesBatchOffset);
                     }
                     Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
 #endif
@@ -1410,7 +1297,8 @@ namespace SplitFuse {
                                                    QType, KType, SType>;
 
         using DispatchPolicyOnlineSoftmax =
-            Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP, RETURN_SOFTMAX, HAS_DROPOUT, HAS_ALIBI>;
+            Epilogue::EpilogueAtlasA2OnlineSoftmaxT<lseMode, IntermCalcPrec, HAS_SOFTCAP, RETURN_SOFTMAX, HAS_DROPOUT, HAS_ALIBI,
+                                                    maskCategory>;
         using PType = Gemm::GemmType<ElementP, LayoutP>;
         using maskType = Gemm::GemmType<ElementMask, LayoutMask>;
         using EpilogueOnlineSoftmax =
