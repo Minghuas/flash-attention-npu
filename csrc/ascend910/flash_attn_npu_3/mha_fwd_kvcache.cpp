@@ -507,7 +507,6 @@ class FAInferKernel {
                     issuedStackCount, prefillRemaining, softmaxPingPongFlag, blockStackNum);
                 taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
-
             // Drain only consumes descriptors already submitted by the task
             // loop.  Keep it outside runMainLoop so the normal KV loop has no
             // drain branch or tail iteration in its hot footprint.
@@ -608,7 +607,7 @@ class FAInferKernel {
     // Consume one delayed PV descriptor.  Keeping the consumer in one outlined
     // body makes the steady-state path and the tail-drain path share the same
     // PV/rescale code instead of growing two copies in runMainLoop.
-    __aicore__ __attribute__((noinline)) void ConsumeDelayedPV(
+    __aicore__ inline void ConsumeDelayedPV(
         uint32_t coreIdx, StackDescriptor& pvDesc, uint32_t blockStackNum,
         uint32_t stackSeqTilePad, GlobalTensorBundle& globalTensors)
     {
@@ -686,7 +685,7 @@ class FAInferKernel {
     // Submit exactly one QK/softmax stack. The descriptor is owned by the
     // caller so all fields written here are preserved in the pipeline ring.
     // SWA state is passed back explicitly.
-    __aicore__ __attribute__((noinline)) void RunQKSoftmaxStackImpl(
+    __aicore__ inline void RunQKSoftmaxStackImpl(
         uint32_t coreIdx, uint32_t qSeqlen, uint32_t kvSeqlen, uint32_t qNBlockSize,
         uint32_t qNBlockTile, uint32_t qSBlockIdx, uint32_t taskFlags, bool isSplitKV,
         bool appendKVFlag, uint32_t kvSeqlenOld, uint32_t kvStartOld,
