@@ -20,9 +20,11 @@
 
 #include "mha_fwd_kvcache.cpp"
 
-// 7-param FAInfer (no IS_FD template arg — main moved flash-decode to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                                      \
-    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT_TYPE, Catlass::Epilogue::LseModeT::OUT_ONLY,      \
+// FlashDecode is a compile-time kernel axis. The host still selects the
+// variant at runtime, but the selected device kernel contains only one mode.
+#define FWD_LAUNCH(DTYPE, PAGED, FLASH_DECODE, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                         \
+    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, FLASH_DECODE, MASK_TYPE, LAYOUT_TYPE,                               \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY,                                                          \
                        SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tiling, kNewDevice, vNewDevice, sequsedQDevice, sequsedKVDevice,                 \
@@ -94,8 +96,12 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
     (void)flashDecodeFlag;
 
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
-        FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
-            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, { FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap); });
+        FWD_BOOL_SWITCH(flashDecodeFlag, IsFlashDecode, {
+            FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
+                FWD_BOOL_SWITCH(has_softcap, HasSoftcap, {
+                    FWD_LAUNCH(DType, IsPaged, IsFlashDecode, MaskType, LAYOUT, HasSoftcap);
+                });
+            });
         });
     });
 }

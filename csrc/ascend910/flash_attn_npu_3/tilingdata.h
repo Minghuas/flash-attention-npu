@@ -33,6 +33,43 @@ struct splitNode {
     int64_t oTaskOffset;
 };
 
+struct alignas(64) TaskDesc {
+    uint32_t batchIdx;
+    uint32_t qNBlockIdx;
+    uint32_t qSBlockIdx;
+    uint32_t qSeqlen;
+    uint32_t kvSeqlen;
+    uint32_t kvStart;
+    uint32_t kvEnd;
+    int32_t startS2Idx;
+    int32_t endS2Idx;
+    uint32_t isSplitKV;
+    uint32_t pipelineDrain;
+    uint64_t lseOffset;
+    uint64_t oOffset;
+};
+
+static_assert(sizeof(TaskDesc) == 64, "TaskDesc must occupy one 64-byte cache line");
+
+struct CoreTaskRange {
+    uint32_t taskOffset;
+    uint32_t taskCount;
+};
+
+struct alignas(64) SchedulerHeader {
+    uint32_t version;
+    uint32_t coreNum;
+    uint32_t actualTaskCount;
+    uint32_t taskCapacity;
+    uint64_t taskDataOffset;
+    uint64_t taskDataBytes;
+    uint32_t status;
+    uint32_t flashDecodeFlag;
+    uint32_t reserved[6];
+};
+
+static_assert(sizeof(SchedulerHeader) == 64, "SchedulerHeader must occupy one cache line");
+
 struct FAInferTilingData {
     uint32_t numHeads;
     uint32_t embeddingSize;
