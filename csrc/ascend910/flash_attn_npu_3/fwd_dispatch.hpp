@@ -10,7 +10,8 @@
 // (2 dtype x {paged/non-paged with flash-decode variants} x {causal/no-mask}
 // x {TND/BSND}) compile in parallel across cores. flash_api.cpp computes all
 // host-side setup (tiling, workspace, layout, block-table/mask pointers) and
-// hands the raw device pointers / scalars to launch_fwd<IS_TND>().
+// hands the raw device pointers / scalars to launch_fwd<IS_TND>(). FlashDecode
+// is selected as a compile-time kernel axis inside that launcher.
 //
 // head_dim is NOT a generation axis: the forward does not bin by head_dim (it
 // is a runtime tiling value). The compile-time axes are dtype and IS_TND only.
@@ -52,7 +53,8 @@ struct FwdLaunchArgs {
 };
 
 // Per-(dtype, layout) implementation, defined in autogen/fwd_dispatch_<dtype>_<layout>.cpp
-// via fwd_dispatch_impl.hpp. Each TU instantiates one launch_fwd_dtype<DType, IS_TND>.
+// via fwd_dispatch_impl.hpp. Each TU instantiates one launch_fwd_dtype<DType, IS_TND>;
+// the launcher then selects the normal or FlashDecode device specialization.
 template <typename DType, bool IS_TND>
 void launch_fwd_dtype(const FwdLaunchArgs& a);
 

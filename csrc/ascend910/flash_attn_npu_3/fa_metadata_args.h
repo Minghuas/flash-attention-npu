@@ -10,8 +10,16 @@
 #include "tilingdata.h"
 
 namespace fa_metadata {
+constexpr uint32_t TASK_METADATA_VERSION = 1;
+constexpr uint32_t TASK_METADATA_OK = 0;
+constexpr uint32_t TASK_METADATA_OVERFLOW = 1;
+constexpr uint64_t TASK_METADATA_ALIGN = 64;
 constexpr uint32_t MASK_DIM = 2048;
 constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
+
+constexpr uint64_t SCHEDULER_HEADER_OFFSET =
+    (sizeof(FAInferTilingData) + TASK_METADATA_ALIGN - 1) / TASK_METADATA_ALIGN * TASK_METADATA_ALIGN;
+constexpr uint64_t CORE_RANGE_OFFSET = SCHEDULER_HEADER_OFFSET + sizeof(SchedulerHeader);
 
 // scheduler_metadata is tiling-only. The 2048x2048 compressed triu(1) mask is
 // generated locally on the device by MakeDeviceTriuMask when required.
@@ -19,9 +27,39 @@ inline uint64_t TilingOffset(bool /*has_mask*/)
 {
     return 0;
 }
-inline uint64_t MetadataBytes(bool /*has_mask*/)
+constexpr uint64_t AlignTaskMetadata(uint64_t value)
 {
-    return sizeof(FAInferTilingData);
+    return (value + TASK_METADATA_ALIGN - 1) / TASK_METADATA_ALIGN * TASK_METADATA_ALIGN;
+}
+
+constexpr uint64_t SchedulerHeaderOffset()
+{
+    return AlignTaskMetadata(sizeof(FAInferTilingData));
+}
+
+constexpr uint64_t CoreRangeOffset()
+{
+    return SchedulerHeaderOffset() + sizeof(SchedulerHeader);
+}
+
+constexpr uint64_t TaskDataOffset(uint32_t blockDim)
+{
+    return AlignTaskMetadata(CoreRangeOffset() + static_cast<uint64_t>(blockDim) * sizeof(CoreTaskRange));
+}
+
+// The upper bound is shape-based and does not depend on runtime seqlensQ
+// values. qNBlockNum is bounded by numHeads and qSBlockNum by ceil(maxQ/128).
+inline uint64_t TaskCapacity(uint32_t batch, uint32_t maxQSeqlen, uint32_t numHeads)
+{
+    const uint64_t qBlocks = (static_cast<uint64_t>(maxQSeqlen) + 127) / 128;
+    const uint64_t capacity = static_cast<uint64_t>(batch) * numHeads * (qBlocks == 0 ? 1 : qBlocks);
+    return capacity == 0 ? 1 : capacity;
+}
+
+inline uint64_t MetadataBytes(bool /*has_mask*/, uint32_t batch, uint32_t maxQSeqlen, uint32_t numHeads,
+                              uint32_t blockDim)
+{
+    return TaskDataOffset(blockDim) + TaskCapacity(batch, maxQSeqlen, numHeads) * sizeof(TaskDesc);
 }
 
 constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;

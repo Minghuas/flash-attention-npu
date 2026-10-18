@@ -97,10 +97,130 @@ static FwdMaskDerivation DeriveFwdMask(bool causal, int64_t window_left, int64_t
     return derived;
 }
 
+constexpr uint32_t MAX_SCHEDULER_SCRATCH_CORES = 64;
+
+// The explicit host-tiling fallback must use the same metadata ABI as the
+// AICPU path.  Keep this builder deliberately mechanical: it only serializes
+// the task descriptors and does not change the legacy tiling calculation.
+static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, const fa_split::SplitContext& ctx,
+                                  uint32_t batch, uint32_t numHeads, uint32_t numHeadsK, uint32_t maxQSeqlen,
+                                  uint32_t blockDim)
+{
+    auto* header = reinterpret_cast<SchedulerHeader*>(metadata + fa_metadata::SchedulerHeaderOffset());
+    auto* ranges = reinterpret_cast<CoreTaskRange*>(metadata + fa_metadata::CoreRangeOffset());
+    auto* tasks = reinterpret_cast<TaskDesc*>(metadata + fa_metadata::TaskDataOffset(blockDim));
+    const uint32_t groupSize = numHeadsK == 0 ? 1U : numHeads / numHeadsK;
+    const uint32_t capacity = static_cast<uint32_t>(fa_metadata::TaskCapacity(batch, maxQSeqlen, numHeads));
+    std::memset(header, 0, sizeof(SchedulerHeader));
+    header->version = fa_metadata::TASK_METADATA_VERSION;
+    header->coreNum = blockDim;
+    header->taskCapacity = capacity;
+    header->taskDataOffset = fa_metadata::TaskDataOffset(blockDim);
+    header->taskDataBytes = static_cast<uint64_t>(capacity) * sizeof(TaskDesc);
+    header->flashDecodeFlag = tiling->flashDecodeFlag;
+
+    uint32_t counts[MAX_SCHEDULER_SCRATCH_CORES] = {};
+    uint32_t cursor[MAX_SCHEDULER_SCRATCH_CORES] = {};
+    uint32_t total = 0;
+    if (tiling->flashDecodeFlag == 0) {
+        uint32_t global = 0;
+        for (uint32_t b = 0; b < batch; ++b) {
+            const auto p = fa_split::getBatchParams(b, groupSize, ctx);
+            for (uint32_t i = 0; i < p.curQNBlockNum * p.curQSBlockNum; ++i, ++global) {
+                ++counts[global % blockDim];
+            }
+        }
+        total = global;
+    } else {
+        for (uint32_t core = 0; core < blockDim; ++core) {
+            if (core >= sizeof(tiling->coreInfo) / sizeof(tiling->coreInfo[0])) continue;
+            if (tiling->needCoreNum != 0 && core >= tiling->needCoreNum) continue;
+            const coreNode& node = tiling->coreInfo[core];
+            for (int32_t b = node.startBIdx; b <= node.endBIdx; ++b) {
+                const auto p = fa_split::getBatchParams(static_cast<uint32_t>(b), groupSize, ctx);
+                const int32_t n0 = b == node.startBIdx ? node.startN1Idx : 0;
+                const int32_t n1 = b == node.endBIdx ? node.endN1Idx : static_cast<int32_t>(p.curQNBlockNum) - 1;
+                for (int32_t n = n0; n <= n1; ++n) {
+                    const int32_t s0 = b == node.startBIdx && n == n0 ? node.startS1Idx : 0;
+                    const int32_t s1 = b == node.endBIdx && n == n1 ? node.endS1Idx : static_cast<int32_t>(p.curQSBlockNum) - 1;
+                    if (s1 >= s0) { counts[core] += s1 - s0 + 1; total += s1 - s0 + 1; }
+                }
+            }
+        }
+    }
+    TORCH_CHECK(blockDim <= MAX_SCHEDULER_SCRATCH_CORES && total <= capacity,
+                "scheduler TaskDesc capacity exceeded");
+    uint32_t offset = 0;
+    for (uint32_t core = 0; core < blockDim; ++core) {
+        ranges[core] = {offset, counts[core]};
+        cursor[core] = offset;
+        offset += ranges[core].taskCount;
+    }
+    header->actualTaskCount = total;
+
+    if (tiling->flashDecodeFlag == 0) {
+        uint32_t global = 0;
+        for (uint32_t b = 0; b < batch; ++b) {
+            const auto p = fa_split::getBatchParams(b, groupSize, ctx);
+            for (uint32_t s = 0; s < p.curQSBlockNum; ++s) {
+                for (uint32_t n = 0; n < p.curQNBlockNum; ++n, ++global) {
+                    const uint32_t core = global % blockDim;
+                    TaskDesc& t = tasks[cursor[core]++];
+                    std::memset(&t, 0, sizeof(t));
+                    t.batchIdx = b; t.qNBlockIdx = n; t.qSBlockIdx = s;
+                    t.qSeqlen = p.qSeqlen; t.kvSeqlen = p.kvSeqlen; t.kvEnd = p.curKSBlockNum;
+                    if (cursor[core] == ranges[core].taskOffset + ranges[core].taskCount) {
+                        t.pipelineDrain = 2;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    for (uint32_t core = 0; core < blockDim; ++core) {
+        if (core >= sizeof(tiling->coreInfo) / sizeof(tiling->coreInfo[0])) continue;
+        if (tiling->needCoreNum != 0 && core >= tiling->needCoreNum) continue;
+        const coreNode& node = tiling->coreInfo[core];
+        uint64_t lse = static_cast<uint64_t>(node.firstSplitKVTaskLseOffset);
+        uint64_t out = static_cast<uint64_t>(node.firstSplitKVTaskOOffset);
+        for (int32_t b = node.startBIdx; b <= node.endBIdx; ++b) {
+            const auto p = fa_split::getBatchParams(static_cast<uint32_t>(b), groupSize, ctx);
+            const int32_t n0 = b == node.startBIdx ? node.startN1Idx : 0;
+            const int32_t n1 = b == node.endBIdx ? node.endN1Idx : static_cast<int32_t>(p.curQNBlockNum) - 1;
+            for (int32_t n = n0; n <= n1; ++n) {
+                const int32_t s0 = b == node.startBIdx && n == n0 ? node.startS1Idx : 0;
+                const int32_t s1 = b == node.endBIdx && n == n1 ? node.endS1Idx : static_cast<int32_t>(p.curQSBlockNum) - 1;
+                for (int32_t s = s0; s <= s1; ++s) {
+                    const int32_t ks = b == node.startBIdx && n == n0 && s == s0 ? node.startS2Idx : 0;
+                    const int32_t ke = b == node.endBIdx && n == n1 && s == s1 ? node.endS2Idx : static_cast<int32_t>(p.curKSBlockNum);
+                    const bool split = ke > ks && ke - ks < static_cast<int32_t>(p.curKSBlockNum);
+                    TaskDesc& t = tasks[cursor[core]++];
+                    std::memset(&t, 0, sizeof(t));
+                    t.batchIdx = b; t.qNBlockIdx = static_cast<uint32_t>(n); t.qSBlockIdx = static_cast<uint32_t>(s);
+                    t.qSeqlen = p.qSeqlen; t.kvSeqlen = p.kvSeqlen; t.kvStart = ks; t.kvEnd = ke;
+                    t.startS2Idx = ks; t.endS2Idx = ke; t.isSplitKV = split; t.pipelineDrain =
+                        (b == node.endBIdx && n == n1 && s == s1) ? 2 : 0;
+                    t.lseOffset = lse; t.oOffset = out;
+                    if (split) {
+                        const uint32_t qs = s == static_cast<int32_t>(p.curQSBlockNum - 1)
+                            ? p.qSeqlen - static_cast<uint32_t>(s) * p.curQSBlockTile : p.curQSBlockTile;
+                        const uint32_t ng = static_cast<uint32_t>(n) % p.qNBlockNumPerGroup;
+                        const uint32_t qn = ng == p.qNBlockNumPerGroup - 1
+                            ? groupSize - ng * p.curQNBlockTile : p.curQNBlockTile;
+                        lse += static_cast<uint64_t>(qs) * qn;
+                        out += static_cast<uint64_t>(qs) * qn * ctx.head_size_v;
+                    }
+                }
+            }
+        }
+    }
+}
+
 static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor& seqlensK,
                                            const std::optional<at::Tensor>& seqlensQ)
 {
-    const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(args.maskType != 0));
+    const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(
+        args.maskType != 0, args.batch, args.maxQSeqlen, args.numHeads, args.blockDim));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
 
@@ -401,7 +521,23 @@ std::vector<at::Tensor> mha_fwd(
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
-        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
+        const uint32_t fdCapacity = static_cast<uint32_t>(max_num_blocks_per_seq * page_block_size);
+        const uint32_t fdKvBound = paged_KV
+            ? fdCapacity + static_cast<uint32_t>(kvNewSeqlen)
+            : static_cast<uint32_t>(std::max<int64_t>(0, kvSeqlenBound));
+        const uint32_t fdGroupSize = num_heads_k == 0 ? 1U : num_heads / num_heads_k;
+        const uint32_t fdTaskCount = static_cast<uint32_t>(batch_size * num_heads_k);
+        const bool fdLongSeq = (static_cast<double>(fdTaskCount) <= 0.8 * blockDim) &&
+                               (fdKvBound >= blockDim * 512U);
+        const bool fdShortSeq = (static_cast<double>(fdTaskCount) <= 0.4 * blockDim) &&
+                                (fdKvBound >= 1024U);
+        flashDecodeFlag = paged_KV && is_varlen_q && !is_local &&
+                          (static_cast<uint64_t>(seqlen_q) * fdGroupSize <= 128U) &&
+                          (seqlen_q <= 16) && (fdKvBound >= 1024U) &&
+                          (seqlen_q > 0) && (fdLongSeq || fdShortSeq);
+        TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(
+                        hasMask, static_cast<uint32_t>(batch_size), static_cast<uint32_t>(seqlen_q),
+                        static_cast<uint32_t>(num_heads), blockDim),
                     "scheduler_metadata buffer size must exactly match this call's "
                     "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
@@ -421,10 +557,13 @@ std::vector<at::Tensor> mha_fwd(
         workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
         launchBlockDim = blockDim;
     } else {
-        at::Tensor tiling_cpu_tensor =
-            at::empty({static_cast<int64_t>(sizeof(FAInferTilingData))}, at::device(c10::kCPU).dtype(at::kByte));
+        at::Tensor tiling_cpu_tensor = at::empty(
+            {static_cast<int64_t>(fa_metadata::MetadataBytes(false, static_cast<uint32_t>(batch_size),
+                                                             static_cast<uint32_t>(seqlen_q),
+                                                             static_cast<uint32_t>(num_heads), blockDim))},
+            at::device(c10::kCPU).dtype(at::kByte));
         FAInferTilingData* tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
-        std::memset(tiling_cpu_ptr, 0, sizeof(FAInferTilingData));
+        std::memset(tiling_cpu_tensor.data_ptr<uint8_t>(), 0, tiling_cpu_tensor.nbytes());
 
         at::Tensor seqlenk_cpu_tensor = seqlens_k.to(at::Device(at::kCPU));
         int32_t* seqlens_k_cpu = static_cast<int32_t*>(seqlenk_cpu_tensor.data_ptr());
@@ -560,6 +699,9 @@ std::vector<at::Tensor> mha_fwd(
                 launchBlockDim = needCoreNum;
             }
         }
+        BuildHostTaskMetadata(tiling_cpu_tensor.data_ptr<uint8_t>(), tiling_cpu_ptr, splitCtx,
+                              static_cast<uint32_t>(batch_size), static_cast<uint32_t>(num_heads),
+                              static_cast<uint32_t>(num_heads_k), static_cast<uint32_t>(seqlen_q), blockDim);
 
         uint64_t WORKSPACE_BLOCK_SIZE_DB = 128 * 512;
         uint64_t PRELANCH_NUM = 3;
@@ -647,8 +789,8 @@ std::vector<at::Tensor> mha_fwd(
     auto softmaxLseDevice = static_cast<uint8_t*>(softmaxlse.data_ptr());
     // Forward kernel launches live in fwd_dispatch_<dtype>_<layout>.cpp. Layout
     // is selected at runtime by is_varlen_q (varlen => TND, else BSND); dtype
-    // and paged/causal are resolved inside the dispatch. flashDecodeFlag only
-    // affects tiling (fa_split), not a FAInfer template arg.
+    // and paged/causal are resolved inside the dispatch. flashDecodeFlag is
+    // also used to select the compile-time normal/FlashDecode kernel variant.
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     FwdLaunchArgs fwd_args;
     fwd_args.launchBlockDim = launchBlockDim;
