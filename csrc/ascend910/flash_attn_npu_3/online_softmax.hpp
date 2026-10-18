@@ -825,15 +825,20 @@ public:
                 rowNumCurLoop, columnNumRound / BLOCK_SIZE, 0, (columnNumPad - columnNumRound) / BLOCK_SIZE));
     }
 
-    template <bool doTriUMask>
-    __aicore__ inline
+    enum class BufferSyncMode : uint32_t {
+        NoMask = 0,
+        Masked = 1,
+    };
+
+    __aicore__ __attribute__((noinline))
     void SubCoreCompute(
         AscendC::GlobalTensor<ElementOutput> gOutput, const LayoutOutput &layoutOutput,
         uint32_t rowOffset, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t isFirstRowLoop, uint32_t isLastRowLoop,
         uint32_t columnNumRound, uint32_t pingpongFlag,
         uint32_t curStackTileMod, uint32_t taskStateSlot,
-        bool isSplitKV, bool startsWithMaskThenNomaskFlag = false)
+        bool isSplitKV, BufferSyncMode syncMode,
+        bool startsWithMaskThenNomaskFlag = false)
     {
         uint32_t rowNumCurLoop = layoutOutput.shape(0);
         uint32_t rowNumCurLoopRound = RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE);
@@ -843,7 +848,7 @@ public:
         uint32_t dmUbOffsetCurCycle = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffset;
         uint32_t stateRowOffset = taskStateSlot * 64 + rowOffset;
 
-        if constexpr (!doTriUMask) {
+        if (syncMode == BufferSyncMode::NoMask) {
             if (isLastNoMaskStackTile && isLastRowLoop) {
                 if (!startsWithMaskThenNomaskFlag) {
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
@@ -864,7 +869,7 @@ public:
             isFirstStackTile);
 
         CalcExp(sUbOffset, rowNumCurLoop, rowNumCurLoopRound, columnNum, columnNumRound, rowOffset);
-        if constexpr (!doTriUMask) {
+        if (syncMode == BufferSyncMode::NoMask) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(pingpongFlag);
         }
 
@@ -877,7 +882,7 @@ public:
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(pingpongFlag);
         CopyPUbToGm(gOutput, sUbOffset, rowNumCurLoop, columnNumRound, columnNumPad);
 
-        if constexpr (doTriUMask) {
+        if (syncMode == BufferSyncMode::Masked) {
             // Mask conversion aliases both P buffers; release both after the P store.
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
@@ -964,7 +969,7 @@ public:
                 if constexpr (HAS_SOFTCAP_) {
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
-                SubCoreCompute<false>(
+                SubCoreCompute(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
                     rowOffsetCurLoop,
@@ -977,6 +982,7 @@ public:
                     curStackTileMod,
                     taskStateSlot,
                     isSplitKV,
+                    BufferSyncMode::NoMask,
                     startsWithMaskThenNomaskFlag);
             }
             if (rowLoopIdx < rowLoopNum) {
@@ -1147,7 +1153,7 @@ public:
                 int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gOutputCurLoop = gOutput[offsetOutput];
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
-                SubCoreCompute<true>(
+                SubCoreCompute(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
                     rowOffsetCurLoop,
@@ -1159,7 +1165,8 @@ public:
                     pingpongFlag,
                     curStackTileMod,
                     taskStateSlot,
-                    isSplitKV);
+                    isSplitKV,
+                    BufferSyncMode::Masked);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
                 if (rowLoopIdx < rowLoopNum) {
                     uint32_t nextRowOffsetCurLoop = rowLoopIdx * rowNumTile;
@@ -1374,7 +1381,7 @@ public:
                 int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gOutputCurLoop = gOutput[offsetOutput];
                 auto layoutOutputCurLoop = layoutOutput.GetTileLayout(MatrixCoord(rowNumCurLoop, columnNum));
-                SubCoreCompute<true>(
+                SubCoreCompute(
                     gOutputCurLoop,
                     layoutOutputCurLoop,
                     rowOffsetCurLoop,
@@ -1387,6 +1394,7 @@ public:
                     curStackTileMod,
                     taskStateSlot,
                     isSplitKV,
+                    BufferSyncMode::Masked,
                     false);
                 // next loop mask load (after P copy releases shared UB via EVENT_ID0)
                 if (rowLoopIdx < rowLoopNum) {
