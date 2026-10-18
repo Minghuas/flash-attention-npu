@@ -37,19 +37,100 @@ struct alignas(64) TaskDesc {
     uint32_t batchIdx;
     uint32_t qNBlockIdx;
     uint32_t qSBlockIdx;
-    uint32_t qSeqlen;
-    uint32_t kvSeqlen;
     uint32_t kvStart;
     uint32_t kvEnd;
     int32_t startS2Idx;
     int32_t endS2Idx;
     uint32_t isSplitKV;
     uint32_t pipelineDrain;
+    uint32_t fdPlanIndex;
+    uint32_t headPlanIndex;
+    uint32_t maskPlanIndex;
+    uint32_t flags;
+    uint32_t reserved;
+};
+
+static_assert(sizeof(TaskDesc) == 64, "TaskDesc must occupy one 64-byte cache line");
+
+// Batch-shared geometry.  These values are generated once per batch and are
+// intentionally kept separate from TaskDesc so the same q/kv geometry is not
+// copied into every query/head task.
+struct BatchPlan {
+    uint32_t qSeqlen;
+    uint32_t kvSeqlen;
+    uint32_t qNBlockTile;
+    uint32_t qNBlockNumPerGroup;
+    uint32_t qNBlockNum;
+    uint32_t qSBlockTile;
+    uint32_t qSBlockNum;
+    uint32_t kSBlockTile;
+    uint32_t kSBlockNum;
+    uint32_t kSBlockTail;
+    uint32_t appendStartStack;
+    uint32_t flags;
+    uint32_t headPlanBase;
+    uint32_t headPlanCount;
+    uint32_t maskPlanBase;
+    uint32_t maskPlanCount;
+};
+
+static_assert(sizeof(BatchPlan) == 64, "BatchPlan layout must remain compact");
+
+struct HeadPlan {
+    uint32_t qNStart;
+    uint32_t qNSize;
+    uint32_t kvHeadOffset;
+};
+
+struct MaskPlan {
+    int32_t windowSizeLeftStartLen;
+    int32_t windowSizeLeftEndLen;
+    int32_t windowSizeRightStartLen;
+    int32_t windowSizeRightEndLen;
+    int32_t invalidSuffixStartRow;
+    int32_t invalidPrefixEndRow;
+    uint32_t noSkipKvS;
+    uint32_t kvStart;
+    uint32_t kvSLoopNumTotal;
+    uint32_t flags;
+};
+
+static_assert(sizeof(MaskPlan) == 40, "MaskPlan must remain compact");
+
+struct FDPlan {
+    // lseOffset is an LSE element offset; oOffset is an output element offset.
     uint64_t lseOffset;
     uint64_t oOffset;
 };
 
-static_assert(sizeof(TaskDesc) == 64, "TaskDesc must occupy one 64-byte cache line");
+// Batch-shared append-KV phase geometry.  Stack-local mask state remains in
+// the KV loop; these values are invariant for all tasks of one batch.
+struct AppendPlan {
+    uint32_t kvSeqlenOld;
+    uint32_t kvStartOld;
+    uint32_t kvLoopNumTotalNew;
+    uint32_t kvNewSeqlen;
+    uint32_t flags;
+    uint32_t reserved[3];
+};
+
+static_assert(sizeof(AppendPlan) == 32, "AppendPlan must remain compact");
+
+// Batch-shared GM bases. Q/K/V/O are byte offsets; lseBOffset is an element
+// offset and blockBOffset is a block-table entry offset.
+struct AddressPlan {
+    uint64_t qBOffset;
+    uint64_t kBOffset;
+    uint64_t vBOffset;
+    uint64_t oBOffset;
+    uint64_t lseBOffset;
+    uint64_t blockBOffset;
+    uint64_t kNewBOffset;
+    uint64_t vNewBOffset;
+    uint32_t lseHeadStride;
+};
+
+static_assert(sizeof(AddressPlan) == 72, "AddressPlan layout must remain compact");
 
 struct CoreTaskRange {
     uint32_t taskOffset;
@@ -63,12 +144,29 @@ struct alignas(64) SchedulerHeader {
     uint32_t taskCapacity;
     uint64_t taskDataOffset;
     uint64_t taskDataBytes;
+    uint64_t batchPlanOffset;
+    uint64_t batchPlanBytes;
+    uint64_t headPlanOffset;
+    uint64_t headPlanBytes;
+    uint64_t fdPlanOffset;
+    uint64_t fdPlanBytes;
+    uint64_t maskPlanOffset;
+    uint64_t maskPlanBytes;
+    uint64_t appendPlanOffset;
+    uint64_t appendPlanBytes;
+    uint64_t addressPlanOffset;
+    uint64_t addressPlanBytes;
     uint32_t status;
     uint32_t flashDecodeFlag;
-    uint32_t reserved[6];
+    uint32_t batchPlanCount;
+    uint32_t headPlanCount;
+    uint32_t fdPlanCount;
+    uint32_t maskPlanCount;
+    uint32_t appendPlanCount;
+    uint32_t addressPlanCount;
 };
 
-static_assert(sizeof(SchedulerHeader) == 64, "SchedulerHeader must occupy one cache line");
+static_assert(sizeof(SchedulerHeader) == 192, "SchedulerHeader must occupy three cache lines");
 
 struct FAInferTilingData {
     uint32_t numHeads;
