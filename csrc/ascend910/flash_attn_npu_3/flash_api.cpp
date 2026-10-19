@@ -4,6 +4,7 @@
 #include <cstring>
 #include <limits>
 #include <unordered_map>
+#include <vector>
 
 // mha_fwd_kvcache.cpp (SplitFuse::FAInfer) and fag_kernel.cpp (FAGGeneral) are
 // compiled separately in the autogen dispatch TUs; flash_api.cpp only needs
@@ -40,8 +41,40 @@ using namespace KernelCommon;
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 extern __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void* args);
+extern __global__ __aicpu__ uint32_t InitFATaskQueueV3(void* args);
+extern __global__ __aicpu__ uint32_t ProduceFATaskQueueV3(void* args);
 
 #define ACL_CHECK(expr) TORCH_CHECK((expr) == ACL_SUCCESS, #expr " failed")
+
+#ifdef FA_TASK_QUEUE_DEBUG
+static void DumpFATaskQueueTrace(uint64_t queueDevice, uint32_t blockDim)
+{
+    std::vector<SchedulerQueueSlot> queue(static_cast<size_t>(blockDim) * fa_metadata::PLAN_QUEUE_SLOTS);
+    if (aclrtMemcpy(queue.data(), queue.size() * sizeof(SchedulerQueueSlot),
+                    reinterpret_cast<const void*>(queueDevice),
+                    queue.size() * sizeof(SchedulerQueueSlot), ACL_MEMCPY_DEVICE_TO_HOST) != ACL_SUCCESS) {
+        return;
+    }
+    for (uint32_t core = 0; core < blockDim; ++core) {
+        for (uint32_t slot = 0; slot < fa_metadata::PLAN_QUEUE_SLOTS; ++slot) {
+            const SchedulerQueueSlot& entry = queue[core * fa_metadata::PLAN_QUEUE_SLOTS + slot];
+            const uint32_t* p = entry.readySeq.reserved;
+            if (p[QUEUE_TRACE_PRODUCER_WAIT_COUNT] == 0U &&
+                p[QUEUE_TRACE_PRODUCER_PUBLISHED_SEQ] == 0U) {
+                continue;
+            }
+            std::fprintf(stderr,
+                         "[FAQueue:host] core=%u slot=%u ready=%u free=%u "
+                         "prodWait=%u prodLast=%u prodPub=%u "
+                         "\n",
+                         core, slot, entry.readySeq.value, entry.freeSeq.value,
+                         p[QUEUE_TRACE_PRODUCER_WAIT_COUNT], p[QUEUE_TRACE_PRODUCER_LAST_SEQ],
+                         p[QUEUE_TRACE_PRODUCER_PUBLISHED_SEQ]);
+        }
+    }
+}
+
+#endif
 
 // Tensor sizes and scalar sequence bounds are int64_t. Validate them before
 // narrowing to the signed 32-bit dimensions used by the forward scheduler.
@@ -164,8 +197,8 @@ static uint32_t CountHostTaskDescriptors(const FAInferTilingData& tiling,
 constexpr uint32_t MAX_SCHEDULER_SCRATCH_CORES = 64;
 
 // The explicit host-tiling fallback must use the same metadata ABI as the
-// AICPU path.  Keep this builder deliberately mechanical: it only serializes
-// the task descriptors and does not change the legacy tiling calculation.
+// AICPU path. Serialize shared plans and core ranges; queue producers generate
+// task descriptors at runtime using the same legacy tiling calculation.
 static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, const fa_split::SplitContext& ctx,
                                   uint32_t batch, uint32_t numHeads, uint32_t numHeadsK, uint32_t maxQSeqlen,
                                   uint32_t blockDim, uint32_t headPlanCapacity, uint32_t fdPlanCapacity,
@@ -173,7 +206,6 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
 {
     auto* header = reinterpret_cast<SchedulerHeader*>(metadata + fa_metadata::SchedulerHeaderOffset());
     auto* ranges = reinterpret_cast<CoreTaskRange*>(metadata + fa_metadata::CoreRangeOffset());
-    auto* tasks = reinterpret_cast<TaskDesc*>(metadata + fa_metadata::TaskDataOffset(blockDim));
     const uint32_t groupSize = numHeadsK == 0 ? 1U : numHeads / numHeadsK;
     const uint32_t capacity = static_cast<uint32_t>(fa_metadata::TaskCapacity(
         batch, maxQSeqlen, numHeads, taskCapacityFactor));
@@ -181,8 +213,8 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
     header->version = fa_metadata::TASK_METADATA_VERSION;
     header->coreNum = blockDim;
     header->taskCapacity = capacity;
-    header->taskDataOffset = fa_metadata::TaskDataOffset(blockDim);
-    header->taskDataBytes = static_cast<uint64_t>(capacity) * sizeof(TaskDesc);
+    header->taskDataOffset = 0;
+    header->taskDataBytes = 0;
     header->batchPlanOffset = fa_metadata::BatchPlanOffset(
         blockDim, batch, maxQSeqlen, numHeads, taskCapacityFactor);
     header->batchPlanBytes = static_cast<uint64_t>(batch) * sizeof(BatchPlan);
@@ -311,7 +343,6 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
     auto* fdPlans = reinterpret_cast<FDPlan*>(metadata + header->fdPlanOffset);
 
     uint32_t counts[MAX_SCHEDULER_SCRATCH_CORES] = {};
-    uint32_t cursor[MAX_SCHEDULER_SCRATCH_CORES] = {};
     uint32_t total = 0;
     if (tiling->flashDecodeFlag == 0) {
         uint32_t global = 0;
@@ -344,34 +375,12 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
     uint32_t offset = 0;
     for (uint32_t core = 0; core < blockDim; ++core) {
         ranges[core] = {offset, counts[core]};
-        cursor[core] = offset;
         offset += ranges[core].taskCount;
     }
     header->actualTaskCount = total;
 
+    // Ordinary descriptors are generated by the queue producer.
     if (tiling->flashDecodeFlag == 0) {
-        uint32_t global = 0;
-        for (uint32_t b = 0; b < batch; ++b) {
-            const auto p = fa_split::getBatchParams(b, groupSize, ctx);
-            for (uint32_t s = 0; s < p.curQSBlockNum; ++s) {
-                for (uint32_t n = 0; n < p.curQNBlockNum; ++n, ++global) {
-                    const uint32_t core = global % blockDim;
-                    TaskDesc& t = tasks[cursor[core]++];
-                    std::memset(&t, 0, sizeof(t));
-                    t.batchIdx = b; t.qNBlockIdx = n; t.qSBlockIdx = s;
-                    t.kvEnd = p.curKSBlockNum;
-                    t.fdPlanIndex = fa_metadata::INVALID_FD_PLAN;
-                    t.headPlanIndex = batchPlans[b].headPlanBase + n;
-                    t.maskPlanIndex = batchPlans[b].maskPlanBase + s;
-                    if (fa_metadata::NeedsCopyback(b, s, p.curQSBlockNum)) {
-                        t.flags |= fa_metadata::TASK_FLAG_NEED_COPYBACK;
-                    }
-                    if (cursor[core] == ranges[core].taskOffset + ranges[core].taskCount) {
-                        t.pipelineDrain = 2;
-                    }
-                }
-            }
-        }
         return;
     }
     for (uint32_t core = 0; core < blockDim; ++core) {
@@ -391,24 +400,10 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
                     const int32_t ks = b == node.startBIdx && n == n0 && s == s0 ? node.startS2Idx : 0;
                     const int32_t ke = b == node.endBIdx && n == n1 && s == s1 ? node.endS2Idx : static_cast<int32_t>(p.curKSBlockNum);
                     const bool split = ke > ks && ke - ks < static_cast<int32_t>(p.curKSBlockNum);
-                    TaskDesc& t = tasks[cursor[core]++];
-                    std::memset(&t, 0, sizeof(t));
-                    t.batchIdx = b; t.qNBlockIdx = static_cast<uint32_t>(n); t.qSBlockIdx = static_cast<uint32_t>(s);
-                    t.kvStart = ks; t.kvEnd = ke;
-                    t.headPlanIndex = batchPlans[static_cast<uint32_t>(b)].headPlanBase +
-                                      static_cast<uint32_t>(n);
-                    t.maskPlanIndex = batchPlans[static_cast<uint32_t>(b)].maskPlanBase +
-                                      static_cast<uint32_t>(s);
-                    if (fa_metadata::NeedsCopyback(static_cast<uint32_t>(b),
-                                                   static_cast<uint32_t>(s), p.curQSBlockNum)) {
-                        t.flags |= fa_metadata::TASK_FLAG_NEED_COPYBACK;
-                    }
-                    t.startS2Idx = ks; t.endS2Idx = ke; t.isSplitKV = split; t.pipelineDrain =
-                        (b == node.endBIdx && n == n1 && s == s1) ? 2 : 0;
                     TORCH_CHECK(header->fdPlanCount < fdPlanCapacity, "scheduler FDPlan capacity exceeded");
-                    t.fdPlanIndex = header->fdPlanCount++;
-                    fdPlans[t.fdPlanIndex].lseOffset = lse;
-                    fdPlans[t.fdPlanIndex].oOffset = out;
+                    const uint32_t fdPlanIndex = header->fdPlanCount++;
+                    fdPlans[fdPlanIndex].lseOffset = lse;
+                    fdPlans[fdPlanIndex].oOffset = out;
                     if (split) {
                         const uint32_t qs = s == static_cast<int32_t>(p.curQSBlockNum - 1)
                             ? p.qSeqlen - static_cast<uint32_t>(s) * p.curQSBlockTile : p.curQSBlockTile;
@@ -695,7 +690,9 @@ std::vector<at::Tensor> mha_fwd(
     at::Tensor mask_gpu_tensor;
     at::Tensor tiling_gpu_tensor;
     uint8_t* tilingDevice = nullptr;
+    uint8_t* metadataDevice = nullptr;
     uint8_t* maskDevice = nullptr;
+    uint64_t taskQueueOffset = 0;
     bool flashDecodeFlag = false;
     bool is_local = false;
     bool has_softcap = (softcap > 0.0f);
@@ -767,6 +764,7 @@ std::vector<at::Tensor> mha_fwd(
                     "scheduler_metadata buffer size must exactly match this call's "
                     "causal/window-derived layout");
         auto metaBase = static_cast<uint8_t*>(schedMd.data_ptr());
+        metadataDevice = metaBase;
         tilingDevice = metaBase + fa_metadata::TilingOffset(hasMask);
         if (hasMask) {
             mask_gpu_tensor = MakeDeviceTriuMask();
@@ -780,7 +778,10 @@ std::vector<at::Tensor> mha_fwd(
             int64_t lseTasksUpper = static_cast<int64_t>(num_heads) * seqlen_q * kvSegUpper * 2;
             wsSplit = lseTasksUpper * 4 + lseTasksUpper * head_size_og * 4;
         }
-        workspace_tensor = at::empty({wsBase + wsSplit}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        taskQueueOffset = fa_metadata::AlignTaskMetadata(static_cast<uint64_t>(wsBase + wsSplit));
+        workspace_tensor = at::empty(
+            {static_cast<int64_t>(taskQueueOffset + fa_metadata::PlanQueueBytes(blockDim))},
+            at::device(at::kPrivateUse1).dtype(at::kByte));
         launchBlockDim = blockDim;
     } else {
         const uint32_t fdKvBoundForMetadata = paged_KV
@@ -988,7 +989,10 @@ std::vector<at::Tensor> mha_fwd(
         int64_t workSpaceSize = static_cast<int64_t>(mm1OutSize + smOnlineOutSize + mm2OutSize + UpdateSize +
                                                      splitLseTotalSize + splitOTotalSize);
 
-        workspace_tensor = at::empty({workSpaceSize}, at::device(at::kPrivateUse1).dtype(at::kByte));
+        taskQueueOffset = fa_metadata::AlignTaskMetadata(static_cast<uint64_t>(workSpaceSize));
+        workspace_tensor = at::empty(
+            {static_cast<int64_t>(taskQueueOffset + fa_metadata::PlanQueueBytes(blockDim))},
+            at::device(at::kPrivateUse1).dtype(at::kByte));
         // Empty FD splits (split \cap window == ∅) never write partials; init like FA GPU
         // (Oaccum=0, LSEaccum=-inf) so CombineScale ignores them.
         if (flashDecodeFlag && (splitLseTotalSize > 0 || splitOTotalSize > 0)) {
@@ -1019,6 +1023,7 @@ std::vector<at::Tensor> mha_fwd(
             mask_gpu_tensor = MakeDeviceTriuMask();
         }
         tiling_gpu_tensor = tiling_cpu_tensor.to(at::Device(at::kPrivateUse1));
+        metadataDevice = static_cast<uint8_t*>(tiling_gpu_tensor.data_ptr());
         tilingDevice = static_cast<uint8_t*>(tiling_gpu_tensor.data_ptr());
         maskDevice = (is_causal || is_local) ? static_cast<uint8_t*>(mask_gpu_tensor.data_ptr()) : nullptr;
     }
@@ -1061,6 +1066,99 @@ std::vector<at::Tensor> mha_fwd(
     auto kvSeqDevice = static_cast<uint8_t*>(seqlenk_gpu_tensor.data_ptr());
     auto workspaceDevice = static_cast<uint8_t*>(workspace_tensor.data_ptr());
     auto softmaxLseDevice = static_cast<uint8_t*>(softmaxlse.data_ptr());
+
+    const uint64_t taskQueueDevice = reinterpret_cast<uint64_t>(workspaceDevice + taskQueueOffset);
+    const uint64_t metadataDeviceAddr = reinterpret_cast<uint64_t>(metadataDevice);
+    {
+        c10_npu::NPUStream queueStream = c10_npu::getNPUStreamFromPool();
+        aclrtStream currentHandle = c10_npu::getCurrentNPUStream().stream(false);
+        aclrtStream queueHandle = queueStream.stream(false);
+        for (uint32_t retry = 0; queueHandle == currentHandle; ++retry) {
+            TORCH_CHECK(retry < 16U, "failed to acquire a queue stream distinct from the current stream");
+            queueStream = c10_npu::getNPUStreamFromPool();
+            queueHandle = queueStream.stream(false);
+        }
+        struct QueueEvents {
+            aclrtEvent inputReady = nullptr;
+            aclrtEvent slotsReady = nullptr;
+        };
+        static thread_local std::unordered_map<c10::DeviceIndex, QueueEvents> queueEventsByDevice;
+        QueueEvents& queueEvents = queueEventsByDevice[c10_npu::getCurrentNPUStream().device_index()];
+        if (queueEvents.inputReady == nullptr) {
+            ACL_CHECK(aclrtCreateEvent(&queueEvents.inputReady));
+            ACL_CHECK(aclrtCreateEvent(&queueEvents.slotsReady));
+        }
+        int64_t aicpuCoreCount = 1;
+        const auto deviceIndex = c10_npu::getCurrentNPUStream().device_index();
+        ACL_CHECK(aclrtGetDeviceInfo(static_cast<uint32_t>(deviceIndex), ACL_DEV_ATTR_AICPU_CORE_NUM,
+                                     &aicpuCoreCount));
+        const uint32_t producerCount = std::max<uint32_t>(
+            1U, std::min<uint32_t>(
+                    blockDim,
+                    std::max<uint32_t>(
+                        (blockDim + fa_metadata::MAX_CORES_PER_PRODUCER - 1U) /
+                            fa_metadata::MAX_CORES_PER_PRODUCER,
+                        static_cast<uint32_t>(std::max<int64_t>(1, aicpuCoreCount)))));
+        std::vector<c10_npu::NPUStream> producerStreams;
+        std::vector<FAMetadataQueueArgs> producerArgs;
+        producerStreams.reserve(producerCount);
+        producerArgs.reserve(producerCount);
+        const uint32_t baseCoreCount = blockDim / producerCount;
+        const uint32_t extraCoreCount = blockDim % producerCount;
+        uint32_t coreBegin = 0;
+        for (uint32_t producer = 0; producer < producerCount; ++producer) {
+            const uint32_t coreCount = baseCoreCount + (producer < extraCoreCount ? 1U : 0U);
+            bool streamAccepted = false;
+            for (uint32_t retry = 0; !streamAccepted; ++retry) {
+                TORCH_CHECK(retry < 16U, "failed to acquire distinct AICPU producer streams");
+                c10_npu::NPUStream producerStream = c10_npu::getNPUStreamFromPool();
+                const aclrtStream producerHandle = producerStream.stream(false);
+                streamAccepted = producerHandle != currentHandle && producerHandle != queueHandle;
+                for (const auto& existingStream : producerStreams) {
+                    streamAccepted = streamAccepted && producerHandle != existingStream.stream(false);
+                }
+                if (streamAccepted) {
+                    producerStreams.emplace_back(producerStream);
+                }
+            }
+            producerArgs.push_back(
+                FAMetadataQueueArgs{metadataDeviceAddr, taskQueueDevice, blockDim, coreBegin, coreBegin + coreCount});
+            coreBegin += coreCount;
+        }
+        FAMetadataQueueArgs initArgs{metadataDeviceAddr, taskQueueDevice, blockDim, 0U, blockDim};
+        auto launchQueue = [currentHandle, queueHandle, inputReady = queueEvents.inputReady,
+                            slotsReady = queueEvents.slotsReady, initArgs,
+                            producerStreams, producerArgs]() mutable -> int {
+            ACL_CHECK(aclrtRecordEvent(inputReady, currentHandle));
+            ACL_CHECK(aclrtStreamWaitEvent(queueHandle, inputReady));
+            InitFATaskQueueV3<<<1, nullptr, queueHandle>>>(&initArgs, sizeof(initArgs));
+            ACL_CHECK(aclrtRecordEvent(slotsReady, queueHandle));
+            for (size_t producer = 0; producer < producerStreams.size(); ++producer) {
+                aclrtStream producerHandle = producerStreams[producer].stream(false);
+                ACL_CHECK(aclrtStreamWaitEvent(producerHandle, slotsReady));
+                ProduceFATaskQueueV3<<<1, nullptr, producerHandle>>>(&producerArgs[producer],
+                                                                      sizeof(producerArgs[producer]));
+            }
+            ACL_CHECK(aclrtStreamWaitEvent(currentHandle, slotsReady));
+            return 0;
+        };
+        at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_task_queue", launchQueue);
+        c10_npu::NPUCachingAllocator::recordStream(workspace_tensor.storage().data_ptr(), queueStream);
+        for (const auto& producerStream : producerStreams) {
+            c10_npu::NPUCachingAllocator::recordStream(workspace_tensor.storage().data_ptr(), producerStream);
+        }
+        if (scheduler_metadata_.has_value()) {
+            c10_npu::NPUCachingAllocator::recordStream(scheduler_metadata_->storage().data_ptr(), queueStream);
+            for (const auto& producerStream : producerStreams) {
+                c10_npu::NPUCachingAllocator::recordStream(scheduler_metadata_->storage().data_ptr(), producerStream);
+            }
+        } else {
+            c10_npu::NPUCachingAllocator::recordStream(tiling_gpu_tensor.storage().data_ptr(), queueStream);
+            for (const auto& producerStream : producerStreams) {
+                c10_npu::NPUCachingAllocator::recordStream(tiling_gpu_tensor.storage().data_ptr(), producerStream);
+            }
+        }
+    }
     // Forward kernel launches live in fwd_dispatch_<dtype>_<layout>.cpp. Layout
     // is selected at runtime by is_varlen_q (varlen => TND, else BSND); dtype
     // and paged/causal are resolved inside the dispatch. flashDecodeFlag is
@@ -1101,6 +1199,11 @@ std::vector<at::Tensor> mha_fwd(
         return 0;
     };
     at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_infer", launch_fa_infer);
+#ifdef FA_TASK_QUEUE_DEBUG
+    if (scheduler_metadata_.has_value()) {
+        DumpFATaskQueueTrace(taskQueueDevice, blockDim);
+    }
+#endif
     return {out, softmaxlse, out_accum, softmax_lse_accum};
 }
 

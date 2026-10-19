@@ -337,8 +337,8 @@ class BishengBuildExt(build_ext):
             or os.getenv("FLASH_ATTN_FORCE_REBUILD", "FALSE") == "TRUE"
         )
 
-    def _build_aicpu_metadata(self, ext_fullpath, ext_name):
-        """Compile fa_metadata.aicpu (host AICPU object) for the extensions
+    def _build_aicpu_metadata(self, ext_fullpath, ext_name, source_name="fa_metadata"):
+        """Compile an AICPU source (host AICPU object) for the extensions
         that carry the scheduler-metadata feature (910 v2/v3/v4 and 950 v3/v4). This
         is a separate `bisheng -x aicpu` invocation (host CPU code
         cross-compiled with hcc, not ASC device code); the resulting object is
@@ -367,7 +367,7 @@ class BishengBuildExt(build_ext):
         src_dir = aicpu_src_dirs.get(ext_name)
         if src_dir is None:
             return None
-        aicpu_src = os.path.join(src_dir, "fa_metadata.aicpu")
+        aicpu_src = os.path.join(src_dir, source_name + ".aicpu")
         if not os.path.exists(aicpu_src):
             return None
         aicpu_obj = os.path.join(
@@ -375,7 +375,7 @@ class BishengBuildExt(build_ext):
             # All extensions share the build output directory.  Keep the
             # AICPU objects per extension; otherwise the later 950 build
             # overwrites the object already queued for the earlier one.
-            f"fa_metadata_{ext_name.replace('.', '_')}.o",
+            f"{source_name}_{ext_name.replace('.', '_')}.o",
         )
         # Incremental AICPU compilation must also track the local headers. In
         # particular, fa_metadata.aicpu includes tilingdata.h and metadata
@@ -506,9 +506,10 @@ class BishengBuildExt(build_ext):
         # after the parallel ASC compiles, before linking.
         for ext in self.extensions:
             ext_fullpath = self.get_ext_fullpath(ext.name)
-            aicpu_obj = self._build_aicpu_metadata(ext_fullpath, ext.name)
-            if aicpu_obj is not None:
-                objs_by_ext[ext.name].append(aicpu_obj)
+            for source_name in ("fa_metadata", "fa_task_queue"):
+                aicpu_obj = self._build_aicpu_metadata(ext_fullpath, ext.name, source_name)
+                if aicpu_obj is not None:
+                    objs_by_ext[ext.name].append(aicpu_obj)
 
         # Link each extension from its own object files (serial; link is cheap
         # relative to compile - measured ~1s/ext - so parallelizing would save

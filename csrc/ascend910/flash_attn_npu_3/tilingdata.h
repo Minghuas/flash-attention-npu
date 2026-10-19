@@ -137,6 +137,31 @@ struct CoreTaskRange {
     uint32_t taskCount;
 };
 
+// Per-core metadata ring. The task payload and each sequence word
+// occupy independent cache lines so AICPU never races a partially-written
+// descriptor or a stale sequence value.
+struct alignas(64) SchedulerQueueWord {
+    uint32_t value;
+    uint32_t reserved[13];
+};
+
+// Queue diagnostics use reserved words only in debug builds.  They preserve
+// the queue ABI and are read back by the host after the forward completes.
+enum QueueTraceField : uint32_t {
+    QUEUE_TRACE_PRODUCER_WAIT_COUNT = 7,
+    QUEUE_TRACE_PRODUCER_LAST_SEQ = 8,
+    QUEUE_TRACE_PRODUCER_PUBLISHED_SEQ = 9,
+};
+
+struct alignas(64) SchedulerQueueSlot {
+    TaskDesc task;
+    SchedulerQueueWord readySeq;
+    SchedulerQueueWord freeSeq;
+};
+
+static_assert(sizeof(SchedulerQueueWord) == 64, "SchedulerQueueWord must occupy one cache line");
+static_assert(sizeof(SchedulerQueueSlot) == 192, "SchedulerQueueSlot layout must remain stable");
+
 struct alignas(64) SchedulerHeader {
     uint32_t version;
     uint32_t coreNum;
@@ -164,6 +189,9 @@ struct alignas(64) SchedulerHeader {
     uint32_t maskPlanCount;
     uint32_t appendPlanCount;
     uint32_t addressPlanCount;
+    uint64_t queueAddr;
+    uint32_t queueBlockDim;
+    uint32_t queueSlotCount;
 };
 
 static_assert(sizeof(SchedulerHeader) == 192, "SchedulerHeader must occupy three cache lines");

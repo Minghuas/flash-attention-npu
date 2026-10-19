@@ -1,0 +1,230 @@
+/**
+ * Copyright (c) 2026, Minghua Shen.
+ * Queue initialization and concurrent AICPU task producers.
+ */
+
+#include "aicpu_api.h"
+#include "fa_metadata_args.h"
+#include <cstdint>
+#include <cstring>
+
+namespace {
+constexpr uint32_t PIPELINE_DRAIN = 2;
+
+inline void ClearTaskDesc(TaskDesc& task)
+{
+    std::memset(&task, 0, sizeof(TaskDesc));
+}
+
+// One cursor per serviced core. Batch and position advance monotonically;
+// preparing a task never reads the materialized TaskDesc array.
+struct QueueTaskCursor {
+    uint32_t batch = 0;
+    uint64_t position = 0;
+    uint32_t qNBlockNum;
+    uint32_t qSBlockNum;
+    uint32_t kSBlockNum;
+    uint32_t headPlanBase;
+    uint32_t maskPlanBase;
+    int32_t startS2Idx = 0;
+    int32_t endS2Idx = 0;
+};
+
+inline void CacheQueueBatch(QueueTaskCursor& cursor, const BatchPlan* batches)
+{
+    const BatchPlan& batch = batches[cursor.batch];
+    cursor.qNBlockNum = batch.qNBlockNum;
+    cursor.qSBlockNum = batch.qSBlockNum;
+    cursor.kSBlockNum = batch.kSBlockNum;
+    cursor.headPlanBase = batch.headPlanBase;
+    cursor.maskPlanBase = batch.maskPlanBase;
+}
+
+inline void InitQueueTaskCursor(QueueTaskCursor& cursor, uint32_t core, uint32_t seq,
+                                uint32_t blockDim, const FAInferTilingData& tiling,
+                                const BatchPlan* batches)
+{
+    if (tiling.flashDecodeFlag == 0U) {
+        cursor.position = static_cast<uint64_t>(seq) * blockDim + core;
+    } else {
+        const coreNode& node = tiling.coreInfo[core];
+        cursor.batch = static_cast<uint32_t>(node.startBIdx);
+        cursor.startS2Idx = node.startS2Idx;
+        cursor.endS2Idx = node.endS2Idx;
+        cursor.position = static_cast<uint64_t>(node.startN1Idx) *
+                          batches[cursor.batch].qSBlockNum + node.startS1Idx + seq;
+    }
+    CacheQueueBatch(cursor, batches);
+}
+
+inline void CalculateQueueTask(TaskDesc& task, QueueTaskCursor& cursor,
+                                uint32_t seq, uint32_t blockDim, const CoreTaskRange& range,
+                                bool flashDecode, const BatchPlan* batches)
+{
+    // Ordinary enumeration is batch/S/N; FD enumeration is batch/N/S.
+    while (cursor.position >= static_cast<uint64_t>(cursor.qNBlockNum) * cursor.qSBlockNum) {
+        cursor.position -= static_cast<uint64_t>(cursor.qNBlockNum) * cursor.qSBlockNum;
+        ++cursor.batch;
+        CacheQueueBatch(cursor, batches);
+    }
+    ClearTaskDesc(task);
+    task.batchIdx = cursor.batch;
+    task.pipelineDrain = seq + 1U == range.taskCount ? PIPELINE_DRAIN : 0U;
+    if (!flashDecode) {
+        task.qNBlockIdx = static_cast<uint32_t>(cursor.position % cursor.qNBlockNum);
+        task.qSBlockIdx = static_cast<uint32_t>(cursor.position / cursor.qNBlockNum);
+        task.kvEnd = cursor.kSBlockNum;
+        task.fdPlanIndex = fa_metadata::INVALID_FD_PLAN;
+        cursor.position += blockDim;
+    } else {
+        task.qNBlockIdx = static_cast<uint32_t>(cursor.position / cursor.qSBlockNum);
+        task.qSBlockIdx = static_cast<uint32_t>(cursor.position % cursor.qSBlockNum);
+        task.startS2Idx = seq == 0U ? cursor.startS2Idx : 0;
+        task.endS2Idx = seq + 1U == range.taskCount ? cursor.endS2Idx :
+                           static_cast<int32_t>(cursor.kSBlockNum);
+        task.kvStart = static_cast<uint32_t>(task.startS2Idx);
+        task.kvEnd = static_cast<uint32_t>(task.endS2Idx);
+        task.isSplitKV = task.endS2Idx > task.startS2Idx &&
+            task.endS2Idx - task.startS2Idx < static_cast<int32_t>(cursor.kSBlockNum);
+        // FDPlan generation uses the same core-major order as CoreTaskRange.
+        task.fdPlanIndex = range.taskOffset + seq;
+        ++cursor.position;
+    }
+    task.headPlanIndex = cursor.headPlanBase + task.qNBlockIdx;
+    task.maskPlanIndex = cursor.maskPlanBase + task.qSBlockIdx;
+    if (fa_metadata::NeedsCopyback(task.batchIdx, task.qSBlockIdx, cursor.qSBlockNum)) {
+        task.flags |= fa_metadata::TASK_FLAG_NEED_COPYBACK;
+    }
+}
+
+} // namespace
+
+// Fill the ring before launching the VEC consumers. CUBE continues
+// computes its task geometry independently; only VEC reads these queue slots.
+__global__ __aicpu__ uint32_t InitFATaskQueueV3(void *args)
+{
+    const FAMetadataQueueArgs* queueArgs = reinterpret_cast<const FAMetadataQueueArgs*>(args);
+    auto* metaBase = reinterpret_cast<uint8_t*>(queueArgs->metadataAddr);
+    auto* header = reinterpret_cast<SchedulerHeader*>(metaBase + fa_metadata::SchedulerHeaderOffset());
+    if (header->status != fa_metadata::TASK_METADATA_OK) {
+        return 1;
+    }
+    auto* ranges = reinterpret_cast<CoreTaskRange*>(metaBase + fa_metadata::CoreRangeOffset());
+    const auto* tiling = reinterpret_cast<const FAInferTilingData*>(metaBase);
+    const auto* batches = reinterpret_cast<const BatchPlan*>(metaBase + header->batchPlanOffset);
+    auto* queue = reinterpret_cast<SchedulerQueueSlot*>(queueArgs->queueAddr);
+
+    header->queueAddr = queueArgs->queueAddr;
+    header->queueBlockDim = queueArgs->blockDim;
+    header->queueSlotCount = fa_metadata::PLAN_QUEUE_SLOTS;
+    for (uint32_t core = 0; core < queueArgs->blockDim; ++core) {
+        const uint32_t taskCount = ranges[core].taskCount;
+        QueueTaskCursor cursor;
+        if (taskCount != 0U) {
+            InitQueueTaskCursor(cursor, core, 0U, queueArgs->blockDim, *tiling, batches);
+        }
+        for (uint32_t slot = 0; slot < fa_metadata::PLAN_QUEUE_SLOTS; ++slot) {
+            SchedulerQueueSlot& entry = queue[core * fa_metadata::PLAN_QUEUE_SLOTS + slot];
+            entry.readySeq.value = UINT32_MAX;
+            entry.freeSeq.value = UINT32_MAX;
+            for (uint32_t i = 0; i < 13U; ++i) {
+                entry.readySeq.reserved[i] = 0U;
+                entry.freeSeq.reserved[i] = 0U;
+            }
+            if (slot < taskCount) {
+                CalculateQueueTask(entry.task, cursor, slot, queueArgs->blockDim,
+                                   ranges[core], tiling->flashDecodeFlag != 0U, batches);
+                entry.readySeq.value = slot;
+            }
+        }
+    }
+    AscendC::DataStoreBarrier();
+    return 0;
+}
+
+// Each AICPU producer services a contiguous range of core-local queues on a
+// separate AICPU stream, so it runs concurrently with the VEC kernel and only
+// touches a slot after the VEC consumers publish its matching free sequence.
+__global__ __aicpu__ uint32_t ProduceFATaskQueueV3(void *args)
+{
+    const FAMetadataQueueArgs* queueArgs = reinterpret_cast<const FAMetadataQueueArgs*>(args);
+    auto* metaBase = reinterpret_cast<uint8_t*>(queueArgs->metadataAddr);
+    auto* header = reinterpret_cast<SchedulerHeader*>(metaBase + fa_metadata::SchedulerHeaderOffset());
+    if (header->status != fa_metadata::TASK_METADATA_OK) {
+        return 1;
+    }
+    auto* ranges = reinterpret_cast<CoreTaskRange*>(metaBase + fa_metadata::CoreRangeOffset());
+    const auto* tiling = reinterpret_cast<const FAInferTilingData*>(metaBase);
+    const auto* batches = reinterpret_cast<const BatchPlan*>(metaBase + header->batchPlanOffset);
+    auto* queue = reinterpret_cast<SchedulerQueueSlot*>(queueArgs->queueAddr);
+
+    const uint32_t coreBegin = queueArgs->coreBegin;
+    const uint32_t coreEnd = queueArgs->coreEnd;
+    if (coreEnd <= coreBegin || coreEnd - coreBegin > fa_metadata::MAX_CORES_PER_PRODUCER) {
+        return 1;
+    }
+    struct ProducerCoreState {
+        QueueTaskCursor cursor;
+        CoreTaskRange range;
+        SchedulerQueueSlot* queueBase;
+        uint32_t nextSeq;
+        bool precalculated = false;
+        TaskDesc pendingTask;
+    };
+    ProducerCoreState states[fa_metadata::MAX_CORES_PER_PRODUCER];
+    uint32_t active[fa_metadata::MAX_CORES_PER_PRODUCER];
+    uint32_t activeCount = 0;
+    const uint32_t blockDim = queueArgs->blockDim;
+    const bool flashDecode = tiling->flashDecodeFlag != 0U;
+    for (uint32_t core = coreBegin; core < coreEnd; ++core) {
+        const CoreTaskRange range = ranges[core];
+        if (range.taskCount <= fa_metadata::PLAN_QUEUE_SLOTS) {
+            continue;
+        }
+        const uint32_t localCore = core - coreBegin;
+        ProducerCoreState& state = states[localCore];
+        state.range = range;
+        state.queueBase = queue + core * fa_metadata::PLAN_QUEUE_SLOTS;
+        state.nextSeq = fa_metadata::PLAN_QUEUE_SLOTS;
+        InitQueueTaskCursor(state.cursor, core, state.nextSeq, blockDim, *tiling, batches);
+        active[activeCount++] = localCore;
+    }
+    while (activeCount != 0U) {
+        for (uint32_t index = 0; index < activeCount;) {
+            ProducerCoreState& state = states[active[index]];
+            // Bound each visit so a free ring cannot starve adjacent cores.
+            for (uint32_t burst = 0; burst < fa_metadata::PLAN_QUEUE_REFILL_BURST; ++burst) {
+                const uint32_t seq = state.nextSeq;
+                if (!state.precalculated) {
+                    CalculateQueueTask(state.pendingTask, state.cursor, seq, blockDim,
+                                       state.range, flashDecode, batches);
+                    state.precalculated = true;
+                }
+                SchedulerQueueSlot& entry = state.queueBase[seq % fa_metadata::PLAN_QUEUE_SLOTS];
+                const volatile uint32_t* freeSeq = &entry.freeSeq.value;
+                if (*freeSeq != seq - fa_metadata::PLAN_QUEUE_SLOTS) {
+                    break;
+                }
+                entry.task = state.pendingTask;
+                AscendC::DataStoreBarrier();
+                entry.readySeq.value = seq;
+                AscendC::DataStoreBarrier();
+                ++state.nextSeq;
+                state.precalculated = false;
+                if (state.nextSeq == state.range.taskCount) {
+                    break;
+                }
+            }
+            if (state.nextSeq == state.range.taskCount) {
+                // Preserve contiguous service order while dropping finished cores.
+                for (uint32_t next = index + 1U; next < activeCount; ++next) {
+                    active[next - 1U] = active[next];
+                }
+                --activeCount;
+            } else {
+                ++index;
+            }
+        }
+    }
+    return 0;
+}

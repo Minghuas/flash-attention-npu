@@ -18,7 +18,8 @@ constexpr uint32_t MASK_TYPE_CAUSAL = 1;
 // Keep in sync with FaiKenel::MaskType::MASK_BAND.
 constexpr uint32_t MASK_TYPE_BAND = 2;
 constexpr int64_t WINDOW_SIZE_INT_MAX = 2147483647;
-// Scratch bound only; metadata CoreTaskRange itself is sized by runtime blockDim.
+// Scratch bound for metadata construction; queue producer state is bounded by
+// fa_metadata::MAX_PRODUCER_CORES instead.
 constexpr uint32_t MAX_SCHEDULER_SCRATCH_CORES = 64;
 
 inline uint32_t CeilDiv(uint32_t a, uint32_t b)
@@ -36,12 +37,6 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
     return qNBlockTile;
 }
 
-constexpr uint32_t PIPELINE_DRAIN = 2;
-
-inline void ClearTaskDesc(TaskDesc& task)
-{
-    std::memset(&task, 0, sizeof(TaskDesc));
-}
 
 inline void InitSchedulerHeader(SchedulerHeader& header, uint32_t coreNum, uint32_t taskCapacity)
 {
@@ -49,8 +44,8 @@ inline void InitSchedulerHeader(SchedulerHeader& header, uint32_t coreNum, uint3
     header.version = fa_metadata::TASK_METADATA_VERSION;
     header.coreNum = coreNum;
     header.taskCapacity = taskCapacity;
-    header.taskDataOffset = fa_metadata::TaskDataOffset(coreNum);
-    header.taskDataBytes = static_cast<uint64_t>(taskCapacity) * sizeof(TaskDesc);
+    header.taskDataOffset = 0;
+    header.taskDataBytes = 0;
     header.batchPlanOffset = 0;
     header.batchPlanBytes = 0;
     header.batchPlanCount = 0;
@@ -163,44 +158,12 @@ inline void BuildAddressPlan(AddressPlan& plan, uint32_t batchIdx, const FAMetad
     plan.lseHeadStride = args.isVarlen != 0U ? totalQTokens : args.maxQSeqlen;
 }
 
-inline void SetOrdinaryTask(TaskDesc& task, uint32_t batchIdx, uint32_t qNBlockIdx, uint32_t qSBlockIdx,
-                            const fa_split::BatchParams& p, uint32_t pipelineDrain)
-{
-    ClearTaskDesc(task);
-    task.batchIdx = batchIdx;
-    task.qNBlockIdx = qNBlockIdx;
-    task.qSBlockIdx = qSBlockIdx;
-    task.kvEnd = p.curKSBlockNum;
-    task.pipelineDrain = pipelineDrain;
-    task.fdPlanIndex = fa_metadata::INVALID_FD_PLAN;
-}
 
-inline void SetFlashDecodeTask(TaskDesc& task, uint32_t batchIdx, uint32_t qNBlockIdx, uint32_t qSBlockIdx,
-                               const fa_split::BatchParams& p, int32_t startS2Idx, int32_t endS2Idx,
-                               uint32_t pipelineDrain, uint32_t fdPlanIndex,
-                               uint32_t groupSize, uint32_t embeddingSizeV)
-{
-    ClearTaskDesc(task);
-    task.batchIdx = batchIdx;
-    task.qNBlockIdx = qNBlockIdx;
-    task.qSBlockIdx = qSBlockIdx;
-    task.kvStart = static_cast<uint32_t>(startS2Idx);
-    task.kvEnd = static_cast<uint32_t>(endS2Idx);
-    task.startS2Idx = startS2Idx;
-    task.endS2Idx = endS2Idx;
-    task.isSplitKV = (endS2Idx > startS2Idx && endS2Idx - startS2Idx < static_cast<int32_t>(p.curKSBlockNum));
-    task.pipelineDrain = pipelineDrain;
-    task.fdPlanIndex = fdPlanIndex;
-    (void)groupSize;
-    (void)embeddingSizeV;
-}
-
-// Before this call, cursor[core] contains that core's task count. After this
-// call, cursor[core] contains the absolute write position of that core's first
-// task in the global TaskDesc array.
+// Assign logical core-major task ranges. Offsets also index FDPlan; no
+// materialized TaskDesc array is allocated.
 inline bool AllocateTaskRange(SchedulerHeader& header, CoreTaskRange* ranges, uint32_t coreNum,
                               uint32_t totalTaskCount, uint32_t taskCapacity,
-                              uint32_t (&cursor)[MAX_SCHEDULER_SCRATCH_CORES])
+                              const uint32_t (&counts)[MAX_SCHEDULER_SCRATCH_CORES])
 {
     if (coreNum == 0 || coreNum > MAX_SCHEDULER_SCRATCH_CORES || totalTaskCount > taskCapacity) {
         header.status = fa_metadata::TASK_METADATA_OVERFLOW;
@@ -210,8 +173,7 @@ inline bool AllocateTaskRange(SchedulerHeader& header, CoreTaskRange* ranges, ui
     uint32_t offset = 0;
     for (uint32_t core = 0; core < coreNum; ++core) {
         ranges[core].taskOffset = offset;
-        ranges[core].taskCount = cursor[core];
-        cursor[core] = offset;
+        ranges[core].taskCount = counts[core];
         offset += ranges[core].taskCount;
     }
     header.actualTaskCount = totalTaskCount;
@@ -257,7 +219,6 @@ inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* til
         metaArgs->taskCapacityFactor);
     header->addressPlanBytes = static_cast<uint64_t>(metaArgs->batch) * sizeof(AddressPlan);
     header->addressPlanCount = metaArgs->batch;
-    auto* tasks = reinterpret_cast<TaskDesc*>(metaBase + header->taskDataOffset);
     auto* batchPlans = reinterpret_cast<BatchPlan*>(metaBase + header->batchPlanOffset);
     auto* headPlans = reinterpret_cast<HeadPlan*>(metaBase + header->headPlanOffset);
     auto* fdPlans = reinterpret_cast<FDPlan*>(metaBase + header->fdPlanOffset);
@@ -266,7 +227,6 @@ inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* til
     auto* addressPlans = reinterpret_cast<AddressPlan*>(metaBase + header->addressPlanOffset);
 
     uint32_t counts[MAX_SCHEDULER_SCRATCH_CORES] = {};
-    uint32_t cursor[MAX_SCHEDULER_SCRATCH_CORES] = {};
     uint32_t totalTaskCount = 0;
 
     const uint32_t actualHeadPlanCount =
@@ -302,8 +262,7 @@ inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* til
     if (tilingData->flashDecodeFlag == 0) {
         uint32_t globalTaskIdx = 0;
         for (uint32_t b = 0; b < metaArgs->batch; ++b) {
-            const fa_split::BatchParams p = fa_split::getBatchParams(b, groupSize, ctx);
-            const uint32_t batchTasks = p.curQNBlockNum * p.curQSBlockNum;
+            const uint32_t batchTasks = batchPlans[b].qNBlockNum * batchPlans[b].qSBlockNum;
             for (uint32_t local = 0; local < batchTasks; ++local, ++globalTaskIdx) {
                 ++counts[globalTaskIdx % metaArgs->blockDim];
             }
@@ -334,32 +293,12 @@ inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* til
         }
     }
 
-    for (uint32_t core = 0; core < metaArgs->blockDim; ++core) {
-        cursor[core] = counts[core];
-    }
-    if (!AllocateTaskRange(*header, ranges, metaArgs->blockDim, totalTaskCount, taskCapacity, cursor)) {
+    if (!AllocateTaskRange(*header, ranges, metaArgs->blockDim, totalTaskCount, taskCapacity, counts)) {
         return false;
     }
 
+    // Ordinary descriptors are generated by the queue producer.
     if (tilingData->flashDecodeFlag == 0) {
-        uint32_t globalTaskIdx = 0;
-        for (uint32_t b = 0; b < metaArgs->batch; ++b) {
-            const fa_split::BatchParams p = fa_split::getBatchParams(b, groupSize, ctx);
-            for (uint32_t s = 0; s < p.curQSBlockNum; ++s) {
-                for (uint32_t n = 0; n < p.curQNBlockNum; ++n, ++globalTaskIdx) {
-                    const uint32_t core = globalTaskIdx % metaArgs->blockDim;
-                    const uint32_t taskIndex = cursor[core]++;
-                    const uint32_t local = taskIndex - ranges[core].taskOffset;
-                    const uint32_t drain = (local + 1 == ranges[core].taskCount) ? PIPELINE_DRAIN : 0;
-                    SetOrdinaryTask(tasks[taskIndex], b, n, s, p, drain);
-                    tasks[taskIndex].headPlanIndex = batchPlans[b].headPlanBase + n;
-                    tasks[taskIndex].maskPlanIndex = batchPlans[b].maskPlanBase + s;
-                    if (fa_metadata::NeedsCopyback(b, s, p.curQSBlockNum)) {
-                        tasks[taskIndex].flags |= fa_metadata::TASK_FLAG_NEED_COPYBACK;
-                    }
-                }
-            }
-        }
         return true;
     }
 
@@ -384,9 +323,6 @@ inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* til
                     const int32_t startS2 = (b == node.startBIdx && n == nBegin && s == sBegin) ? node.startS2Idx : 0;
                     const int32_t endS2 = (b == node.endBIdx && n == nEnd && s == sEnd) ? node.endS2Idx : static_cast<int32_t>(p.curKSBlockNum);
                     const bool split = endS2 > startS2 && endS2 - startS2 < static_cast<int32_t>(p.curKSBlockNum);
-                    const uint32_t taskIndex = cursor[core]++;
-                    const uint32_t local = taskIndex - ranges[core].taskOffset;
-                    const uint32_t drain = (b == node.endBIdx && n == nEnd && s == sEnd) ? PIPELINE_DRAIN : 0;
                     const uint32_t qSSize = s == static_cast<int32_t>(p.curQSBlockNum - 1)
                         ? p.qSeqlen - static_cast<uint32_t>(s) * p.curQSBlockTile : p.curQSBlockTile;
                     const uint32_t nInGroup = static_cast<uint32_t>(n) % p.qNBlockNumPerGroup;
@@ -399,17 +335,6 @@ inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* til
                     const uint32_t fdPlanIndex = header->fdPlanCount++;
                     fdPlans[fdPlanIndex].lseOffset = lseOffset;
                     fdPlans[fdPlanIndex].oOffset = oOffset;
-                    SetFlashDecodeTask(tasks[taskIndex], static_cast<uint32_t>(b), static_cast<uint32_t>(n),
-                                       static_cast<uint32_t>(s), p, startS2, endS2, drain, fdPlanIndex,
-                                       groupSize, metaArgs->embeddingSizeV);
-                    tasks[taskIndex].headPlanIndex = batchPlans[static_cast<uint32_t>(b)].headPlanBase +
-                                                     static_cast<uint32_t>(n);
-                    tasks[taskIndex].maskPlanIndex = batchPlans[static_cast<uint32_t>(b)].maskPlanBase +
-                                                    static_cast<uint32_t>(s);
-                    if (fa_metadata::NeedsCopyback(static_cast<uint32_t>(b),
-                                                   static_cast<uint32_t>(s), p.curQSBlockNum)) {
-                        tasks[taskIndex].flags |= fa_metadata::TASK_FLAG_NEED_COPYBACK;
-                    }
                     if (split) {
                         lseOffset += static_cast<uint64_t>(qSSize) * qNSize;
                         oOffset += static_cast<uint64_t>(qSSize) * qNSize * metaArgs->embeddingSizeV;

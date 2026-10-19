@@ -25,14 +25,19 @@ constexpr uint32_t APPEND_PLAN_ENABLED = 1u << 0;
 constexpr uint32_t MASK_PLAN_NOT_PRE_MASK = 1u << 0;
 constexpr uint32_t MASK_PLAN_NOT_NEXT_MASK = 1u << 1;
 constexpr uint64_t TASK_METADATA_ALIGN = 64;
+constexpr uint32_t PLAN_QUEUE_SLOTS = 8;
+constexpr uint32_t PLAN_QUEUE_REFILL_BURST = 4;
+// Bound the number of logical FA blocks served by one AICPU producer.  The
+// host may still use fewer or more producers according to the device count.
+constexpr uint32_t MAX_CORES_PER_PRODUCER = 8;
 constexpr uint32_t MASK_DIM = 2048;
 constexpr uint64_t MASK_BYTES = static_cast<uint64_t>(MASK_DIM) * MASK_DIM;
 constexpr uint32_t MASK_PLAN_STACK_LEN = 512;
 constexpr int64_t MASK_PLAN_WINDOW_MAX = 2147483647;
 
 // Append-KV copyback is selected per query-stack tile, for both ordinary and
-// FlashDecode tasks.  Keep the rule in one place so SetOrdinaryTask()'s flag
-// clearing cannot make the ordinary path diverge from the legacy logic.
+// FlashDecode tasks. Keep the rule shared by queue task generation and the
+// CUBE task loop so their copyback decisions match.
 static FA_METADATA_INLINE constexpr bool NeedsCopyback(uint32_t batchIdx, uint32_t qSBlockIdx, uint32_t qSBlockNum)
 {
     return qSBlockNum != 0U && qSBlockIdx == batchIdx % qSBlockNum;
@@ -168,11 +173,11 @@ constexpr uint64_t TaskCapacity(uint32_t batch, uint32_t maxQSeqlen, uint32_t nu
     return capacity == 0 ? 1 : capacity;
 }
 
-constexpr uint64_t BatchPlanOffset(uint32_t blockDim, uint32_t batch, uint32_t maxQSeqlen,
-                                   uint32_t numHeads, uint32_t numSplits = 1U)
+constexpr uint64_t BatchPlanOffset(uint32_t blockDim, uint32_t /*batch*/, uint32_t /*maxQSeqlen*/,
+                                   uint32_t /*numHeads*/, uint32_t /*numSplits*/ = 1U)
 {
-    return AlignTaskMetadata(TaskDataOffset(blockDim) +
-                             TaskCapacity(batch, maxQSeqlen, numHeads, numSplits) * sizeof(TaskDesc));
+    // TaskDesc is generated into the bounded queue; no full task array in GM.
+    return TaskDataOffset(blockDim);
 }
 
 constexpr uint32_t HeadPlanCapacity(uint32_t batch, uint32_t numHeads)
@@ -242,6 +247,11 @@ inline uint64_t MetadataBytes(bool /*has_mask*/, uint32_t batch, uint32_t maxQSe
            static_cast<uint64_t>(addressPlanCapacity) * sizeof(AddressPlan);
 }
 
+constexpr uint64_t PlanQueueBytes(uint32_t blockDim)
+{
+    return static_cast<uint64_t>(blockDim) * PLAN_QUEUE_SLOTS * sizeof(SchedulerQueueSlot);
+}
+
 constexpr uint64_t WORKSPACE_BLOCK_SIZE_DB = static_cast<uint64_t>(128) * 512;
 constexpr uint64_t PRELAUNCH_NUM = 3;
 inline uint64_t Mm1OutSize(uint64_t blockDim)
@@ -296,6 +306,16 @@ struct FAMetadataArgs {
     uint32_t headPlanCapacity;
     uint32_t fdPlanCapacity;
     uint32_t maskPlanCapacity;
+};
+
+struct FAMetadataQueueArgs {
+    uint64_t metadataAddr;
+    uint64_t queueAddr;
+    uint32_t blockDim;
+    // The initializer uses the whole block range; each producer receives a
+    // disjoint contiguous sub-range through these two fields.
+    uint32_t coreBegin;
+    uint32_t coreEnd;
 };
 
 #undef FA_METADATA_INLINE

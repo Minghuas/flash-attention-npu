@@ -24,6 +24,8 @@
 
 #include "kernel_common.hpp"
 #include "kernel_operator.h"
+#include "c_api/cache_ctrl/cache_ctrl.h"
+#include "c_api/sys_var/sys_var.h"
 #include "tilingdata.h"
 #include "fa_metadata_args.h"
 
@@ -412,14 +414,13 @@ class FAInferKernel {
         uint32_t issuedStackCount = 0;
         uint32_t prefillRemaining = PRE_LAUNCH;
         uint32_t taskStateSequence = 0;
-
 #ifdef __DAV_C220_VEC__
+        uint64_t steadyPreloadPc = 0;
         const auto* schedulerHeader = reinterpret_cast<const __gm__ SchedulerHeader*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + fa_metadata::SCHEDULER_HEADER_OFFSET);
         const auto* taskRanges = reinterpret_cast<const __gm__ CoreTaskRange*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + fa_metadata::CORE_RANGE_OFFSET);
-        const auto* taskList = reinterpret_cast<const __gm__ TaskDesc*>(
-            reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->taskDataOffset);
+        auto* taskQueue = reinterpret_cast<__gm__ SchedulerQueueSlot*>(schedulerHeader->queueAddr);
         const auto* batchPlans = reinterpret_cast<const __gm__ BatchPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->batchPlanOffset);
         const auto* headPlans = reinterpret_cast<const __gm__ HeadPlan*>(
@@ -436,6 +437,7 @@ class FAInferKernel {
         const bool idleCoreFD =
             FLASH_DECODE_FLAG && (fATilingData->needCoreNum != 0U) && (coreIdx >= fATilingData->needCoreNum);
         if (schedulerHeader->status == fa_metadata::TASK_METADATA_OK &&
+            taskQueue != nullptr && schedulerHeader->queueSlotCount == fa_metadata::PLAN_QUEUE_SLOTS &&
             coreIdx < schedulerHeader->coreNum && !idleCoreFD) {
             const __gm__ CoreTaskRange* taskRange = &taskRanges[coreIdx];
             uint32_t cachedBatchIdx = UINT32_MAX;
@@ -446,10 +448,62 @@ class FAInferKernel {
             uint32_t cachedMaskPlanIndex = UINT32_MAX;
             const __gm__ MaskPlan* cachedMaskPlan = nullptr;
             MaskPlan cachedMaskPlanValue{};
-            const __gm__ TaskDesc* drainTask = nullptr;
+            uint32_t drainPipeline = 0;
             const uint32_t blockStackNum = (MAX_KV_STACK_LEN - 1 + pagedBlockSize) / pagedBlockSize;
             for (uint32_t localTaskIdx = 0; localTaskIdx < taskRange->taskCount; ++localTaskIdx) {
-                const __gm__ TaskDesc* task = &taskList[taskRange->taskOffset + localTaskIdx];
+                const __gm__ TaskDesc* taskSource = nullptr;
+#ifdef __DAV_C220_VEC__
+                TaskDesc taskValue;
+                __gm__ SchedulerQueueSlot* queueSlot = nullptr;
+                {
+                    queueSlot = &taskQueue[coreIdx * fa_metadata::PLAN_QUEUE_SLOTS +
+                                            (localTaskIdx % fa_metadata::PLAN_QUEUE_SLOTS)];
+                    AscendC::GlobalTensor<uint32_t> readySeqTensor;
+                    readySeqTensor.SetGlobalBuffer(&queueSlot->readySeq.value, 1);
+                    const __gm__ volatile uint32_t* readySeq = &queueSlot->readySeq.value;
+                    if (steadyPreloadPc != 0U) {
+                        asc_icache_preload(reinterpret_cast<const void*>(steadyPreloadPc), static_cast<int64_t>(3));
+                    }
+                    for (uint64_t waitCount = 0;; ++waitCount) {
+                        const uint32_t observedReadySeq = *readySeq;
+                        if (observedReadySeq == localTaskIdx) {
+                            break;
+                        }
+                        AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                         AscendC::DcciDst::CACHELINE_OUT>(
+                            readySeqTensor);
+                    }
+                    // readySeq and TaskDesc occupy different cachelines.  The
+                    // ready flag becoming visible does not refresh the payload
+                    // line, so invalidate the descriptor before scalar loads.
+                    AscendC::GlobalTensor<uint32_t> taskTensor;
+                    taskTensor.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(&queueSlot->task),
+                                               sizeof(TaskDesc) / sizeof(uint32_t));
+                    AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                     AscendC::DcciDst::CACHELINE_OUT>(taskTensor);
+                    taskSource = &queueSlot->task;
+                }
+                taskValue.batchIdx = taskSource->batchIdx;
+                taskValue.qNBlockIdx = taskSource->qNBlockIdx;
+                taskValue.qSBlockIdx = taskSource->qSBlockIdx;
+                taskValue.kvStart = taskSource->kvStart;
+                taskValue.kvEnd = taskSource->kvEnd;
+                taskValue.startS2Idx = taskSource->startS2Idx;
+                taskValue.endS2Idx = taskSource->endS2Idx;
+                taskValue.isSplitKV = taskSource->isSplitKV;
+                taskValue.pipelineDrain = taskSource->pipelineDrain;
+                taskValue.fdPlanIndex = taskSource->fdPlanIndex;
+                taskValue.headPlanIndex = taskSource->headPlanIndex;
+                taskValue.maskPlanIndex = taskSource->maskPlanIndex;
+                taskValue.flags = taskSource->flags;
+                taskValue.reserved = taskSource->reserved;
+                TaskDesc* task = &taskValue;
+                if (queueSlot != nullptr) {
+                    ReleaseTaskQueueSlot(queueSlot, localTaskIdx);
+                }
+#else
+                const __gm__ TaskDesc* task = taskSource;
+#endif
                 if (task->batchIdx != cachedBatchIdx) {
                     cachedBatchIdx = task->batchIdx;
                     cachedBatchPlan = task->batchIdx < schedulerHeader->batchPlanCount
@@ -511,25 +565,25 @@ class FAInferKernel {
                 // Save the last valid task context.  The tail drain is emitted
                 // after the task loop, but it still consumes descriptors
                 // produced by the whole core-local task sequence.
-                drainTask = task;
+                drainPipeline = task->pipelineDrain;
                 const bool hasTaskWork = runMainLoop(
                     coreIdx, batchPlan->qSeqlen, batchPlan->kvSeqlen,
                     headPlan->qNStart, headPlan->qNSize, batchPlan->qNBlockTile, headPlan->kvHeadOffset,
                     task->qSBlockIdx, task->flags,
                     task->isSplitKV != 0, task->startS2Idx, task->endS2Idx, lseOffset, oOffset,
                     cachedMaskPlanValue, batchRuntime, globalTensors, descriptors, currentTaskStateSlot,
-                    issuedStackCount, prefillRemaining, softmaxPingPongFlag, blockStackNum);
+                    issuedStackCount, prefillRemaining, steadyPreloadPc, softmaxPingPongFlag, blockStackNum);
                 taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
             // Drain only consumes descriptors already submitted by the task
             // loop.  Keep it outside runMainLoop so the normal KV loop has no
             // drain branch or tail iteration in its hot footprint.
-            if (drainTask != nullptr && drainTask->pipelineDrain != 0U && issuedStackCount != 0U) {
+            if (drainPipeline != 0U && issuedStackCount != 0U) {
                 const uint32_t blockStackNum =
                     (MAX_KV_STACK_LEN - 1 + pagedBlockSize) / pagedBlockSize;
                 const uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
                 const uint32_t readyDrainCount = AscendC::Std::min(issuedStackCount, PRE_LAUNCH);
-                const uint32_t drainCount = AscendC::Std::min(drainTask->pipelineDrain, readyDrainCount);
+                const uint32_t drainCount = AscendC::Std::min(drainPipeline, readyDrainCount);
                 uint32_t drainStackCount = issuedStackCount - readyDrainCount;
                 for (uint32_t drainIdx = 0; drainIdx < drainCount; ++drainIdx) {
                     StackDescriptor& pvDesc = descriptors[drainStackCount % STACK_SLOTS];
@@ -1223,6 +1277,21 @@ class FAInferKernel {
         return taskPrefillCount;
     }
 
+#ifdef __DAV_C220_VEC__
+    __aicore__ inline void ReleaseTaskQueueSlot(__gm__ SchedulerQueueSlot* queueSlot, uint32_t taskSeq)
+    {
+        Arch::CrossCoreBarrier<0x1, PIPE_MTE3>();
+        if (AscendC::GetSubBlockIdx() == 0U) {
+            *reinterpret_cast<__gm__ volatile uint32_t*>(&queueSlot->freeSeq.value) = taskSeq;
+            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+            AscendC::GlobalTensor<uint32_t> freeSeqTensor;
+            freeSeqTensor.SetGlobalBuffer(&queueSlot->freeSeq.value, 1);
+            AscendC::DataCacheCleanAndInvalid<uint32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                             AscendC::DcciDst::CACHELINE_OUT>(freeSeqTensor);
+        }
+    }
+#endif
+
     __aicore__ inline bool runMainLoop(uint32_t coreIdx, uint32_t qSeqlen, uint32_t kvSeqlenCur,
                                        uint32_t qNStartIdx, uint32_t qNBlockSize, uint32_t qNBlockTile,
                                        uint32_t kvNIdx, uint32_t qSBlockIdx, uint32_t taskFlags,
@@ -1237,7 +1306,11 @@ class FAInferKernel {
                                        StackDescriptor (&descriptors)[STACK_SLOTS],
                                        const uint32_t& currentTaskStateSlot, uint32_t& issuedStackCount,
                                        uint32_t& prefillRemaining,
-                                       uint32_t& softmaxPingPongFlag, uint32_t blockStackNum)
+#ifdef __DAV_C220_VEC__
+                                       uint64_t& steadyPreloadPc,
+#endif
+                                       uint32_t& softmaxPingPongFlag,
+                                       uint32_t blockStackNum)
     {
         // Per batch KV length from the caller, already includes the appended new KV
         uint32_t kvSeqlen = kvSeqlenCur;
@@ -1371,6 +1444,12 @@ class FAInferKernel {
         int32_t steadyStackSeqCount = static_cast<int32_t>(taskPrefillCount);
         uint32_t steadyTaskStackCount = taskPrefillCount;
         for (uint32_t kvSIdx = kvStart + taskPrefillCount; kvSIdx < kvEnd; ++kvSIdx) {
+#ifdef __DAV_C220_VEC__
+            if (steadyPreloadPc == 0U) {
+                steadyPreloadPc = static_cast<uint64_t>(asc_get_program_counter()) & 0xFFFFFFFFFFFFULL;
+                asc_icache_preload(reinterpret_cast<const void*>(steadyPreloadPc), static_cast<int64_t>(3));
+            }
+#endif
             StackDescriptor& desc = descriptors[issuedStackCount % STACK_SLOTS];
             RunQKSoftmaxStack(stackCtx, kvSIdx, steadyStackSeqCount, steadyTaskStackCount,
                               issuedStackCount, softmaxPingPongFlag, globalTensors, desc,
