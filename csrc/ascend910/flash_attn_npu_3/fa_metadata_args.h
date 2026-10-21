@@ -9,6 +9,12 @@
 #include <cstdint>
 #include "tilingdata.h"
 
+#if defined(__DAV_C220_CUBE__) || defined(__DAV_C220_VEC__)
+#define FA_METADATA_INLINE __aicore__ inline
+#else
+#define FA_METADATA_INLINE inline
+#endif
+
 namespace fa_metadata {
 constexpr uint32_t TASK_METADATA_VERSION = 1;
 constexpr uint32_t TASK_METADATA_OK = 0;
@@ -27,19 +33,19 @@ constexpr int64_t MASK_PLAN_WINDOW_MAX = 2147483647;
 // Append-KV copyback is selected per query-stack tile, for both ordinary and
 // FlashDecode tasks.  Keep the rule in one place so SetOrdinaryTask()'s flag
 // clearing cannot make the ordinary path diverge from the legacy logic.
-constexpr bool NeedsCopyback(uint32_t batchIdx, uint32_t qSBlockIdx, uint32_t qSBlockNum)
+static FA_METADATA_INLINE constexpr bool NeedsCopyback(uint32_t batchIdx, uint32_t qSBlockIdx, uint32_t qSBlockNum)
 {
     return qSBlockNum != 0U && qSBlockIdx == batchIdx % qSBlockNum;
 }
 
-inline uint32_t MaskPlanCeilDiv(uint32_t a, uint32_t b)
+static FA_METADATA_INLINE uint32_t MaskPlanCeilDiv(uint32_t a, uint32_t b)
 {
     return b == 0 ? 0 : (a + b - 1) / b;
 }
 
-inline MaskPlan BuildMaskPlan(uint32_t qSeqlen, uint32_t kvSeqlen, uint32_t qSBlockIdx,
-                              uint32_t qSBlockTile, uint32_t qSBlockSize, uint32_t maskType,
-                              int64_t windowLeft, int64_t windowRight)
+static FA_METADATA_INLINE MaskPlan BuildMaskPlan(uint32_t qSeqlen, uint32_t kvSeqlen, uint32_t qSBlockIdx,
+                                                 uint32_t qSBlockTile, uint32_t qSBlockSize, uint32_t maskType,
+                                                 int64_t windowLeft, int64_t windowRight)
 {
     MaskPlan p{};
     p.noSkipKvS = kvSeqlen;
@@ -291,5 +297,7 @@ struct FAMetadataArgs {
     uint32_t fdPlanCapacity;
     uint32_t maskPlanCapacity;
 };
+
+#undef FA_METADATA_INLINE
 
 #endif
