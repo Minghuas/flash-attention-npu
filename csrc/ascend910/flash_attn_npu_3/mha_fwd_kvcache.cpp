@@ -161,6 +161,7 @@ class FAInferKernel {
         uint32_t kvSLoopNumTotalOld;
         uint32_t kvStart;
         uint32_t kvEnd;
+        int32_t lastNoMaskStackId;
 #ifdef __DAV_C220_VEC__
         int32_t windowSizeLeftStartLen;
         int32_t windowSizeLeftEndLen;
@@ -1085,29 +1086,14 @@ class FAInferKernel {
         const uint32_t kvSEndIdx = kvSStartIdx + desc.stackSeqTile;
         if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
             const int64_t triUp = static_cast<int64_t>(ctx.noSkipKvS) - static_cast<int64_t>(ctx.qSBlockSize);
-            const uint32_t triDown = ctx.noSkipKvS;
             const bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1U);
-            uint32_t isLastNoMaskStackTile = 0;
-            if (!doTriUMask) {
-                uint32_t lastNoMaskTile;
-                if (triUp + 1U == ctx.kvSeqlen) {
-                    lastNoMaskTile = ctx.kvSLoopNumTotal - 1U;
-                } else if (triUp + 1U == ctx.kvSeqlenOld) {
-                    lastNoMaskTile = ctx.kvStartOld - 1U;
-                } else if (triUp + 1U < ctx.kvSeqlenOld) {
-                    lastNoMaskTile = (triUp + 1U) / MAX_KV_STACK_LEN - 1U;
-                } else {
-                    lastNoMaskTile = ctx.kvStartOld + (triUp + 1U - ctx.kvSeqlenOld) / MAX_KV_STACK_LEN - 1U;
-                }
-                const int32_t lastNoMaskStackId =
-                    lastNoMaskTile - (FLASH_DECODE_FLAG ? static_cast<int32_t>(ctx.kvStart) : 0);
-                isLastNoMaskStackTile = (stackSeqCount == lastNoMaskStackId);
-            }
+            const uint32_t isLastNoMaskStackTile =
+                !doTriUMask && stackSeqCount == ctx.lastNoMaskStackId;
             // Both causal tile modes use the same row pipeline, including unmasked tiles.
             epilogueOnlineSoftmax(gP[gmOffsetS], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
                                   actualBlockShapeQK, desc.firstStack, ctx.qSBlockSize, ctx.qNBlockSize,
                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                  triUp, triDown, kvSStartIdx, kvSEndIdx, doTriUMask,
+                                  triUp, kvSStartIdx, kvSEndIdx, doTriUMask,
                                   isLastNoMaskStackTile, ctx.isSplitKV);
         } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             const int32_t kvStartI = static_cast<int32_t>(kvSStartIdx);
@@ -1123,29 +1109,17 @@ class FAInferKernel {
                       (ctx.windowSizeRightEndLen > kvStartI && ctx.windowSizeRightEndLen <= kvEndI) ||
                       (ctx.windowSizeRightStartLen <= kvStartI && ctx.windowSizeRightEndLen >= kvEndI);
             const bool doTriUMask = doTriUPreMask || doTriUNextMask;
-            uint32_t lastNoMaskStackTile = 0;
             if (doTriUMask) {
                 startsWithMaskTile = true;
                 startsWithMaskThenNomaskFlag = true;
-
-            } else {
-                const bool isLastNoMaskStackTile =
-                    (ctx.windowSizeRightStartLen >= ctx.kvSeqlen) || (ctx.windowSizeRightStartLen < 0);
-                const uint32_t kvSeqlenLimit =
-                    isLastNoMaskStackTile ? ctx.kvSeqlen : ctx.windowSizeRightStartLen;
-                const uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile
-                    ? RoundUp(kvSeqlenLimit, MAX_KV_STACK_LEN)
-                    : RoundDown(kvSeqlenLimit, MAX_KV_STACK_LEN);
-                const uint32_t noMaskStackSeqNum =
-                    (alignedKvSeqlenLimit - ctx.kvStart * MAX_KV_STACK_LEN) / MAX_KV_STACK_LEN;
-                lastNoMaskStackTile = (stackSeqCount == noMaskStackSeqNum - 1);
             }
             epilogueOnlineSoftmax(gP[gmOffsetS], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
                                   actualBlockShapeQK, desc.firstStack, ctx.qSBlockSize, ctx.qNBlockSize,
                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
                                   kvSStartIdx, doTriUPreMask, doTriUNextMask, ctx.windowSizeLeftStartLen,
                                   ctx.windowSizeLeftEndLen, ctx.windowSizeRightStartLen,
-                                  ctx.windowSizeRightEndLen, ctx.isSplitKV, lastNoMaskStackTile,
+                                  ctx.windowSizeRightEndLen, ctx.isSplitKV,
+                                  static_cast<uint32_t>(!doTriUMask && stackSeqCount == ctx.lastNoMaskStackId),
                                   startsWithMaskTile, startsWithMaskThenNomaskFlag);
             if (!doTriUMask) {
                 startsWithMaskTile = false;
@@ -1301,6 +1275,45 @@ class FAInferKernel {
             return false;
         }
 
+        int32_t lastNoMaskStackId = -1;
+#ifdef __DAV_C220_VEC__
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+            const int64_t triUp = static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
+            const int64_t diagonalEnd = triUp + 1;
+            if (diagonalEnd > 0) {
+                uint32_t lastNoMaskTile;
+                if (diagonalEnd == static_cast<int64_t>(kvSeqlen)) {
+                    lastNoMaskTile = kvSLoopNumTotal - 1U;
+                } else if (diagonalEnd == static_cast<int64_t>(kvSeqlenOld)) {
+                    lastNoMaskTile = kvStartOld - 1U;
+                } else if (diagonalEnd < static_cast<int64_t>(kvSeqlenOld)) {
+                    lastNoMaskTile = static_cast<uint32_t>(diagonalEnd) / MAX_KV_STACK_LEN - 1U;
+                } else {
+                    lastNoMaskTile = kvStartOld +
+                        (static_cast<uint32_t>(diagonalEnd) - kvSeqlenOld) / MAX_KV_STACK_LEN - 1U;
+                }
+                lastNoMaskStackId = static_cast<int32_t>(lastNoMaskTile) -
+                    (FLASH_DECODE_FLAG ? static_cast<int32_t>(kvStart) : 0);
+            }
+        } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+            const bool lastWindowTile = (windowSizeRightStartLen >= static_cast<int32_t>(kvSeqlen)) ||
+                (windowSizeRightStartLen < 0);
+            const uint32_t kvSeqlenLimit = lastWindowTile ? kvSeqlen :
+                static_cast<uint32_t>(windowSizeRightStartLen);
+            const uint32_t alignedKvSeqlenLimit = lastWindowTile
+                ? RoundUp(kvSeqlenLimit, MAX_KV_STACK_LEN)
+                : RoundDown(kvSeqlenLimit, MAX_KV_STACK_LEN);
+            const uint32_t kvStartOffset = kvStart * MAX_KV_STACK_LEN;
+            if (alignedKvSeqlenLimit >= kvStartOffset) {
+                const uint32_t noMaskStackSeqNum =
+                    (alignedKvSeqlenLimit - kvStartOffset) / MAX_KV_STACK_LEN;
+                if (noMaskStackSeqNum != 0U) {
+                    lastNoMaskStackId = static_cast<int32_t>(noMaskStackSeqNum - 1U);
+                }
+            }
+        }
+#endif
+
 #ifdef __DAV_C220_CUBE__
         LayoutQ layoutQTemp(rowNum, embed);
         blockMmadQK.resetBlockStart(kvStart, pagedBlockSize);
@@ -1323,6 +1336,7 @@ class FAInferKernel {
             isSplitKV, appendKVFlag, kvSeqlenOld, kvStartOld, kvLoopNumTotalNew, kvNewSeqlen,
             gmOffsetQ, gmOffsetK, gmOffsetKNew, blockBOffset, qSBlockSize, noSkipKvS,
             kvSLoopNumTotal, kvSLoopNumTotalOld, kvStart, kvEnd,
+            lastNoMaskStackId,
 #ifdef __DAV_C220_VEC__
             windowSizeLeftStartLen,
             windowSizeLeftEndLen, windowSizeRightStartLen, windowSizeRightEndLen, notPreMask, notNextMask,

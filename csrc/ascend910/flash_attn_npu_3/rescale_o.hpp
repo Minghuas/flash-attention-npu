@@ -103,12 +103,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
 
     __aicore__ inline void SetMask(int32_t len)
     {
-        uint64_t mask = 0;
-        uint64_t one = 1;
         uint64_t temp = static_cast<uint64_t>(len) % static_cast<uint64_t>(FLOAT_VECTOR_SIZE);
-        for (uint64_t i = 0; i < temp; i++) {
-            mask |= one << i;
-        }
+        uint64_t mask = (uint64_t{1} << temp) - uint64_t{1};
 
         if (len == VECTOR_SIZE) {
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
@@ -137,8 +133,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
             const uint32_t prefixRows = AscendC::Std::min(static_cast<int64_t>(rowsPerHead),
                                                           static_cast<int64_t>(invalidPrefixEndRow) - tokenStart);
             headMask |= ~uint64_t{0} >> (FLOAT_VECTOR_SIZE - prefixRows);
-        }
-        if (invalidSuffixStartRow > 0 && invalidSuffixStartRow < tokenStart + rowsPerHead) {
+        } else if (invalidSuffixStartRow > 0 && invalidSuffixStartRow < tokenStart + rowsPerHead) {
             const uint32_t suffixStart = invalidSuffixStartRow > tokenStart ? invalidSuffixStartRow - tokenStart : 0U;
             const uint32_t suffixRows = rowsPerHead - suffixStart;
             headMask |= (~uint64_t{0} >> (FLOAT_VECTOR_SIZE - suffixRows)) << suffixStart;
@@ -164,34 +159,25 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
             return;
         }
 
-        // invalidSuffixStartRow marks an invalid suffix [invalidSuffixStartRow, qSeqlen).
-        if (invalidSuffixStartRow > 0) {
-            uint32_t suffixStart = static_cast<uint32_t>(invalidSuffixStartRow);
-            uint32_t localStart = 0U;
-            if (tokenStart < suffixStart) {
-                uint32_t validPrefix = suffixStart - tokenStart;
-                localStart = validPrefix < tokenNum ? validPrefix : tokenNum;
-            }
-            if (localStart < tokenNum) {
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Duplicate<ElementOutput>(goUbTensor16[(ubRowOffset + localStart) * embedRound],
-                                                  static_cast<ElementOutput>(0), (tokenNum - localStart) * embedRound);
-            }
+        // BuildMaskPlan emits one invalid interval per output tile: either a suffix
+        // or a prefix. Keep the clear as one contiguous Duplicate in the hot path.
+        if (invalidSuffixStartRow <= 0 &&
+            (invalidPrefixEndRow < 0 || invalidPrefixEndRow == static_cast<int32_t>(qSeqlen))) {
+            return;
         }
-
-        // invalidPrefixEndRow marks an invalid prefix [0, invalidPrefixEndRow).
-        if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != static_cast<int32_t>(qSeqlen)) {
-            uint32_t prefixEnd = static_cast<uint32_t>(invalidPrefixEndRow);
-            uint32_t localEnd = 0U;
-            if (tokenStart < prefixEnd) {
-                uint32_t invalidPrefix = prefixEnd - tokenStart;
-                localEnd = invalidPrefix < tokenNum ? invalidPrefix : tokenNum;
-            }
-            if (localEnd > 0U) {
-                AscendC::PipeBarrier<PIPE_V>();
-                AscendC::Duplicate<ElementOutput>(goUbTensor16[ubRowOffset * embedRound], static_cast<ElementOutput>(0),
-                                                  localEnd * embedRound);
-            }
+        uint32_t invalidBegin = tokenStart;
+        uint32_t invalidEnd = tokenStart + tokenNum;
+        if (invalidSuffixStartRow > 0) {
+            invalidBegin = AscendC::Std::max(invalidBegin, static_cast<uint32_t>(invalidSuffixStartRow));
+        } else if (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != static_cast<int32_t>(qSeqlen)) {
+            invalidEnd = AscendC::Std::min(invalidEnd, static_cast<uint32_t>(invalidPrefixEndRow));
+        }
+        if (invalidBegin < invalidEnd) {
+            AscendC::PipeBarrier<PIPE_V>();
+            AscendC::Duplicate<ElementOutput>(
+                goUbTensor16[(ubRowOffset + invalidBegin - tokenStart) * embedRound],
+                static_cast<ElementOutput>(0),
+                (invalidEnd - invalidBegin) * embedRound);
         }
     }
 
@@ -200,26 +186,30 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                                      uint32_t qSThisSubBlock, uint32_t embed, uint32_t embedRound,
                                      uint32_t outputStride, uint32_t oHeadStride)
     {
-        uint32_t innerOGmOffset = 0;
-        uint32_t innerGOUbOffset = 0;
-        if (proTokenNum != 0U) {
-            AscendC::DataCopyPad(gOutput[innerOGmOffset + proTokenIdx * outputStride], goUbTensor16[innerGOUbOffset],
-                                 AscendC::DataCopyExtParams(proTokenNum, embed * SIZE_OF_16BIT, 0,
-                                                            (outputStride - embed) * SIZE_OF_16BIT, 0));
-            innerOGmOffset += oHeadStride;
-            innerGOUbOffset += proTokenNum * embedRound;
-        }
-        for (uint32_t qN_idx = 0; qN_idx < integralHeadNum; qN_idx++) {
-            AscendC::DataCopyPad(gOutput[innerOGmOffset], goUbTensor16[innerGOUbOffset],
-                                 AscendC::DataCopyExtParams(qSThisSubBlock, embed * SIZE_OF_16BIT, 0,
-                                                            (outputStride - embed) * SIZE_OF_16BIT, 0));
-            innerOGmOffset += oHeadStride;
-            innerGOUbOffset += qSThisSubBlock * embedRound;
-        }
-        if (epiTokenNum != 0U) {
-            AscendC::DataCopyPad(gOutput[innerOGmOffset], goUbTensor16[innerGOUbOffset],
-                                 AscendC::DataCopyExtParams(epiTokenNum, embed * SIZE_OF_16BIT, 0,
-                                                            (outputStride - embed) * SIZE_OF_16BIT, 0));
+        uint32_t sourceRow = 0U;
+        uint32_t fullHeadIdx = 0U;
+        uint32_t remaining = proTokenNum + integralHeadNum * qSThisSubBlock + epiTokenNum;
+        while (remaining != 0U) {
+            uint32_t copyRows;
+            uint32_t gmOffset;
+            if (proTokenNum != 0U && sourceRow == 0U) {
+                copyRows = proTokenNum;
+                gmOffset = proTokenIdx * outputStride;
+            } else if (fullHeadIdx < integralHeadNum) {
+                copyRows = qSThisSubBlock;
+                gmOffset = ((proTokenNum != 0U ? 1U : 0U) + fullHeadIdx) * oHeadStride;
+                ++fullHeadIdx;
+            } else {
+                copyRows = epiTokenNum;
+                gmOffset = ((proTokenNum != 0U ? 1U : 0U) + integralHeadNum) * oHeadStride;
+            }
+            AscendC::DataCopyPad(
+                gOutput[gmOffset],
+                goUbTensor16[sourceRow * embedRound],
+                AscendC::DataCopyExtParams(
+                    copyRows, embed * SIZE_OF_16BIT, 0, (outputStride - embed) * SIZE_OF_16BIT, 0));
+            sourceRow += copyRows;
+            remaining -= copyRows;
         }
     }
 
@@ -230,74 +220,77 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                                          uint32_t qSThisSubBlock, uint32_t embed, uint32_t embedRound,
                                          uint32_t oHiddenSize, uint32_t oHiddenSize_gmlo)
     {
-        uint32_t innerOGmOffset = 0;
-        uint32_t innerGOUbOffset = 0;
         uint32_t blockLen = embed * sizeof(float);
         uint32_t blockLenAligned = (blockLen + 31) / 32 * 32;
         uint32_t srcStride = (embedRound * sizeof(float) - blockLenAligned) / 32;
-        if (proTokenNum != 0U) {
-            AscendC::DataCopyPad(gOutput[innerOGmOffset + proTokenIdx * oHiddenSize_gmlo],
-                                 goUbTensor32[innerGOUbOffset],
-                                 AscendC::DataCopyExtParams(proTokenNum, blockLen, srcStride,
-                                                            (oHiddenSize_gmlo - embed) * sizeof(float), 0));
-            innerOGmOffset += embed;
-            innerGOUbOffset += proTokenNum * embedRound;
-        }
-        for (uint32_t qN_idx = 0; qN_idx < integralHeadNum; qN_idx++) {
-            AscendC::DataCopyPad(gOutput[innerOGmOffset], goUbTensor32[innerGOUbOffset],
-                                 AscendC::DataCopyExtParams(qSThisSubBlock, blockLen, srcStride,
-                                                            (oHiddenSize_gmlo - embed) * sizeof(float), 0));
-            innerOGmOffset += embed;
-            innerGOUbOffset += qSThisSubBlock * embedRound;
-        }
-        if (epiTokenNum != 0U) {
-            AscendC::DataCopyPad(gOutput[innerOGmOffset], goUbTensor32[innerGOUbOffset],
-                                 AscendC::DataCopyExtParams(epiTokenNum, blockLen, srcStride,
-                                                            (oHiddenSize_gmlo - embed) * sizeof(float), 0));
+        uint32_t sourceRow = 0U;
+        uint32_t fullHeadIdx = 0U;
+        uint32_t remaining = proTokenNum + integralHeadNum * qSThisSubBlock + epiTokenNum;
+        while (remaining != 0U) {
+            uint32_t copyRows;
+            uint32_t gmOffset;
+            if (proTokenNum != 0U && sourceRow == 0U) {
+                copyRows = proTokenNum;
+                gmOffset = proTokenIdx * oHiddenSize_gmlo;
+            } else if (fullHeadIdx < integralHeadNum) {
+                copyRows = qSThisSubBlock;
+                gmOffset = ((proTokenNum != 0U ? 1U : 0U) + fullHeadIdx) * embed;
+                ++fullHeadIdx;
+            } else {
+                copyRows = epiTokenNum;
+                gmOffset = ((proTokenNum != 0U ? 1U : 0U) + integralHeadNum) * embed;
+            }
+            AscendC::DataCopyPad(
+                gOutput[gmOffset],
+                goUbTensor32[sourceRow * embedRound],
+                AscendC::DataCopyExtParams(
+                    copyRows, blockLen, srcStride, (oHiddenSize_gmlo - embed) * sizeof(float), 0));
+            sourceRow += copyRows;
+            remaining -= copyRows;
         }
     }
 
-    __aicore__ inline void
-    SubCoreCompute(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
-                   AscendC::GlobalTensor<ElementUpdate> gUpdate, AscendC::GlobalTensor<ElementLse> gLse,
-                   const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutUpdate& layoutUpdate,
-                   const LayoutLse& layoutLse, uint32_t qNThisSubBlock, uint32_t qSThisSubBlock, uint32_t totalRowNum,
-                   uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
-                   uint32_t taskStateSlot, uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
-                   uint32_t proTokenIdx, uint32_t proTokenNum, uint32_t epiTokenNum, uint32_t integralHeadNum,
-                   const SplitKVParams& splitParams, uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow,
-                   int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx, uint32_t rowNum,
-                   uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile, uint32_t outputStride,
-                   uint32_t oHeadStride)
+    __aicore__ inline
+    void SubCoreCompute(
+        AscendC::GlobalTensor<ElementOutput> gOutput,
+        AscendC::GlobalTensor<ElementInput> gInput,
+        AscendC::GlobalTensor<ElementUpdate> gUpdate,
+        AscendC::GlobalTensor<ElementLse> gLse,
+        const LayoutOutput &layoutOutput,
+        const LayoutInput &layoutInput,
+        const LayoutUpdate &layoutUpdate,
+        const LayoutLse &layoutLse,
+        uint32_t qNThisSubBlock, uint32_t qSThisSubBlock, uint32_t totalRowNum,
+        uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
+        uint32_t taskStateSlot,
+        uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
+        const SplitKVParams &splitParams,
+        uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen,
+        uint32_t qSBlockIdx, uint32_t rowNum, uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile,
+        uint32_t outputStride, uint32_t oHeadStride)
     {
         uint32_t curRowNum = layoutInput.shape(0);
         uint32_t embed = layoutInput.shape(1);
         uint32_t embedRound = layoutInput.stride(0);
         uint32_t curRowNumRound = RoundUp(curRowNum, FLOAT_BLOCK_SIZE);
-        uint32_t qSBlockSize = layoutOutput.shape(0);
-        uint32_t oHiddenSize = layoutOutput.shape(1);
-        uint32_t qHeads = layoutLse.shape(0);
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
         uint32_t stateRowOffset = taskStateSlot * 64 + rowOffsetLoop;
         auto lseUbTensor = lseStagingUbTensor;
         auto lseBroadcastUbTensor = lseUbTensor[FLOAT_VECTOR_SIZE];
 
-        // FD: read partial-O / partial-LSE hidden dims from splitParams layouts.
-        uint32_t oHiddenSize_gmlo = 0;
-        uint32_t qHeads_gmlse = 0;
-        if (splitParams.isSplitkv) {
-            oHiddenSize_gmlo = splitParams.layoutgmLo->shape(1);
-            qHeads_gmlse = splitParams.layoutgmLse->shape(1);
-        }
-
-        if (!isFirstStackTile) {
+        if (isFirstStackTile) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
+            // *** go = lo
+            AscendC::DataCopy(
+                goUbTensor32, gInput, AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        } else {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
             AscendC::DataCopy(loUbTensor, gInput,
                               AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-        }
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
-        if (!isFirstStackTile) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
                           dmUbTensor[dmUbOffsetCurStackTile].ReinterpretCast<uint32_t>(),
@@ -335,15 +328,33 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                                        AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
-        } else {
-            // *** go = lo
-            AscendC::DataCopy(goUbTensor32, gInput,
-                              AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
 
-        if (isLastStackTile) {
+        if (!isLastStackTile) {
+            if (needRowLoop) {
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
+                AscendC::DataCopy(
+                    gUpdate, goUbTensor32,
+                    AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+            }
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
+        } else {
+            // These values describe only the final GM writeback layout. Keeping
+            // them out of non-final stack iterations reduces steady-loop scalar
+            // work and avoids carrying dead arguments through every call.
+            uint32_t qSBlockSize = layoutOutput.shape(0);
+            uint32_t oHiddenSize = layoutOutput.shape(1);
+            uint32_t proTokenIdx = rowOffsetLoop % qSThisSubBlock;
+            uint32_t proTokenNum = AscendC::Std::min(curRowNum, (qSThisSubBlock - proTokenIdx)) % qSThisSubBlock;
+            uint32_t integralHeadNum = (curRowNum - proTokenNum) / qSThisSubBlock;
+            uint32_t epiTokenNum = curRowNum - proTokenNum - integralHeadNum * qSThisSubBlock;
+            uint32_t oHiddenSize_gmlo = 0;
+            uint32_t qHeads_gmlse = 0;
+            if (splitParams.isSplitkv) {
+                oHiddenSize_gmlo = splitParams.layoutgmLo->shape(1);
+                qHeads_gmlse = splitParams.layoutgmLse->shape(1);
+            }
             // *** gl_block = expand_to_block(gl)
             AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
                           glUbTensor.ReinterpretCast<uint32_t>()[stateRowOffset], curRowNumRound / FLOAT_BLOCK_SIZE,
@@ -533,13 +544,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                     }
                 }
             }
-        } else if (needRowLoop) {
-            AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-            AscendC::DataCopy(gUpdate, goUbTensor32,
-                              AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
     }
 
     __aicore__ inline void
@@ -619,12 +625,6 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
 
             // The rows of each cycle consist of multiple heads with several tokens.
             // There are several integral heads, one prologue head, one epilogue head.
-            uint32_t proTokenIdx = 0;     // the token idx of the start token of the prologue part
-            uint32_t proTokenIdxPre = 0;  // the token idx of the start token of the pre prologue part
-            uint32_t proTokenNum = 0;     // the token num of the prologue part
-            uint32_t epiTokenNum = 0;     // the token num of the epilogue part
-            uint32_t integralHeadNum = 0; // the number of integral heads within a cycle
-            uint32_t qSRemian = qSThisSubBlock;
             for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoop; rowLoopIdx++) {
                 uint32_t rowOffsetLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetCurLoop = inRowOffsetThisSubBlock + rowOffsetLoop;
@@ -656,21 +656,37 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                 auto gUpdateCurLoop = gUpdate[offsetUpdate];
                 auto layoutUpdateCurLoop = layoutUpdate.GetTileLayout(MatrixCoord(rowActualCurLoop, embed));
 
-                proTokenIdx = rowOffsetLoop % qSThisSubBlock;
-                proTokenNum = AscendC::Std::min(rowActualCurLoop, (qSThisSubBlock - proTokenIdx)) % qSThisSubBlock;
-                integralHeadNum = (rowActualCurLoop - proTokenNum) / qSThisSubBlock;
-                epiTokenNum = rowActualCurLoop - proTokenNum - integralHeadNum * qSThisSubBlock;
-
                 if (rowLoopIdx == 0) {
                     Arch::CrossCoreWaitFlag(pvReady);
                 }
-                SubCoreCompute(gOutputCurLoop, gInputCurLoop, gUpdateCurLoop, gLseThisSubBlock, layoutOutputCurLoop,
-                               layoutInputCurLoop, layoutUpdateCurLoop, layoutOutLseThisSubBlock, qNThisSubBlock,
-                               qSThisSubBlock, inRowActualThisSubBlock, isFirstStackTile, isLastStackTile,
-                               curStackTileMod, taskStateSlot, needRowLoop, (rowLoopIdx == rowLoop - 1U), rowOffsetLoop,
-                               proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum, blockParams, rowOffsetCurLoop,
-                               invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen, qSBlockIdx, rowNum,
-                               inRowOffsetThisSubBlock, curQNBlockTile, outputStride, oHeadStride);
+                SubCoreCompute(
+                    gOutputCurLoop,
+                    gInputCurLoop,
+                    gUpdateCurLoop,
+                    gLseThisSubBlock,
+                    layoutOutputCurLoop,
+                    layoutInputCurLoop,
+                    layoutUpdateCurLoop,
+                    layoutOutLseThisSubBlock,
+                    qNThisSubBlock,
+                    qSThisSubBlock,
+                    inRowActualThisSubBlock,
+                    isFirstStackTile,
+                    isLastStackTile,
+                    curStackTileMod,
+                    taskStateSlot,
+                    needRowLoop,
+                    (rowLoopIdx == rowLoop - 1U),
+                    rowOffsetLoop,
+                    blockParams,
+                    rowOffsetCurLoop,
+                    invalidSuffixStartRow,
+                    invalidPrefixEndRow,
+                    qSeqlen,
+                    qSBlockIdx,
+                    rowNum,
+                    inRowOffsetThisSubBlock,
+                    curQNBlockTile, outputStride, oHeadStride);
             }
         }
     }

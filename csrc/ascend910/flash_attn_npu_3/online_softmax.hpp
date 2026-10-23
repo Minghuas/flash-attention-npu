@@ -115,12 +115,8 @@ public:
     __aicore__ inline
     void SetVecMask(int32_t len)
     {
-        uint64_t mask = 0;
-        uint64_t one = 1;
         uint64_t temp = len % FLOAT_VECTOR_SIZE;
-        for (int64_t i = 0; i < temp; i++) {
-            mask |= one << i;
-        }
+        uint64_t mask = (uint64_t{1} << temp) - uint64_t{1};
 
         if (len == VECTOR_SIZE || len == 0) {
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
@@ -807,7 +803,7 @@ public:
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
         const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
-        uint32_t& softmaxPingPongFlag, int64_t triUp, uint32_t triDown,
+        uint32_t& softmaxPingPongFlag, int64_t triUp,
         uint32_t kvSStartIdx, uint32_t kvSEndIdx, bool doTriUMask,
         uint32_t isLastNoMaskStackTile, bool isSplitKV = false)
     {
@@ -900,7 +896,6 @@ public:
                 // Both modes consume QK-ready once; masked tiles first prefetch their mask.
                 if (rowLoopIdx == 0) {
                     if (doTriUMask) {
-                        // Split the row span into partial and complete heads for mask copying.
                         uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
                         uint32_t proTokenNum =
                             Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) % tokenNumPerHeadThisSubBlock;
@@ -1083,15 +1078,12 @@ public:
                 // loop 0 mask load before cross core sync
                 if (rowLoopIdx == 0) {
                     if (doTriUMask) {
-                        // the token idx of the start token of the prologue part
                         uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
-                        // the token num of the prologue part
                         uint32_t proTokenNum =
                             Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) % tokenNumPerHeadThisSubBlock;
-                        // the token num of the epilogue part
                         uint32_t integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
-                        // the number of integral heads within a cycle
-                        uint32_t epiTokenNum = rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
+                        uint32_t epiTokenNum =
+                            rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
                         CopyMaskGmToUb(gMaskThisSubBlock, columnNumRound, columnNumRound, maskStride,
                                        tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum,
@@ -1135,12 +1127,9 @@ public:
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
                         // *** TriUNextMask
                         uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
-                        // the token num of the prologue part
                         uint32_t proTokenNum = Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) %
                                                 tokenNumPerHeadThisSubBlock;
-                        // the token num of the epilogue part
                         uint32_t integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
-                        // the number of integral heads within a cycle
                         uint32_t epiTokenNum =
                             rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
