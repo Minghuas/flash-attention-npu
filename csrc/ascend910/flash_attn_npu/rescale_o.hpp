@@ -68,11 +68,6 @@ public:
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
     static constexpr uint32_t SIZE_OF_16BIT = 2;
 
-    // Scalar + broadcast LSE: [177920, 180224), between live DM rows and raw masks.
-    static constexpr uint32_t LSE_STAGING_ELEMENTS = FLOAT_VECTOR_SIZE * (1 + FLOAT_BLOCK_SIZE);
-    static constexpr uint32_t LSE_STAGING_UB_OFFSET =
-        11 * UB_UINT8_BLOCK_SIZE - LSE_STAGING_ELEMENTS * sizeof(float);
-
     struct SplitKVParams {
         bool isSplitkv = false;
         AscendC::GlobalTensor<ElementLse> gCombineLse;
@@ -94,14 +89,15 @@ public:
         constexpr uint32_t LO_UB_TENSOR_OFFSET = 6 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t GO_UB_TENSOR_OFFSET = 8 * UB_UINT8_BLOCK_SIZE;
 
-        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;        
         constexpr uint32_t GM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 6 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 12 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 18 * REPEAT_SIZE_IN_BYTE;
+        constexpr uint32_t LSE_STAGING_UB_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 24 * REPEAT_SIZE_IN_BYTE;
 
         dropoutValue = dropoutValue_;
 
@@ -111,10 +107,7 @@ public:
         tvUbTensor = resource.ubBuf.template GetBufferByByte<float>(TV_UB_TENSOR_OFFSET);
         goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementOutput>(GO_UB_TENSOR_OFFSET);
         goUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GO_UB_TENSOR_OFFSET);
-        hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
         gmUbTensor = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
-        static_assert(DM_UB_TENSOR_OFFSET + (2 * MAX_ROW_NUM_SUB_CORE + FLOAT_VECTOR_SIZE) * sizeof(float)
-            <= LSE_STAGING_UB_OFFSET, "LSE staging overlaps live DM rows");
         lseStagingUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_STAGING_UB_OFFSET);
     }
 
@@ -319,8 +312,7 @@ public:
         uint32_t qHeads = layoutLse.shape(0);
         uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
         uint32_t stateRowOffset = taskStateSlot * 64 + rowOffsetLoop;
-        auto lseUbTensor = lseStagingUbTensor;
-        auto lseBroadcastUbTensor = lseUbTensor[FLOAT_VECTOR_SIZE];
+        auto lseUbTensor = glUbTensor[taskStateSlot * 64];
 
         // FD: read partial-O / partial-LSE hidden dims from splitParams layouts.
         uint32_t oHiddenSize_gmlo = 0;
@@ -528,7 +520,7 @@ public:
                             inRowOffsetThisSubBlock, totalRowNum, invalidPrefixEndRow, qSeqlen, qSThisSubBlock,
                             lseUbTensor);
                     AscendC::Brcb(
-                        lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
+                        lseStagingUbTensor.ReinterpretCast<uint32_t>(),
                         lseUbTensor.ReinterpretCast<uint32_t>(),
                         CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                         AscendC::BrcbRepeatParams(1, 8));
@@ -542,14 +534,14 @@ public:
                         // isSplitkv: per-head strided write to token-major gCombineLse. UNCHANGED.
                         if (qNThisSubBlock == 0U) {
                             AscendC::DataCopyPad(
-                                splitParams.gCombineLse, lseBroadcastUbTensor,
+                                splitParams.gCombineLse, lseStagingUbTensor,
                                 AscendC::DataCopyExtParams(
                                     totalRowNum, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                         } else {
                             for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
                                 AscendC::DataCopyPad(
                                     splitParams.gCombineLse[qNIdx],
-                                    lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
+                                    lseStagingUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
                                     AscendC::DataCopyExtParams(
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                                 }
@@ -614,7 +606,7 @@ public:
                         AscendC::PipeBarrier<PIPE_V>();
 
                         AscendC::Brcb(
-                            lseBroadcastUbTensor.ReinterpretCast<uint32_t>(),
+                            lseStagingUbTensor.ReinterpretCast<uint32_t>(),
                             lseUbTensor.ReinterpretCast<uint32_t>(),
                             CeilDiv(totalRowNum, FLOAT_BLOCK_SIZE),
                             AscendC::BrcbRepeatParams(1, 8));
@@ -624,14 +616,14 @@ public:
 
                         if (qNThisSubBlock == 0U) {
                             AscendC::DataCopyPad(
-                                splitParams.gCombineLse, lseBroadcastUbTensor,
+                                splitParams.gCombineLse, lseStagingUbTensor,
                                 AscendC::DataCopyExtParams(
                                     totalRowNum, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                         } else {
                             for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
                                 AscendC::DataCopyPad(
                                     splitParams.gCombineLse[qNIdx],
-                                    lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
+                                    lseStagingUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
                                     AscendC::DataCopyExtParams(
                                         qSBlockSize, sizeof(float), 0, (qHeads_gmlse - 1) * sizeof(float), 0));
                             }
@@ -817,7 +809,6 @@ private:
     float dropoutValue;
     AscendC::LocalTensor<float> loUbTensor;
     AscendC::LocalTensor<float> dmUbTensor;
-    AscendC::LocalTensor<float> hmUbTensor;
     AscendC::LocalTensor<float> glUbTensor;
     AscendC::LocalTensor<float> tvUbTensor;
     AscendC::LocalTensor<ElementOutput> goUbTensor16;

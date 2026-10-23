@@ -29,6 +29,24 @@ using namespace Catlass;
 using namespace KernelCommon;
 
 namespace SplitFuse {
+
+struct FAIKernelParams {
+    GM_ADDR q;
+    GM_ADDR k;
+    GM_ADDR v;
+    GM_ADDR mask;
+    GM_ADDR blockTables;
+    GM_ADDR actualQseqlen;
+    GM_ADDR actualKvseqlen;
+    GM_ADDR o;
+    GM_ADDR lse;
+    GM_ADDR workSpace;
+    GM_ADDR tiling;
+    GM_ADDR alibiSlopes;
+    GM_ADDR kNew;
+    GM_ADDR vNew;
+};
+
 template <class BlockMmadQK, class BlockMmadPV, class EpilogueOnlineSoftmax, class EpilogueRescaleO,
           bool PAGED_CACHE_FLAG, FaiKenel::MaskType MASK_TYPE = FaiKenel::MaskType::NO_MASK,
           FaiKenel::inputLayout INPUT_LAYOUT = FaiKenel::inputLayout::BSND, class CombineScale = void>

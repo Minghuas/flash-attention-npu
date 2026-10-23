@@ -88,21 +88,23 @@ public:
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
 
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
         constexpr uint32_t LM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
-        constexpr uint32_t HM_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE;
+        constexpr uint32_t HM_UB_TENSOR_OFFSET =
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t LL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 4 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t GM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 2 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 6 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t GL_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 5 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 12 * REPEAT_SIZE_IN_BYTE;
         constexpr uint32_t DM_UB_TENSOR_OFFSET =
-            10 * UB_UINT8_BLOCK_SIZE + 9 * UB_UINT8_VECTOR_SIZE + 8 * REPEAT_SIZE_IN_BYTE;
+            10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE + 18 * REPEAT_SIZE_IN_BYTE;
+
         // TV reductions use at most 5 KiB; its last 2 KiB hold dropout bits, separate from SWA masks.
         constexpr uint32_t DROP_UB_TENSOR_OFFSET = TV_UB_TENSOR_OFFSET + 6 * UB_UINT8_VECTOR_SIZE;
         // ALiBi uses TV's first 2 KiB before rowmax; LM would overlap live task GM slots.
         constexpr uint32_t ALIBI_WORK_UB_OFFSET = TV_UB_TENSOR_OFFSET;
+        constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
 
         scaleValue = scaleValue_;
         softcapValue = softcapValue_;

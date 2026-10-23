@@ -15,7 +15,7 @@ namespace KernelCommon {
     constexpr uint32_t PRE_LAUNCH = 2;
     constexpr uint32_t N_SPLIT_HELPER = 2;
     constexpr uint32_t MAX_KV_STACK_LEN = 512;
-    constexpr uint32_t Q_TILE_CEIL = 128;
+    constexpr uint32_t Q_TILE_CEIL = 256;
     constexpr uint32_t WORKSPACE_BLOCK_SIZE_DB = Q_TILE_CEIL * MAX_KV_STACK_LEN;
     constexpr uint32_t L1_MAX_SIZE = 524288;
     constexpr uint32_t L1_MAX_N_NUM = 128;
@@ -59,32 +59,6 @@ namespace KernelCommon {
             BSND = 0,
             TND = 1
         };
-    };
-
-    struct FAIKernelParams {
-        GM_ADDR q;
-        GM_ADDR k;
-        GM_ADDR v;
-        GM_ADDR mask;
-        GM_ADDR blockTables;
-        GM_ADDR actualQseqlen;
-        GM_ADDR actualKvseqlen;
-        GM_ADDR o;
-        GM_ADDR lse;
-        GM_ADDR workSpace;
-        GM_ADDR tiling;
-        GM_ADDR alibiSlopes;
-        GM_ADDR kNew;
-        GM_ADDR vNew;
-
-        __aicore__ inline FAIKernelParams() {}
-
-        __aicore__ inline FAIKernelParams(GM_ADDR q_, GM_ADDR k_, GM_ADDR v_, GM_ADDR mask_, GM_ADDR blockTables_,
-                GM_ADDR actualQseqlen_, GM_ADDR actualKvseqlen_, GM_ADDR o_, GM_ADDR lse_, GM_ADDR workSpace_,
-                    GM_ADDR tiling_, GM_ADDR alibiSlopes_, GM_ADDR kNew_ = nullptr, GM_ADDR vNew_ = nullptr)
-            : q(q_), k(k_), v(v_), mask(mask_), blockTables(blockTables_), actualQseqlen(actualQseqlen_),
-                actualKvseqlen(actualKvseqlen_), o(o_), lse(lse_), workSpace(workSpace_), tiling(tiling_), alibiSlopes(alibiSlopes_),
-                kNew(kNew_), vNew(vNew_) {}
     };
 
     __aicore__ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)

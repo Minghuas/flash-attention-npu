@@ -14,12 +14,13 @@
 
 #include <cstdint>
 #include "tilingdata.h"
+#include "kernel_common.hpp"
 
 namespace fa_split {
 
-constexpr uint32_t Q_TILE_CEIL = 128;
-constexpr uint32_t N_SPLIT_HELPER = 2;
-constexpr uint32_t MAX_KV_STACK_LEN = 512;
+using KernelCommon::Q_TILE_CEIL;
+using KernelCommon::N_SPLIT_HELPER;
+using KernelCommon::MAX_KV_STACK_LEN;
 
 inline uint32_t FaMin(uint32_t a, uint32_t b) { return a < b ? a : b; }
 inline uint32_t FaMax(uint32_t a, uint32_t b) { return a > b ? a : b; }
