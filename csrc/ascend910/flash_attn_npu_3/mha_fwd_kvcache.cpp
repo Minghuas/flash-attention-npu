@@ -134,6 +134,13 @@ class FAInferKernel {
         uint32_t kvStartOld;
         uint32_t kvLoopNumTotalNew;
         uint32_t kvNewSeqlen;
+#ifdef __DAV_C220_VEC__
+        uint32_t taskEnd;
+        uint32_t taskInnerCount;
+        uint32_t taskStepInner;
+        uint32_t taskStepOuter;
+        uint32_t copybackQSBlock;
+#endif
     };
 
     // QK/SM task-local state shared by the prefill and steady-state paths.
@@ -223,6 +230,13 @@ class FAInferKernel {
         hasSeqUsedKv = params.seqUsedKv != nullptr;
         __gm__ FAInferTilingData* fATilingData =
             reinterpret_cast<__gm__ FAInferTilingData*>(params.tiling.tilingDataAddr);
+        const auto* schedulerHeader = reinterpret_cast<const __gm__ SchedulerHeader*>(
+            reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + fa_metadata::SCHEDULER_HEADER_OFFSET);
+        // Both AIC and AIV reject stale metadata before arming pipeline events.
+        if (schedulerHeader->version != fa_metadata::TASK_METADATA_VERSION ||
+            schedulerHeader->status != fa_metadata::TASK_METADATA_OK) {
+            return;
+        }
         mm1OutSize = fATilingData->mm1OutSize;
         smOnlineOutSize = fATilingData->smOnlineOutSize;
         mm2OutSize = fATilingData->mm2OutSize;
@@ -260,7 +274,9 @@ class FAInferKernel {
         AscendC::GlobalTensor<ElementK> gV;
         gV.SetGlobalBuffer((__gm__ ElementK*)params.v);
         AscendC::GlobalTensor<ElementMask> gMask;
-        gMask.SetGlobalBuffer((__gm__ ElementMask*)params.mask);
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+            gMask.SetGlobalBuffer((__gm__ ElementMask*)params.mask);
+        }
         AscendC::GlobalTensor<int32_t> gBlockTable;
         gBlockTable.SetGlobalBuffer((__gm__ int32_t*)(params.blockTables));
         AscendC::GlobalTensor<int32_t> gActualQseqlen;
@@ -456,129 +472,108 @@ class FAInferKernel {
         uint32_t taskStateSequence = 0;
 
 #ifdef __DAV_C220_VEC__
-        const auto* schedulerHeader = reinterpret_cast<const __gm__ SchedulerHeader*>(
-            reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + fa_metadata::SCHEDULER_HEADER_OFFSET);
         const auto* taskRanges = reinterpret_cast<const __gm__ CoreTaskRange*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + fa_metadata::CORE_RANGE_OFFSET);
-        const auto* taskList = reinterpret_cast<const __gm__ TaskDesc*>(
-            reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->taskDataOffset);
         const auto* batchPlans = reinterpret_cast<const __gm__ BatchPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->batchPlanOffset);
         const auto* headPlans = reinterpret_cast<const __gm__ HeadPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->headPlanOffset);
-        const auto* fdPlans = reinterpret_cast<const __gm__ FDPlan*>(
-            reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->fdPlanOffset);
         const auto* maskPlans = reinterpret_cast<const __gm__ MaskPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->maskPlanOffset);
         const auto* appendPlans = reinterpret_cast<const __gm__ AppendPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->appendPlanOffset);
         const auto* addressPlans = reinterpret_cast<const __gm__ AddressPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->addressPlanOffset);
-
         const bool idleCoreFD =
             FLASH_DECODE_FLAG && (fATilingData->needCoreNum != 0U) && (coreIdx >= fATilingData->needCoreNum);
-        if (schedulerHeader->status == fa_metadata::TASK_METADATA_OK &&
-            coreIdx < schedulerHeader->coreNum && !idleCoreFD) {
-            const __gm__ CoreTaskRange* taskRange = &taskRanges[coreIdx];
-            uint32_t cachedBatchIdx = UINT32_MAX;
-            const __gm__ BatchPlan* cachedBatchPlan = nullptr;
-            const __gm__ AppendPlan* cachedAppendPlan = nullptr;
-            const __gm__ AddressPlan* cachedAddressPlan = nullptr;
-            BatchRuntime batchRuntime{};
-            uint32_t cachedMaskPlanIndex = UINT32_MAX;
-            const __gm__ MaskPlan* cachedMaskPlan = nullptr;
-            MaskPlan cachedMaskPlanValue{};
-            const __gm__ TaskDesc* drainTask = nullptr;
+        if (coreIdx < schedulerHeader->coreNum && !idleCoreFD) {
+            const __gm__ CoreTaskRange* range = &taskRanges[coreIdx];
+            const uint32_t taskCount = range->taskCount;
             const uint32_t blockStackNum = (MAX_KV_STACK_LEN - 1 + pagedBlockSize) / pagedBlockSize;
-            for (uint32_t localTaskIdx = 0; localTaskIdx < taskRange->taskCount; ++localTaskIdx) {
-                const __gm__ TaskDesc* task = &taskList[taskRange->taskOffset + localTaskIdx];
-                if (task->batchIdx != cachedBatchIdx) {
-                    cachedBatchIdx = task->batchIdx;
-                    cachedBatchPlan = task->batchIdx < schedulerHeader->batchPlanCount
-                        ? &batchPlans[task->batchIdx] : nullptr;
-                    cachedAppendPlan = task->batchIdx < schedulerHeader->appendPlanCount
-                        ? &appendPlans[task->batchIdx] : nullptr;
-                    cachedAddressPlan = task->batchIdx < schedulerHeader->addressPlanCount
-                        ? &addressPlans[task->batchIdx] : nullptr;
-                    if (cachedBatchPlan != nullptr && cachedAppendPlan != nullptr && cachedAddressPlan != nullptr) {
-                        PrepareBatchRuntime(batchRuntime, cachedBatchPlan, cachedAppendPlan, cachedAddressPlan);
+            if (taskCount != 0U) {
+                uint32_t batchIdx = range->firstBatch;
+                uint32_t inner = range->firstInner;
+                uint32_t outer = range->firstOuter;
+                uint32_t ordinal = range->taskStart;
+                const uint32_t taskStride = FLASH_DECODE_FLAG ? 1U : schedulerHeader->coreNum;
+                const __gm__ BatchPlan* batchPlan = &batchPlans[batchIdx];
+                BatchRuntime runtime{};
+                PrepareBatchRuntime(runtime, batchPlan, &appendPlans[batchIdx], &addressPlans[batchIdx]);
+                uint32_t cachedMaskPlanIndex = UINT32_MAX;
+                MaskPlan maskValue{};
+                for (uint32_t local = 0; local < taskCount; ++local, ordinal += taskStride) {
+                    if (ordinal >= runtime.taskEnd) {
+                        do {
+                            batchPlan = &batchPlans[++batchIdx];
+                        } while (ordinal >= batchPlan->taskBase + batchPlan->qNBlockNum * batchPlan->qSBlockNum);
+                        PrepareBatchRuntime(runtime, batchPlan, &appendPlans[batchIdx], &addressPlans[batchIdx]);
+                        // Decode only at batch transitions; in-batch tasks use a carry.
+                        const uint32_t inBatch = ordinal - batchPlan->taskBase;
+                        outer = inBatch / runtime.taskInnerCount;
+                        inner = inBatch - outer * runtime.taskInnerCount;
+                    }
+                    const uint32_t qS = FLASH_DECODE_FLAG ? inner : outer;
+                    const uint32_t qN = FLASH_DECODE_FLAG ? outer : inner;
+                    const __gm__ HeadPlan* head = &headPlans[batchPlan->headPlanBase + qN];
+                    const uint32_t maskIndex = batchPlan->maskPlanBase + qS;
+                    if (maskIndex != cachedMaskPlanIndex) {
+                        cachedMaskPlanIndex = maskIndex;
+                        const __gm__ MaskPlan* mask = &maskPlans[maskIndex];
+                        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+                            maskValue.windowSizeLeftStartLen = mask->windowSizeLeftStartLen;
+                            maskValue.windowSizeLeftEndLen = mask->windowSizeLeftEndLen;
+                            maskValue.windowSizeRightStartLen = mask->windowSizeRightStartLen;
+                            maskValue.windowSizeRightEndLen = mask->windowSizeRightEndLen;
+                            maskValue.flags = mask->flags;
+                        }
+                        maskValue.invalidSuffixStartRow = mask->invalidSuffixStartRow;
+                        maskValue.invalidPrefixEndRow = mask->invalidPrefixEndRow;
+                        maskValue.noSkipKvS = mask->noSkipKvS;
+                        maskValue.kvStart = mask->kvStart;
+                        maskValue.kvSLoopNumTotal = mask->kvSLoopNumTotal;
+                    }
+                    int32_t startS2 = 0;
+                    int32_t endS2 = static_cast<int32_t>(runtime.curKSBlockNum);
+                    bool split = false;
+                    uint64_t lseOffset = 0;
+                    uint64_t oOffset = 0;
+                    if constexpr (FLASH_DECODE_FLAG) {
+                        if (local == 0U || local + 1U == taskCount) {
+                            const bool first = local == 0U;
+                            startS2 = first ? range->firstS2 : 0;
+                            endS2 = local + 1U == taskCount ? range->lastS2 : endS2;
+                            split = (range->flags & (first ? fa_metadata::CORE_FIRST_TASK_SPLIT
+                                                         : fa_metadata::CORE_LAST_TASK_SPLIT)) != 0U;
+                            lseOffset = first ? range->firstLseOffset : range->lastLseOffset;
+                            oOffset = first ? range->firstOOffset : range->lastOOffset;
+                        }
+                    }
+                    const uint32_t taskFlags = qS == runtime.copybackQSBlock
+                        ? fa_metadata::TASK_FLAG_NEED_COPYBACK : 0U;
+                    const uint32_t stateSlot = taskStateSequence % STACK_SLOTS;
+                    const bool hasTaskWork = runMainLoop(
+                        coreIdx, batchPlan->qSeqlen, batchPlan->kvSeqlen,
+                        head->qNStart, head->qNSize, batchPlan->qNBlockTile, head->kvHeadOffset,
+                        qS, taskFlags, split, startS2, endS2, lseOffset, oOffset,
+                        maskValue, runtime, globalTensors, descriptors, taskContexts,
+                        stateSlot, issuedStackCount, prefillRemaining, softmaxPingPongFlag, blockStackNum);
+                    taskStateSequence += static_cast<uint32_t>(hasTaskWork);
+                    inner += runtime.taskStepInner;
+                    outer += runtime.taskStepOuter;
+                    if (inner >= runtime.taskInnerCount) {
+                        inner -= runtime.taskInnerCount;
+                        ++outer;
                     }
                 }
-                if (cachedBatchPlan == nullptr || cachedAppendPlan == nullptr || cachedAddressPlan == nullptr) {
-                    continue;
-                }
-                const __gm__ BatchPlan* batchPlan = cachedBatchPlan;
-                const uint32_t maskPlanBase = batchPlan->maskPlanBase;
-                const bool maskPlanOwned =
-                    task->maskPlanIndex >= maskPlanBase &&
-                    (task->maskPlanIndex - maskPlanBase) < batchPlan->maskPlanCount &&
-                    task->maskPlanIndex < schedulerHeader->maskPlanCount;
-                if (!maskPlanOwned) {
-                    cachedMaskPlanIndex = UINT32_MAX;
-                    cachedMaskPlan = nullptr;
-                    continue;
-                }
-                if (task->maskPlanIndex != cachedMaskPlanIndex) {
-                    cachedMaskPlanIndex = task->maskPlanIndex;
-                    cachedMaskPlan = &maskPlans[task->maskPlanIndex];
-                    cachedMaskPlanValue.windowSizeLeftStartLen = cachedMaskPlan->windowSizeLeftStartLen;
-                    cachedMaskPlanValue.windowSizeLeftEndLen = cachedMaskPlan->windowSizeLeftEndLen;
-                    cachedMaskPlanValue.windowSizeRightStartLen = cachedMaskPlan->windowSizeRightStartLen;
-                    cachedMaskPlanValue.windowSizeRightEndLen = cachedMaskPlan->windowSizeRightEndLen;
-                    cachedMaskPlanValue.invalidSuffixStartRow = cachedMaskPlan->invalidSuffixStartRow;
-                    cachedMaskPlanValue.invalidPrefixEndRow = cachedMaskPlan->invalidPrefixEndRow;
-                    cachedMaskPlanValue.noSkipKvS = cachedMaskPlan->noSkipKvS;
-                    cachedMaskPlanValue.kvStart = cachedMaskPlan->kvStart;
-                    cachedMaskPlanValue.kvSLoopNumTotal = cachedMaskPlan->kvSLoopNumTotal;
-                    cachedMaskPlanValue.flags = cachedMaskPlan->flags;
-                }
-                if (cachedMaskPlan == nullptr) {
-                    continue;
-                }
-                if (task->headPlanIndex >= schedulerHeader->headPlanCount) {
-                    continue;
-                }
-                const __gm__ HeadPlan* headPlan = &headPlans[task->headPlanIndex];
-                uint64_t lseOffset = 0;
-                uint64_t oOffset = 0;
-                if (task->fdPlanIndex != fa_metadata::INVALID_FD_PLAN) {
-                    if (task->fdPlanIndex >= schedulerHeader->fdPlanCount) {
-                        continue;
-                    }
-                    const __gm__ FDPlan* fdPlan = &fdPlans[task->fdPlanIndex];
-                    lseOffset = fdPlan->lseOffset;
-                    oOffset = fdPlan->oOffset;
-                }
-                const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
-                // Save the last valid task context.  The tail drain is emitted
-                // after the task loop, but it still consumes descriptors
-                // produced by the whole core-local task sequence.
-                drainTask = task;
-                const bool hasTaskWork = runMainLoop(
-                    coreIdx, batchPlan->qSeqlen, batchPlan->kvSeqlen,
-                    headPlan->qNStart, headPlan->qNSize, batchPlan->qNBlockTile, headPlan->kvHeadOffset,
-                    task->qSBlockIdx, task->flags,
-                    task->isSplitKV != 0, task->startS2Idx, task->endS2Idx, lseOffset, oOffset,
-                    cachedMaskPlanValue, batchRuntime, globalTensors, descriptors, taskContexts, currentTaskStateSlot,
-                    issuedStackCount, prefillRemaining, softmaxPingPongFlag, blockStackNum);
-                taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
-            // Drain only consumes descriptors already submitted by the task
-            // loop.  Keep it outside runMainLoop so the normal KV loop has no
-            // drain branch or tail iteration in its hot footprint.
-            if (drainTask != nullptr && drainTask->pipelineDrain != 0U && issuedStackCount != 0U) {
-                const uint32_t blockStackNum =
-                    (MAX_KV_STACK_LEN - 1 + pagedBlockSize) / pagedBlockSize;
-                const uint32_t stackSeqTilePad = MAX_KV_STACK_LEN;
-                const uint32_t readyDrainCount = AscendC::Std::min(issuedStackCount, PRE_LAUNCH);
-                const uint32_t drainCount = AscendC::Std::min(drainTask->pipelineDrain, readyDrainCount);
-                uint32_t drainStackCount = issuedStackCount - readyDrainCount;
-                for (uint32_t drainIdx = 0; drainIdx < drainCount; ++drainIdx) {
-                    StackDescriptor& pvDesc = descriptors[drainStackCount % STACK_SLOTS];
-                    ConsumeDelayedPV(coreIdx, pvDesc, taskContexts, blockStackNum, stackSeqTilePad, globalTensors);
-                    ++drainStackCount;
-                    ++issuedStackCount;
-                }
+            // Drain consumes only descriptors already submitted by this core.
+            const uint32_t drainCount = AscendC::Std::min(issuedStackCount, PRE_LAUNCH);
+            uint32_t drainStack = issuedStackCount - drainCount;
+            for (uint32_t i = 0; i < drainCount; ++i) {
+                StackDescriptor& desc = descriptors[drainStack % STACK_SLOTS];
+                ConsumeDelayedPV(coreIdx, desc, taskContexts, blockStackNum, MAX_KV_STACK_LEN, globalTensors);
+                ++drainStack;
+                ++issuedStackCount;
             }
         }
 #else
@@ -673,6 +668,11 @@ class FAInferKernel {
         runtime.kvStartOld = appendPlan->kvStartOld;
         runtime.kvLoopNumTotalNew = appendPlan->kvLoopNumTotalNew;
         runtime.kvNewSeqlen = appendPlan->kvNewSeqlen;
+        runtime.taskEnd = batchPlan->taskBase + batchPlan->qNBlockNum * batchPlan->qSBlockNum;
+        runtime.taskInnerCount = FLASH_DECODE_FLAG ? batchPlan->qSBlockNum : batchPlan->qNBlockNum;
+        runtime.taskStepInner = batchPlan->taskStepInner;
+        runtime.taskStepOuter = batchPlan->taskStepOuter;
+        runtime.copybackQSBlock = batchPlan->copybackQSBlock;
     }
 #endif
 
@@ -1031,7 +1031,6 @@ class FAInferKernel {
     {
         auto& gQ = globalTensors.gQ;
         auto& gK = globalTensors.gK;
-        auto& gMask = globalTensors.gMask;
         auto& gBlockTable = globalTensors.gBlockTable;
         auto& gS = globalTensors.gS;
         auto& gP = globalTensors.gP;
@@ -1086,7 +1085,6 @@ class FAInferKernel {
 #endif
 #ifdef __DAV_C220_VEC__
         LayoutP layOutP(rowNum, desc.stackSeqTile, stackSeqTilePad);
-        LayoutMask layOutMask(COMP_TRIU_MASK_DIM_LEN, COMP_TRIU_MASK_DIM_LEN);
         const uint32_t kvSStartIdx =
             isAppendBlock ? ctx.kvSeqlenOld + kvSIdxLocal * MAX_KV_STACK_LEN : kvSIdx * MAX_KV_STACK_LEN;
         const uint32_t kvSEndIdx = kvSStartIdx + desc.stackSeqTile;
@@ -1100,6 +1098,8 @@ class FAInferKernel {
                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
                                   diagS0, doTriUMask, ctx.isSplitKV);
         } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+            auto& gMask = globalTensors.gMask;
+            LayoutMask layOutMask(COMP_TRIU_MASK_DIM_LEN, COMP_TRIU_MASK_DIM_LEN);
             const int32_t kvStartI = static_cast<int32_t>(kvSStartIdx);
             const int32_t kvEndI = static_cast<int32_t>(kvSEndIdx);
             const bool doTriUPreMask =
@@ -1281,25 +1281,7 @@ class FAInferKernel {
 
         int32_t lastNoMaskStackId = -1;
 #ifdef __DAV_C220_VEC__
-        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
-            const int64_t triUp = static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
-            const int64_t diagonalEnd = triUp + 1;
-            if (diagonalEnd > 0) {
-                uint32_t lastNoMaskTile;
-                if (diagonalEnd == static_cast<int64_t>(kvSeqlen)) {
-                    lastNoMaskTile = kvSLoopNumTotal - 1U;
-                } else if (diagonalEnd == static_cast<int64_t>(kvSeqlenOld)) {
-                    lastNoMaskTile = kvStartOld - 1U;
-                } else if (diagonalEnd < static_cast<int64_t>(kvSeqlenOld)) {
-                    lastNoMaskTile = static_cast<uint32_t>(diagonalEnd) / MAX_KV_STACK_LEN - 1U;
-                } else {
-                    lastNoMaskTile = kvStartOld +
-                        (static_cast<uint32_t>(diagonalEnd) - kvSeqlenOld) / MAX_KV_STACK_LEN - 1U;
-                }
-                lastNoMaskStackId = static_cast<int32_t>(lastNoMaskTile) -
-                    (FLASH_DECODE_FLAG ? static_cast<int32_t>(kvStart) : 0);
-            }
-        } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             const bool lastWindowTile = (windowSizeRightStartLen >= static_cast<int32_t>(kvSeqlen)) ||
                 (windowSizeRightStartLen < 0);
             const uint32_t kvSeqlenLimit = lastWindowTile ? kvSeqlen :

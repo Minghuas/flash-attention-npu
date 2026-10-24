@@ -409,7 +409,7 @@ class BishengBuildExt(build_ext):
         # switch or stash re-apply.
         aicpu_stamp = aicpu_obj + ".inputs"
         aicpu_inputs = [aicpu_src]
-        for name in ("tilingdata.h", "fa_metadata_args.h"):
+        for name in ("tilingdata.h", "fa_metadata_args.h", "fa_task_schedule.h", "fa_split.h"):
             header = os.path.join(src_dir, name)
             if os.path.exists(header):
                 aicpu_inputs.append(header)
@@ -549,7 +549,7 @@ class BishengBuildExt(build_ext):
             link_inputs.extend(
                 os.path.join(os.path.dirname(src), name)
                 for src in ext.sources
-                for name in ("tilingdata.h", "fa_metadata_args.h")
+                for name in ("tilingdata.h", "fa_metadata_args.h", "fa_task_schedule.h", "fa_split.h")
                 if os.path.exists(os.path.join(os.path.dirname(src), name))
             )
             expected_link_signature = _inputs_signature(link_inputs)

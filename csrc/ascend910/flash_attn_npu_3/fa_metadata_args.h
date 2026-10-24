@@ -16,11 +16,12 @@
 #endif
 
 namespace fa_metadata {
-constexpr uint32_t TASK_METADATA_VERSION = 1;
+constexpr uint32_t TASK_METADATA_VERSION = 2;
 constexpr uint32_t TASK_METADATA_OK = 0;
 constexpr uint32_t TASK_METADATA_OVERFLOW = 1;
-constexpr uint32_t INVALID_FD_PLAN = 0xFFFFFFFFu;
 constexpr uint32_t TASK_FLAG_NEED_COPYBACK = 1u << 0;
+constexpr uint32_t CORE_FIRST_TASK_SPLIT = 1u << 0;
+constexpr uint32_t CORE_LAST_TASK_SPLIT = 1u << 1;
 constexpr uint32_t APPEND_PLAN_ENABLED = 1u << 0;
 constexpr uint32_t MASK_PLAN_NOT_PRE_MASK = 1u << 0;
 constexpr uint32_t MASK_PLAN_NOT_NEXT_MASK = 1u << 1;
@@ -130,49 +131,15 @@ constexpr uint64_t CoreRangeOffset()
     return SchedulerHeaderOffset() + sizeof(SchedulerHeader);
 }
 
-constexpr uint64_t TaskDataOffset(uint32_t blockDim)
+constexpr uint64_t PlanDataOffset(uint32_t blockDim)
 {
     return AlignTaskMetadata(CoreRangeOffset() + static_cast<uint64_t>(blockDim) * sizeof(CoreTaskRange));
 }
 
-// The upper bound is shape-based and does not depend on runtime seqlensQ
-// values. qNBlockNum is bounded by numHeads and qSBlockNum by ceil(maxQ/128).
-constexpr uint32_t TaskSplitFactor(uint32_t numSplits)
+constexpr uint64_t BatchPlanOffset(uint32_t blockDim, uint32_t /*batch*/, uint32_t /*maxQSeqlen*/,
+                                   uint32_t /*numHeads*/, uint32_t /*numSplits*/ = 1U)
 {
-    return numSplits > 1U ? numSplits : 1U;
-}
-
-constexpr uint32_t CeilDivTask(uint32_t value, uint32_t divisor)
-{
-    return divisor == 0U ? 0U : (value + divisor - 1U) / divisor;
-}
-
-// FlashDecode may split one query tile by both an explicit num_splits value
-// and the 512-token KV stack decomposition used by the auto scheduler.
-constexpr uint32_t FlashDecodeTaskFactor(uint32_t maxKvSeqlen, uint32_t kvNewSeqlen,
-                                          uint32_t numSplits)
-{
-    const uint32_t oldStacks = CeilDivTask(maxKvSeqlen, 512U);
-    const uint32_t newStacks = CeilDivTask(kvNewSeqlen, 512U);
-    const uint32_t stackFactor = oldStacks + newStacks;
-    const uint32_t splitFactor = TaskSplitFactor(numSplits);
-    return stackFactor > splitFactor ? stackFactor : splitFactor;
-}
-
-constexpr uint64_t TaskCapacity(uint32_t batch, uint32_t maxQSeqlen, uint32_t numHeads,
-                                uint32_t numSplits = 1U)
-{
-    const uint64_t qBlocks = (static_cast<uint64_t>(maxQSeqlen) + 127) / 128;
-    const uint64_t capacity = static_cast<uint64_t>(batch) * numHeads *
-                              (qBlocks == 0 ? 1 : qBlocks) * TaskSplitFactor(numSplits);
-    return capacity == 0 ? 1 : capacity;
-}
-
-constexpr uint64_t BatchPlanOffset(uint32_t blockDim, uint32_t batch, uint32_t maxQSeqlen,
-                                   uint32_t numHeads, uint32_t numSplits = 1U)
-{
-    return AlignTaskMetadata(TaskDataOffset(blockDim) +
-                             TaskCapacity(batch, maxQSeqlen, numHeads, numSplits) * sizeof(TaskDesc));
+    return PlanDataOffset(blockDim);
 }
 
 constexpr uint32_t HeadPlanCapacity(uint32_t batch, uint32_t numHeads)
@@ -187,9 +154,9 @@ constexpr uint64_t HeadPlanOffset(uint32_t blockDim, uint32_t batch, uint32_t ma
                              static_cast<uint64_t>(batch) * sizeof(BatchPlan));
 }
 
-constexpr uint64_t FDPlanOffsetForCapacity(uint32_t blockDim, uint32_t batch, uint32_t maxQSeqlen,
-                                            uint32_t numHeads, uint32_t headPlanCapacity,
-                                            uint32_t numSplits = 1U)
+constexpr uint64_t HeadPlanEndOffset(uint32_t blockDim, uint32_t batch, uint32_t maxQSeqlen,
+                                      uint32_t numHeads, uint32_t headPlanCapacity,
+                                      uint32_t numSplits = 1U)
 {
     return AlignTaskMetadata(HeadPlanOffset(blockDim, batch, maxQSeqlen, numHeads, numSplits) +
                              static_cast<uint64_t>(headPlanCapacity) * sizeof(HeadPlan));
@@ -205,9 +172,8 @@ constexpr uint64_t MaskPlanOffsetForCapacity(uint32_t blockDim, uint32_t batch, 
                                              uint32_t numHeads, uint32_t headPlanCapacity,
                                              uint32_t fdPlanCapacity, uint32_t numSplits = 1U)
 {
-    return AlignTaskMetadata(FDPlanOffsetForCapacity(blockDim, batch, maxQSeqlen, numHeads,
-                                                     headPlanCapacity, numSplits) +
-                             static_cast<uint64_t>(fdPlanCapacity) * sizeof(FDPlan));
+    (void)fdPlanCapacity;
+    return HeadPlanEndOffset(blockDim, batch, maxQSeqlen, numHeads, headPlanCapacity, numSplits);
 }
 
 constexpr uint64_t AppendPlanOffsetForCapacity(uint32_t blockDim, uint32_t batch, uint32_t maxQSeqlen,
@@ -233,12 +199,12 @@ constexpr uint64_t AddressPlanOffsetForCapacity(uint32_t blockDim, uint32_t batc
 
 inline uint64_t MetadataBytes(bool /*has_mask*/, uint32_t batch, uint32_t maxQSeqlen, uint32_t numHeads,
                               uint32_t blockDim, uint32_t headPlanCapacity,
-                              uint32_t fdPlanCapacity = 0, uint32_t maskPlanCapacity = 0,
+                              uint32_t /*fdPlanCapacity*/ = 0, uint32_t maskPlanCapacity = 0,
                               uint32_t appendPlanCapacity = 0, uint32_t addressPlanCapacity = 0,
                               uint32_t numSplits = 1U)
 {
     return AddressPlanOffsetForCapacity(blockDim, batch, maxQSeqlen, numHeads, headPlanCapacity,
-                                        fdPlanCapacity, maskPlanCapacity, appendPlanCapacity, numSplits) +
+                                        0, maskPlanCapacity, appendPlanCapacity, numSplits) +
            static_cast<uint64_t>(addressPlanCapacity) * sizeof(AddressPlan);
 }
 
@@ -291,8 +257,8 @@ struct FAMetadataArgs {
     uint32_t kvNewSeqlen;
     uint32_t kvCacheSeqlen;
     uint32_t taskCapacityFactor;
-    // Host-reserved plan capacities. HeadPlan is bounded by batch*numHeads;
-    // FDPlan is zero for metadata shapes that cannot enter FlashDecode.
+    // Version 2 reserves taskCapacityFactor/fdPlanCapacity as 1/0; neither
+    // affects allocation. HeadPlan is bounded by batch*numHeads.
     uint32_t headPlanCapacity;
     uint32_t fdPlanCapacity;
     uint32_t maskPlanCapacity;

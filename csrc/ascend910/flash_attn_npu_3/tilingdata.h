@@ -33,28 +33,8 @@ struct splitNode {
     int64_t oTaskOffset;
 };
 
-struct alignas(64) TaskDesc {
-    uint32_t batchIdx;
-    uint32_t qNBlockIdx;
-    uint32_t qSBlockIdx;
-    uint32_t kvStart;
-    uint32_t kvEnd;
-    int32_t startS2Idx;
-    int32_t endS2Idx;
-    uint32_t isSplitKV;
-    uint32_t pipelineDrain;
-    uint32_t fdPlanIndex;
-    uint32_t headPlanIndex;
-    uint32_t maskPlanIndex;
-    uint32_t flags;
-    uint32_t reserved;
-};
-
-static_assert(sizeof(TaskDesc) == 64, "TaskDesc must occupy one 64-byte cache line");
-
 // Batch-shared geometry.  These values are generated once per batch and are
-// intentionally kept separate from TaskDesc so the same q/kv geometry is not
-// copied into every query/head task.
+// reused for every query/head task.
 struct BatchPlan {
     uint32_t qSeqlen;
     uint32_t kvSeqlen;
@@ -72,9 +52,13 @@ struct BatchPlan {
     uint32_t headPlanCount;
     uint32_t maskPlanBase;
     uint32_t maskPlanCount;
+    uint32_t taskBase;
+    uint32_t taskStepOuter;
+    uint32_t taskStepInner;
+    uint32_t copybackQSBlock;
 };
 
-static_assert(sizeof(BatchPlan) == 64, "BatchPlan layout must remain compact");
+static_assert(sizeof(BatchPlan) == 80, "BatchPlan layout must remain compact");
 
 struct HeadPlan {
     uint32_t qNStart;
@@ -96,12 +80,6 @@ struct MaskPlan {
 };
 
 static_assert(sizeof(MaskPlan) == 40, "MaskPlan must remain compact");
-
-struct FDPlan {
-    // lseOffset is an LSE element offset; oOffset is an output element offset.
-    uint64_t lseOffset;
-    uint64_t oOffset;
-};
 
 // Batch-shared append-KV phase geometry.  Stack-local mask state remains in
 // the KV loop; these values are invariant for all tasks of one batch.
@@ -133,15 +111,32 @@ struct AddressPlan {
 static_assert(sizeof(AddressPlan) == 72, "AddressPlan layout must remain compact");
 
 struct CoreTaskRange {
-    uint32_t taskOffset;
+    // Seeds for one flat task cursor. Only FD boundary tasks need S2 slices
+    // and partial-output offsets; storage is fixed per core.
+    uint32_t taskStart;
     uint32_t taskCount;
+    uint32_t firstBatch;
+    uint32_t firstInner;
+    uint32_t firstOuter;
+    int32_t firstS2;
+    int32_t lastS2;
+    uint32_t flags;
+    uint64_t firstLseOffset;
+    uint64_t firstOOffset;
+    uint64_t lastLseOffset;
+    uint64_t lastOOffset;
 };
+
+static_assert(sizeof(CoreTaskRange) == 64, "core task cursor must remain compact");
 
 struct alignas(64) SchedulerHeader {
     uint32_t version;
     uint32_t coreNum;
     uint32_t actualTaskCount;
     uint32_t taskCapacity;
+    // Reserved zeroed slots; metadata version 2 has no task/FD arrays.
+    // Task descriptors are no longer allocated; tasks are reconstructed from
+    // CoreTaskRange and BatchPlan.
     uint64_t taskDataOffset;
     uint64_t taskDataBytes;
     uint64_t batchPlanOffset;
