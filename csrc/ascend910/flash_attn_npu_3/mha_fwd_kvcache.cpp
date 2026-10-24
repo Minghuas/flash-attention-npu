@@ -432,6 +432,9 @@ class FAInferKernel {
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 
         epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+            epilogueOnlineSoftmax.BuildColRamp(resource);
+        }
         epilogueRescaleO.init(resource);
 
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
@@ -630,6 +633,9 @@ class FAInferKernel {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+            epilogueOnlineSoftmax.ReleaseArithMaskEvents();
+        }
 #endif
         AscendC::PipeBarrier<PIPE_ALL>();
 
@@ -1087,14 +1093,12 @@ class FAInferKernel {
         if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
             const int64_t triUp = static_cast<int64_t>(ctx.noSkipKvS) - static_cast<int64_t>(ctx.qSBlockSize);
             const bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1U);
-            const uint32_t isLastNoMaskStackTile =
-                !doTriUMask && stackSeqCount == ctx.lastNoMaskStackId;
+            const int64_t diagS0 = triUp - static_cast<int64_t>(kvSStartIdx);
             // Both causal tile modes use the same row pipeline, including unmasked tiles.
-            epilogueOnlineSoftmax(gP[gmOffsetS], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
+            epilogueOnlineSoftmax(gP[gmOffsetS], gS[gmOffsetS], layOutP, layOutS,
                                   actualBlockShapeQK, desc.firstStack, ctx.qSBlockSize, ctx.qNBlockSize,
                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                  triUp, kvSStartIdx, kvSEndIdx, doTriUMask,
-                                  isLastNoMaskStackTile, ctx.isSplitKV);
+                                  diagS0, doTriUMask, ctx.isSplitKV);
         } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             const int32_t kvStartI = static_cast<int32_t>(kvSStartIdx);
             const int32_t kvEndI = static_cast<int32_t>(kvSEndIdx);
