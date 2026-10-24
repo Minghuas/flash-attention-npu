@@ -433,7 +433,7 @@ class FAInferKernel {
 
         epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
         if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
-            epilogueOnlineSoftmax.BuildColRamp(resource);
+            epilogueOnlineSoftmax.InitArithMask(resource);
         }
         epilogueRescaleO.init(resource);
 

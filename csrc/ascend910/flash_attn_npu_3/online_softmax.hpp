@@ -47,7 +47,6 @@ public:
     static constexpr uint32_t REPEAT_SIZE_IN_BYTE = 256;
     static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
     static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
-    static constexpr uint32_t HALF_VECTOR_SIZE = 128;
     static constexpr uint32_t BLOCK_SIZE = 16;
     static constexpr uint32_t UB_UINT8_VECTOR_SIZE = 1024;
     static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;
@@ -70,15 +69,11 @@ public:
     static constexpr uint32_t CAUSAL_KEEP_STRIDE = CAUSAL_MAX_COLUMN_NUM / 8;
     // Reuse the first 4 KiB of the raw GM-mask scratch; it does not alias P.
     static constexpr uint32_t CAUSAL_KEEP_UB_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
-    static constexpr uint32_t COLRAMP_UB_OFFSET =
+    static constexpr uint32_t SELECT_SCALAR_UB_OFFSET =
         TASK_GL_UB_TENSOR_OFFSET + TASK_STATE_SLOTS * MAX_ROW_NUM_SUB_CORE * sizeof(float);
-    static constexpr uint32_t TOKEN_LIMIT_UB_OFFSET = COLRAMP_UB_OFFSET + CAUSAL_MAX_COLUMN_NUM * sizeof(half);
-    // Each rowLoop starts at a 16-half boundary, even when its row tile is 24/40/56.
-    static constexpr uint32_t TOKEN_LIMIT_CAPACITY = 2 * MAX_ROW_NUM_SUB_CORE;
-    static constexpr uint32_t LIMIT_BCAST_UB_OFFSET = TOKEN_LIMIT_UB_OFFSET + TOKEN_LIMIT_CAPACITY * sizeof(half);
     static_assert(CAUSAL_KEEP_UB_OFFSET + CAUSAL_MAX_ROWS_PER_LOOP * CAUSAL_KEEP_STRIDE <= TASK_GM_UB_TENSOR_OFFSET,
                   "causal predicates must not overlap task state");
-    static_assert(LIMIT_BCAST_UB_OFFSET + CAUSAL_MAX_ROWS_PER_LOOP * 16 * sizeof(half) <= 192 * 1024,
+    static_assert(SELECT_SCALAR_UB_OFFSET + BLOCK_SIZE_IN_BYTE <= 192 * 1024,
                   "causal arithmetic-mask workspace exceeds UB");
 
     __aicore__ inline
@@ -128,18 +123,14 @@ public:
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
     }
 
-    __aicore__ inline void BuildColRamp(Arch::Resource<ArchTag> &resource)
+    __aicore__ inline void InitArithMask(Arch::Resource<ArchTag> &resource)
     {
-        colRampUbTensor = resource.ubBuf.template GetBufferByByte<half>(COLRAMP_UB_OFFSET);
         keepUbTensor = resource.ubBuf.template GetBufferByByte<uint8_t>(CAUSAL_KEEP_UB_OFFSET);
-        tokenLimitUbTensor = resource.ubBuf.template GetBufferByByte<half>(TOKEN_LIMIT_UB_OFFSET);
-        limitBcastUbTensor = resource.ubBuf.template GetBufferByByte<half>(LIMIT_BCAST_UB_OFFSET);
-        // C220 implements this as scalar writes. Build once before the first QK wait.
-        AscendC::CreateVecIndex(colRampUbTensor, (half)(int32_t)0, CAUSAL_MAX_COLUMN_NUM);
+        selectScalarUbTensor = resource.ubBuf.template GetBufferByByte<float>(SELECT_SCALAR_UB_OFFSET);
         maskSToVEventId = GetTPipePtr()->FetchEventID(AscendC::HardEvent::S_V);
         maskVToSEventId = GetTPipePtr()->FetchEventID(AscendC::HardEvent::V_S);
-        AscendC::SetFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
-        AscendC::WaitFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
+        AscendC::Duplicate(selectScalarUbTensor, -3.0e38f, FLOAT_BLOCK_SIZE);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void ReleaseArithMaskEvents()
@@ -148,55 +139,35 @@ public:
         GetTPipePtr()->ReleaseEventID<AscendC::HardEvent::V_S>(maskVToSEventId);
     }
 
-    __aicore__ inline void BuildTokenLimitAll(uint32_t rowOffset, uint32_t rowCount,
-        uint32_t qSBlockSize, uint32_t columnNum, int64_t diagS0, uint32_t rowNumTile)
+    __aicore__ inline void ApplyArithMask(uint32_t sUbOffset, uint32_t rowNumCurLoop,
+        uint32_t columnNum, uint32_t columnNumRound, int64_t diagS0,
+        uint32_t rowOffset, uint32_t qSBlockSize)
     {
-        // Previous stacks may still read this table through Brcb.
+        // The previous Select must finish reading keep before Scalar overwrites it.
         AscendC::SetFlag<AscendC::HardEvent::V_S>(maskVToSEventId);
         AscendC::WaitFlag<AscendC::HardEvent::V_S>(maskVToSEventId);
+        auto keepWords = keepUbTensor.ReinterpretCast<uint64_t>();
+        const uint32_t wordCount = CeilDiv(columnNumRound, 64U);
         uint32_t token = rowOffset % qSBlockSize;
-        const int64_t columnLimit = static_cast<int64_t>(columnNum) - 1;
-        const uint32_t limitRowStride = RoundUp(rowNumTile, BLOCK_SIZE);
-        // Tiling bounds rowCount by MAX_ROW_NUM_SUB_CORE; no per-row UB reads or division.
-        for (uint32_t rowBase = 0, limitBase = 0; rowBase < rowCount;
-             rowBase += rowNumTile, limitBase += limitRowStride) {
-            const uint32_t rows = Min(rowNumTile, rowCount - rowBase);
-            for (uint32_t r = 0; r < rows; ++r) {
-                int64_t limit = diagS0 + static_cast<int64_t>(token);
-                limit = limit > columnLimit ? columnLimit : limit;
-                limit = limit < 0 ? -1 : limit;
-                tokenLimitUbTensor.SetValue(limitBase + r, (half)(int32_t)limit);
-                if (++token == qSBlockSize) {
-                    token = 0;
-                }
+        for (uint32_t r = 0; r < rowNumCurLoop; ++r) {
+            const int64_t rowVisible = diagS0 + static_cast<int64_t>(token) + 1;
+            const int32_t visible = rowVisible <= 0 ? 0 :
+                (rowVisible >= static_cast<int64_t>(columnNum) ? static_cast<int32_t>(columnNum) :
+                                                               static_cast<int32_t>(rowVisible));
+            for (uint32_t j = 0; j < wordCount; ++j) {
+                const int32_t bits = visible - static_cast<int32_t>(j * 64);
+                // LSB-first prefix; guard both endpoints to avoid invalid shifts.
+                const uint64_t word = bits >= 64 ? UINT64_MAX :
+                    (bits <= 0 ? uint64_t{0} : ((uint64_t{1} << bits) - uint64_t{1}));
+                keepWords.SetValue(r * (CAUSAL_KEEP_STRIDE / sizeof(uint64_t)) + j, word);
+            }
+            if (++token == qSBlockSize) {
+                token = 0;
             }
         }
         AscendC::SetFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
         AscendC::WaitFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
-    }
-
-    __aicore__ inline void ApplyArithMask(uint32_t sUbOffset, uint32_t rowNumCurLoop,
-        uint32_t columnNumRound, uint32_t limitOffset)
-    {
-        AscendC::Brcb(limitBcastUbTensor.ReinterpretCast<uint16_t>(),
-            tokenLimitUbTensor[limitOffset].ReinterpretCast<uint16_t>(),
-            static_cast<uint8_t>(RoundUp(rowNumCurLoop, FLOAT_BLOCK_SIZE) / FLOAT_BLOCK_SIZE),
-            AscendC::BrcbRepeatParams(1, 8));
-        AscendC::PipeBarrier<PIPE_V>();
-        // Half Compare handles 128 columns/repeat; short tiles do not pay for 512.
-        const uint8_t repeatTimes = static_cast<uint8_t>(CeilDiv(columnNumRound, HALF_VECTOR_SIZE));
-        for (uint32_t r = 0; r < rowNumCurLoop; ++r) {
-            AscendC::Compare(keepUbTensor[r * CAUSAL_KEEP_STRIDE], limitBcastUbTensor[r * 16],
-                colRampUbTensor, AscendC::CMPMODE::GE, (uint64_t)0, repeatTimes,
-                AscendC::BinaryRepeatParams(1, 0, 1, 8, 0, 8));
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        // All Compare reads have finished, so reuse the broadcast buffer for
-        // the Select scalar. Prepare CMPMASK once, after the last Compare.
-        auto selectScalar = limitBcastUbTensor.ReinterpretCast<float>();
-        AscendC::Duplicate(selectScalar, -3.0e38f, FLOAT_BLOCK_SIZE);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::SetCmpMask(selectScalar);
+        AscendC::SetCmpMask(selectScalarUbTensor);
         AscendC::PipeBarrier<PIPE_V>();
 
         // Predicate rows are 32B-aligned slots, not a flat rows*W bitstream.
@@ -932,9 +903,6 @@ public:
             Arch::CrossCoreWaitFlag(qkReady);
             return;
         }
-        if (doTriUMask) {
-            BuildTokenLimitAll(rowOffsetThisSubBlock, rowActualThisSubBlock, qSBlockSize, columnNum, diagS0, rowNumTile);
-        }
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
                 uint32_t pingpongFlag = softmaxPingPongFlag % 2;
@@ -966,7 +934,8 @@ public:
                 }
                 if (doTriUMask) {
                     ApplyArithMask(pingpongFlag * MAX_UB_S_ELEM_NUM, rowNumCurLoop,
-                                   columnNumRound, delayedRowLoopIdx * RoundUp(rowNumTile, BLOCK_SIZE));
+                                   columnNum, columnNumRound, diagS0,
+                                   rowOffsetThisSubBlock + rowOffsetCurLoop, qSBlockSize);
                 }
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
@@ -1197,10 +1166,8 @@ private:
 
     AscendC::TEventID maskSToVEventId;
     AscendC::TEventID maskVToSEventId;
-    AscendC::LocalTensor<half> colRampUbTensor;
     AscendC::LocalTensor<uint8_t> keepUbTensor;
-    AscendC::LocalTensor<half> tokenLimitUbTensor;
-    AscendC::LocalTensor<half> limitBcastUbTensor;
+    AscendC::LocalTensor<float> selectScalarUbTensor;
 
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
