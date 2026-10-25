@@ -448,7 +448,8 @@ class FAInferKernel {
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 
         epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
-        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL ||
+                      MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             epilogueOnlineSoftmax.InitArithMask(resource);
         }
         epilogueRescaleO.init(resource);
@@ -478,8 +479,15 @@ class FAInferKernel {
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->batchPlanOffset);
         const auto* headPlans = reinterpret_cast<const __gm__ HeadPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->headPlanOffset);
-        const auto* maskPlans = reinterpret_cast<const __gm__ MaskPlan*>(
-            reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->maskPlanOffset);
+        const __gm__ CausalMaskPlan* causalMaskPlans = nullptr;
+        const __gm__ SwaMaskPlan* swaMaskPlans = nullptr;
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+            causalMaskPlans = reinterpret_cast<const __gm__ CausalMaskPlan*>(
+                reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->maskPlanOffset);
+        } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+            swaMaskPlans = reinterpret_cast<const __gm__ SwaMaskPlan*>(
+                reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->maskPlanOffset);
+        }
         const auto* appendPlans = reinterpret_cast<const __gm__ AppendPlan*>(
             reinterpret_cast<const __gm__ uint8_t*>(fATilingData) + schedulerHeader->appendPlanOffset);
         const auto* addressPlans = reinterpret_cast<const __gm__ AddressPlan*>(
@@ -498,7 +506,30 @@ class FAInferKernel {
                 const uint32_t taskStride = FLASH_DECODE_FLAG ? 1U : schedulerHeader->coreNum;
                 const __gm__ BatchPlan* batchPlan = &batchPlans[batchIdx];
                 BatchRuntime runtime{};
-                PrepareBatchRuntime(runtime, batchPlan, &appendPlans[batchIdx], &addressPlans[batchIdx]);
+                const __gm__ AppendPlan* appendPlan = &appendPlans[batchIdx];
+                const __gm__ AddressPlan* addressPlan = &addressPlans[batchIdx];
+                runtime.qBOffset = addressPlan->qBOffset;
+                runtime.kBOffset = addressPlan->kBOffset;
+                runtime.vBOffset = addressPlan->vBOffset;
+                runtime.oBOffset = addressPlan->oBOffset;
+                runtime.lseBOffset = addressPlan->lseBOffset;
+                runtime.blockBOffset = addressPlan->blockBOffset;
+                runtime.kNewBOffset = addressPlan->kNewBOffset;
+                runtime.vNewBOffset = addressPlan->vNewBOffset;
+                runtime.lseHeadStride = addressPlan->lseHeadStride;
+                runtime.curQSBlockTile = batchPlan->qSBlockTile;
+                runtime.curQSBlockNum = batchPlan->qSBlockNum;
+                runtime.curKSBlockNum = batchPlan->kSBlockNum;
+                runtime.appendKVFlag = (appendPlan->flags & fa_metadata::APPEND_PLAN_ENABLED) != 0U;
+                runtime.kvSeqlenOld = appendPlan->kvSeqlenOld;
+                runtime.kvStartOld = appendPlan->kvStartOld;
+                runtime.kvLoopNumTotalNew = appendPlan->kvLoopNumTotalNew;
+                runtime.kvNewSeqlen = appendPlan->kvNewSeqlen;
+                runtime.taskEnd = batchPlan->taskBase + batchPlan->qNBlockNum * batchPlan->qSBlockNum;
+                runtime.taskInnerCount = FLASH_DECODE_FLAG ? batchPlan->qSBlockNum : batchPlan->qNBlockNum;
+                runtime.taskStepInner = batchPlan->taskStepInner;
+                runtime.taskStepOuter = batchPlan->taskStepOuter;
+                runtime.copybackQSBlock = batchPlan->copybackQSBlock;
                 uint32_t cachedMaskPlanIndex = UINT32_MAX;
                 MaskPlan maskValue{};
                 for (uint32_t local = 0; local < taskCount; ++local, ordinal += taskStride) {
@@ -506,7 +537,30 @@ class FAInferKernel {
                         do {
                             batchPlan = &batchPlans[++batchIdx];
                         } while (ordinal >= batchPlan->taskBase + batchPlan->qNBlockNum * batchPlan->qSBlockNum);
-                        PrepareBatchRuntime(runtime, batchPlan, &appendPlans[batchIdx], &addressPlans[batchIdx]);
+                        appendPlan = &appendPlans[batchIdx];
+                        addressPlan = &addressPlans[batchIdx];
+                        runtime.qBOffset = addressPlan->qBOffset;
+                        runtime.kBOffset = addressPlan->kBOffset;
+                        runtime.vBOffset = addressPlan->vBOffset;
+                        runtime.oBOffset = addressPlan->oBOffset;
+                        runtime.lseBOffset = addressPlan->lseBOffset;
+                        runtime.blockBOffset = addressPlan->blockBOffset;
+                        runtime.kNewBOffset = addressPlan->kNewBOffset;
+                        runtime.vNewBOffset = addressPlan->vNewBOffset;
+                        runtime.lseHeadStride = addressPlan->lseHeadStride;
+                        runtime.curQSBlockTile = batchPlan->qSBlockTile;
+                        runtime.curQSBlockNum = batchPlan->qSBlockNum;
+                        runtime.curKSBlockNum = batchPlan->kSBlockNum;
+                        runtime.appendKVFlag = (appendPlan->flags & fa_metadata::APPEND_PLAN_ENABLED) != 0U;
+                        runtime.kvSeqlenOld = appendPlan->kvSeqlenOld;
+                        runtime.kvStartOld = appendPlan->kvStartOld;
+                        runtime.kvLoopNumTotalNew = appendPlan->kvLoopNumTotalNew;
+                        runtime.kvNewSeqlen = appendPlan->kvNewSeqlen;
+                        runtime.taskEnd = batchPlan->taskBase + batchPlan->qNBlockNum * batchPlan->qSBlockNum;
+                        runtime.taskInnerCount = FLASH_DECODE_FLAG ? batchPlan->qSBlockNum : batchPlan->qNBlockNum;
+                        runtime.taskStepInner = batchPlan->taskStepInner;
+                        runtime.taskStepOuter = batchPlan->taskStepOuter;
+                        runtime.copybackQSBlock = batchPlan->copybackQSBlock;
                         // Decode only at batch transitions; in-batch tasks use a carry.
                         const uint32_t inBatch = ordinal - batchPlan->taskBase;
                         outer = inBatch / runtime.taskInnerCount;
@@ -515,22 +569,28 @@ class FAInferKernel {
                     const uint32_t qS = FLASH_DECODE_FLAG ? inner : outer;
                     const uint32_t qN = FLASH_DECODE_FLAG ? outer : inner;
                     const __gm__ HeadPlan* head = &headPlans[batchPlan->headPlanBase + qN];
-                    const uint32_t maskIndex = batchPlan->maskPlanBase + qS;
-                    if (maskIndex != cachedMaskPlanIndex) {
-                        cachedMaskPlanIndex = maskIndex;
-                        const __gm__ MaskPlan* mask = &maskPlans[maskIndex];
-                        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
-                            maskValue.windowSizeLeftStartLen = mask->windowSizeLeftStartLen;
-                            maskValue.windowSizeLeftEndLen = mask->windowSizeLeftEndLen;
-                            maskValue.windowSizeRightStartLen = mask->windowSizeRightStartLen;
-                            maskValue.windowSizeRightEndLen = mask->windowSizeRightEndLen;
-                            maskValue.flags = mask->flags;
+                    if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL ||
+                                  MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+                        const uint32_t maskIndex = batchPlan->maskPlanBase + qS;
+                        if (maskIndex != cachedMaskPlanIndex) {
+                            cachedMaskPlanIndex = maskIndex;
+                            if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+                                const __gm__ CausalMaskPlan* plan = &causalMaskPlans[maskIndex];
+                                maskValue.causal.invalidPrefixEndRow = plan->invalidPrefixEndRow;
+                                maskValue.causal.noSkipKvS = plan->noSkipKvS;
+                                maskValue.causal.kvSLoopNumTotal = plan->kvSLoopNumTotal;
+                            } else {
+                                const __gm__ SwaMaskPlan* plan = &swaMaskPlans[maskIndex];
+                                maskValue.swa.windowSizeLeftStartLen = plan->windowSizeLeftStartLen;
+                                maskValue.swa.windowSizeRightStartLen = plan->windowSizeRightStartLen;
+                                maskValue.swa.invalidSuffixStartRow = plan->invalidSuffixStartRow;
+                                maskValue.swa.invalidPrefixEndRow = plan->invalidPrefixEndRow;
+                                maskValue.swa.noSkipKvS = plan->noSkipKvS;
+                                maskValue.swa.kvStart = plan->kvStart;
+                                maskValue.swa.kvSLoopNumTotal = plan->kvSLoopNumTotal;
+                                maskValue.swa.flags = plan->flags;
+                            }
                         }
-                        maskValue.invalidSuffixStartRow = mask->invalidSuffixStartRow;
-                        maskValue.invalidPrefixEndRow = mask->invalidPrefixEndRow;
-                        maskValue.noSkipKvS = mask->noSkipKvS;
-                        maskValue.kvStart = mask->kvStart;
-                        maskValue.kvSLoopNumTotal = mask->kvSLoopNumTotal;
                     }
                     int32_t startS2 = 0;
                     int32_t endS2 = static_cast<int32_t>(runtime.curKSBlockNum);
@@ -628,7 +688,8 @@ class FAInferKernel {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
-        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL ||
+                      MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             epilogueOnlineSoftmax.ReleaseArithMaskEvents();
         }
 #endif
@@ -645,36 +706,6 @@ class FAInferKernel {
 #endif
         }
     }
-
-#ifdef __DAV_C220_VEC__
-    __aicore__ __attribute__((noinline)) void PrepareBatchRuntime(
-        BatchRuntime& runtime, const __gm__ BatchPlan* batchPlan,
-        const __gm__ AppendPlan* appendPlan, const __gm__ AddressPlan* addressPlan)
-    {
-        runtime.qBOffset = addressPlan->qBOffset;
-        runtime.kBOffset = addressPlan->kBOffset;
-        runtime.vBOffset = addressPlan->vBOffset;
-        runtime.oBOffset = addressPlan->oBOffset;
-        runtime.lseBOffset = addressPlan->lseBOffset;
-        runtime.blockBOffset = addressPlan->blockBOffset;
-        runtime.kNewBOffset = addressPlan->kNewBOffset;
-        runtime.vNewBOffset = addressPlan->vNewBOffset;
-        runtime.lseHeadStride = addressPlan->lseHeadStride;
-        runtime.curQSBlockTile = batchPlan->qSBlockTile;
-        runtime.curQSBlockNum = batchPlan->qSBlockNum;
-        runtime.curKSBlockNum = batchPlan->kSBlockNum;
-        runtime.appendKVFlag = (appendPlan->flags & fa_metadata::APPEND_PLAN_ENABLED) != 0U;
-        runtime.kvSeqlenOld = appendPlan->kvSeqlenOld;
-        runtime.kvStartOld = appendPlan->kvStartOld;
-        runtime.kvLoopNumTotalNew = appendPlan->kvLoopNumTotalNew;
-        runtime.kvNewSeqlen = appendPlan->kvNewSeqlen;
-        runtime.taskEnd = batchPlan->taskBase + batchPlan->qNBlockNum * batchPlan->qSBlockNum;
-        runtime.taskInnerCount = FLASH_DECODE_FLAG ? batchPlan->qSBlockNum : batchPlan->qNBlockNum;
-        runtime.taskStepInner = batchPlan->taskStepInner;
-        runtime.taskStepOuter = batchPlan->taskStepOuter;
-        runtime.copybackQSBlock = batchPlan->copybackQSBlock;
-    }
-#endif
 
 #ifdef __DAV_C220_CUBE__
     __aicore__ inline void BuildCubeBatchRuntime(BatchRuntime& runtime, uint32_t batchIdx,
@@ -1024,8 +1055,8 @@ class FAInferKernel {
     // caller so all fields written here are preserved in the pipeline ring.
     // SWA state is passed back explicitly.
     __aicore__ inline void RunQKSoftmaxStack(
-        const StackRunContext& ctx, uint32_t kvSIdx, int32_t stackSeqCount,
-        uint32_t taskStackCount, uint32_t issuedStackCount,
+        const StackRunContext& ctx, uint32_t kvSIdx, uint32_t taskStackCount,
+        uint32_t issuedStackCount,
         uint32_t& softmaxPingPongFlag, GlobalTensorBundle& globalTensors,
         StackDescriptor& desc, bool& startsWithMaskTile, bool& startsWithMaskThenNomaskFlag)
     {
@@ -1098,8 +1129,6 @@ class FAInferKernel {
                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
                                   diagS0, doTriUMask, ctx.isSplitKV);
         } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
-            auto& gMask = globalTensors.gMask;
-            LayoutMask layOutMask(COMP_TRIU_MASK_DIM_LEN, COMP_TRIU_MASK_DIM_LEN);
             const int32_t kvStartI = static_cast<int32_t>(kvSStartIdx);
             const int32_t kvEndI = static_cast<int32_t>(kvSEndIdx);
             const bool doTriUPreMask =
@@ -1113,21 +1142,13 @@ class FAInferKernel {
                       (ctx.windowSizeRightEndLen > kvStartI && ctx.windowSizeRightEndLen <= kvEndI) ||
                       (ctx.windowSizeRightStartLen <= kvStartI && ctx.windowSizeRightEndLen >= kvEndI);
             const bool doTriUMask = doTriUPreMask || doTriUNextMask;
-            if (doTriUMask) {
-                startsWithMaskTile = true;
-                startsWithMaskThenNomaskFlag = true;
-            }
-            epilogueOnlineSoftmax(gP[gmOffsetS], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
+            const int64_t leftS0 = static_cast<int64_t>(ctx.windowSizeLeftStartLen) - kvSStartIdx;
+            const int64_t rightS0 = static_cast<int64_t>(ctx.windowSizeRightStartLen) - kvSStartIdx;
+            epilogueOnlineSoftmax(gP[gmOffsetS], gS[gmOffsetS], layOutP, layOutS,
                                   actualBlockShapeQK, desc.firstStack, ctx.qSBlockSize, ctx.qNBlockSize,
                                   curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                  kvSStartIdx, doTriUPreMask, doTriUNextMask, ctx.windowSizeLeftStartLen,
-                                  ctx.windowSizeLeftEndLen, ctx.windowSizeRightStartLen,
-                                  ctx.windowSizeRightEndLen, ctx.isSplitKV,
-                                  static_cast<uint32_t>(!doTriUMask && stackSeqCount == ctx.lastNoMaskStackId),
-                                  startsWithMaskTile, startsWithMaskThenNomaskFlag);
-            if (!doTriUMask) {
-                startsWithMaskTile = false;
-            }
+                                  rightS0, doTriUMask, ctx.isSplitKV,
+                                  leftS0, doTriUPreMask, doTriUNextMask);
         } else {
             epilogueOnlineSoftmax(gP[gmOffsetS], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
                                   desc.firstStack, 0, ctx.qSBlockSize, ctx.qNBlockSize, curStackTileMod,
@@ -1147,7 +1168,7 @@ class FAInferKernel {
         while (prefillRemaining != 0U && ctx.kvStart + taskPrefillCount < ctx.kvEnd) {
             StackDescriptor& desc = descriptors[issuedStackCount % STACK_SLOTS];
             RunQKSoftmaxStack(ctx, ctx.kvStart + taskPrefillCount, taskPrefillCount,
-                              taskPrefillCount, issuedStackCount, softmaxPingPongFlag,
+                              issuedStackCount, softmaxPingPongFlag,
                               globalTensors, desc, startsWithMaskTile, startsWithMaskThenNomaskFlag);
             ++taskPrefillCount;
             ++issuedStackCount;
@@ -1222,17 +1243,34 @@ class FAInferKernel {
                               invalidSuffixStartRow, qSeqlen, kvSeqlen, qSBlockIdx,
                               curQSBlockTile, qSBlockSize);
 #else
-        const uint32_t noSkipKvS = maskGeometry.noSkipKvS;
-        uint32_t kvSLoopNumTotal = maskGeometry.kvSLoopNumTotal;
-        uint32_t kvStart = maskGeometry.kvStart;
-        const int32_t windowSizeLeftStartLen = maskGeometry.windowSizeLeftStartLen;
-        const int32_t windowSizeLeftEndLen = maskGeometry.windowSizeLeftEndLen;
-        const int32_t windowSizeRightStartLen = maskGeometry.windowSizeRightStartLen;
-        const int32_t windowSizeRightEndLen = maskGeometry.windowSizeRightEndLen;
-        const bool notPreMask = (maskGeometry.flags & fa_metadata::MASK_PLAN_NOT_PRE_MASK) != 0;
-        const bool notNextMask = (maskGeometry.flags & fa_metadata::MASK_PLAN_NOT_NEXT_MASK) != 0;
-        const int32_t invalidSuffixStartRow = maskGeometry.invalidSuffixStartRow;
-        const int32_t invalidPrefixEndRow = maskGeometry.invalidPrefixEndRow;
+        uint32_t noSkipKvS = kvSeqlen;
+        uint32_t kvSLoopNumTotal = CeilDiv(kvSeqlen, MAX_KV_STACK_LEN);
+        uint32_t kvStart = 0;
+        int32_t windowSizeLeftStartLen = 0;
+        int32_t windowSizeLeftEndLen = 0;
+        int32_t windowSizeRightStartLen = 0;
+        int32_t windowSizeRightEndLen = 0;
+        bool notPreMask = true;
+        bool notNextMask = true;
+        int32_t invalidSuffixStartRow = 0;
+        int32_t invalidPrefixEndRow = static_cast<int32_t>(qSeqlen);
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
+            noSkipKvS = maskGeometry.causal.noSkipKvS;
+            kvSLoopNumTotal = maskGeometry.causal.kvSLoopNumTotal;
+            invalidPrefixEndRow = maskGeometry.causal.invalidPrefixEndRow;
+        } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+            noSkipKvS = maskGeometry.swa.noSkipKvS;
+            kvSLoopNumTotal = maskGeometry.swa.kvSLoopNumTotal;
+            kvStart = maskGeometry.swa.kvStart;
+            windowSizeLeftStartLen = maskGeometry.swa.windowSizeLeftStartLen;
+            windowSizeRightStartLen = maskGeometry.swa.windowSizeRightStartLen;
+            notPreMask = (maskGeometry.swa.flags & fa_metadata::MASK_PLAN_NOT_PRE_MASK) != 0;
+            notNextMask = (maskGeometry.swa.flags & fa_metadata::MASK_PLAN_NOT_NEXT_MASK) != 0;
+            windowSizeLeftEndLen = notPreMask ? 0 : windowSizeLeftStartLen + static_cast<int32_t>(qSBlockSize);
+            windowSizeRightEndLen = notNextMask ? 0 : windowSizeRightStartLen + static_cast<int32_t>(qSBlockSize);
+            invalidSuffixStartRow = maskGeometry.swa.invalidSuffixStartRow;
+            invalidPrefixEndRow = maskGeometry.swa.invalidPrefixEndRow;
+        }
 #endif
 
         // Match FA GPU split-KV: n_block_min/max = split ∩ window (do not overwrite SWA).
@@ -1334,17 +1372,15 @@ class FAInferKernel {
             stackCtx, issuedStackCount, prefillRemaining, softmaxPingPongFlag, globalTensors, descriptors,
             startsWithMaskTile, startsWithMaskThenNomaskFlag);
 
-        int32_t steadyStackSeqCount = static_cast<int32_t>(taskPrefillCount);
-        uint32_t steadyTaskStackCount = taskPrefillCount;
+        uint32_t taskStackCount = taskPrefillCount;
         for (uint32_t kvSIdx = kvStart + taskPrefillCount; kvSIdx < kvEnd; ++kvSIdx) {
             StackDescriptor& desc = descriptors[issuedStackCount % STACK_SLOTS];
-            RunQKSoftmaxStack(stackCtx, kvSIdx, steadyStackSeqCount, steadyTaskStackCount,
+            RunQKSoftmaxStack(stackCtx, kvSIdx, taskStackCount,
                               issuedStackCount, softmaxPingPongFlag, globalTensors, desc,
                               startsWithMaskTile, startsWithMaskThenNomaskFlag);
             StackDescriptor& pvDesc = descriptors[(issuedStackCount - PRE_LAUNCH) % STACK_SLOTS];
             ConsumeDelayedPV(coreIdx, pvDesc, taskContexts, blockStackNum, MAX_KV_STACK_LEN, globalTensors);
-            ++steadyStackSeqCount;
-            ++steadyTaskStackCount;
+            ++taskStackCount;
             ++issuedStackCount;
         }
         return !isEmptyTask;

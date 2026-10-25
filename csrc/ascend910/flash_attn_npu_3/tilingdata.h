@@ -39,26 +39,19 @@ struct BatchPlan {
     uint32_t qSeqlen;
     uint32_t kvSeqlen;
     uint32_t qNBlockTile;
-    uint32_t qNBlockNumPerGroup;
     uint32_t qNBlockNum;
     uint32_t qSBlockTile;
     uint32_t qSBlockNum;
-    uint32_t kSBlockTile;
     uint32_t kSBlockNum;
-    uint32_t kSBlockTail;
-    uint32_t appendStartStack;
-    uint32_t flags;
     uint32_t headPlanBase;
-    uint32_t headPlanCount;
     uint32_t maskPlanBase;
-    uint32_t maskPlanCount;
     uint32_t taskBase;
     uint32_t taskStepOuter;
     uint32_t taskStepInner;
     uint32_t copybackQSBlock;
 };
 
-static_assert(sizeof(BatchPlan) == 80, "BatchPlan layout must remain compact");
+static_assert(sizeof(BatchPlan) == 52, "BatchPlan layout must remain compact");
 
 struct HeadPlan {
     uint32_t qNStart;
@@ -66,11 +59,17 @@ struct HeadPlan {
     uint32_t kvHeadOffset;
 };
 
-struct MaskPlan {
+struct CausalMaskPlan {
+    int32_t invalidPrefixEndRow;
+    uint32_t noSkipKvS;
+    uint32_t kvSLoopNumTotal;
+};
+
+static_assert(sizeof(CausalMaskPlan) == 12, "CausalMaskPlan must remain compact");
+
+struct SwaMaskPlan {
     int32_t windowSizeLeftStartLen;
-    int32_t windowSizeLeftEndLen;
     int32_t windowSizeRightStartLen;
-    int32_t windowSizeRightEndLen;
     int32_t invalidSuffixStartRow;
     int32_t invalidPrefixEndRow;
     uint32_t noSkipKvS;
@@ -79,7 +78,14 @@ struct MaskPlan {
     uint32_t flags;
 };
 
-static_assert(sizeof(MaskPlan) == 40, "MaskPlan must remain compact");
+static_assert(sizeof(SwaMaskPlan) == 32, "SwaMaskPlan must remain compact");
+
+union MaskPlan {
+    CausalMaskPlan causal;
+    SwaMaskPlan swa;
+};
+
+static_assert(sizeof(MaskPlan) == sizeof(SwaMaskPlan), "MaskPlan must use the largest mode layout");
 
 // Batch-shared append-KV phase geometry.  Stack-local mask state remains in
 // the KV loop; these values are invariant for all tasks of one batch.
@@ -134,7 +140,7 @@ struct alignas(64) SchedulerHeader {
     uint32_t coreNum;
     uint32_t actualTaskCount;
     uint32_t taskCapacity;
-    // Reserved zeroed slots; metadata version 2 has no task/FD arrays.
+    // Reserved zeroed slots; metadata version 3 has no task/FD arrays.
     // Task descriptors are no longer allocated; tasks are reconstructed from
     // CoreTaskRange and BatchPlan.
     uint64_t taskDataOffset;

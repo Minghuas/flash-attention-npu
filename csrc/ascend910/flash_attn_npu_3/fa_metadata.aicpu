@@ -42,34 +42,38 @@ inline void InitSchedulerHeader(SchedulerHeader& header, uint32_t coreNum)
     header.status = fa_metadata::TASK_METADATA_OK;
 }
 
-inline uint32_t BuildBatchPlans(BatchPlan* plans, HeadPlan* headPlans, MaskPlan* maskPlans,
-                            uint32_t batch, uint32_t groupSize, uint32_t maskType,
-                            int64_t windowLeft, int64_t windowRight, const fa_split::SplitContext& ctx)
+inline void BuildAppendPlan(AppendPlan& plan, const fa_split::BatchParams& p,
+                            const fa_split::SplitContext& ctx);
+inline void BuildAddressPlan(AddressPlan& plan, uint32_t batchIdx, const FAMetadataArgs& args,
+                             const fa_split::SplitContext& ctx, uint32_t totalQTokens,
+                             uint32_t qPrefix, uint32_t kvPrefix);
+
+inline bool BuildPlans(BatchPlan* plans, HeadPlan* headPlans, uint8_t* maskPlanData,
+                       AppendPlan* appendPlans, AddressPlan* addressPlans,
+                       uint32_t batch, uint32_t groupSize, uint32_t maskType,
+                       int64_t windowLeft, int64_t windowRight, const FAMetadataArgs& args,
+                       const fa_split::SplitContext& ctx, uint32_t totalQTokens,
+                       uint32_t headCapacity, uint32_t maskCapacity,
+                       uint32_t& headPlanBase, uint32_t& maskPlanBase)
 {
-    uint32_t headPlanBase = 0;
-    uint32_t maskPlanBase = 0;
+    uint32_t qPrefix = 0;
+    uint32_t kvPrefix = 0;
     for (uint32_t b = 0; b < batch; ++b) {
         const fa_split::BatchParams p = fa_split::getBatchParams(b, groupSize, ctx);
+        const uint32_t batchMaskCount = maskType == 0U ? 0U : p.curQSBlockNum;
+        if (p.curQNBlockNum > headCapacity - headPlanBase ||
+            batchMaskCount > maskCapacity - maskPlanBase) return false;
         BatchPlan& plan = plans[b];
         std::memset(&plan, 0, sizeof(BatchPlan));
         plan.qSeqlen = p.qSeqlen;
         plan.kvSeqlen = p.kvSeqlen;
         plan.qNBlockTile = p.curQNBlockTile;
-        plan.qNBlockNumPerGroup = p.qNBlockNumPerGroup;
         plan.qNBlockNum = p.curQNBlockNum;
         plan.qSBlockTile = p.curQSBlockTile;
         plan.qSBlockNum = p.curQSBlockNum;
-        plan.kSBlockTile = p.curKSBlockTile;
         plan.kSBlockNum = p.curKSBlockNum;
-        plan.kSBlockTail = p.curKSBlockTail;
-        plan.appendStartStack = ctx.kvNewSeqlen == 0
-            ? p.curKSBlockNum
-            : (static_cast<uint32_t>(p.kvSeqlen - ctx.kvNewSeqlen) + p.curKSBlockTile - 1) /
-                  p.curKSBlockTile;
         plan.headPlanBase = headPlanBase;
-        plan.headPlanCount = p.curQNBlockNum;
         plan.maskPlanBase = maskPlanBase;
-        plan.maskPlanCount = p.curQSBlockNum;
         for (uint32_t n = 0; n < p.curQNBlockNum; ++n) {
             const uint32_t nInGroup = n % p.qNBlockNumPerGroup;
             const uint32_t kvHead = n / p.qNBlockNumPerGroup;
@@ -81,16 +85,27 @@ inline uint32_t BuildBatchPlans(BatchPlan* plans, HeadPlan* headPlans, MaskPlan*
             head.kvHeadOffset = kvHead;
         }
         headPlanBase += p.curQNBlockNum;
-        for (uint32_t s = 0; s < p.curQSBlockNum; ++s) {
+        const uint32_t maskStride = fa_metadata::MaskPlanStride(maskType);
+        for (uint32_t s = 0; s < batchMaskCount; ++s) {
             const uint32_t qSSize = s + 1 == p.curQSBlockNum
                 ? p.qSeqlen - s * p.curQSBlockTile : p.curQSBlockTile;
-            maskPlans[maskPlanBase + s] = fa_metadata::BuildMaskPlan(
+            const MaskPlan value = fa_metadata::BuildMaskPlan(
                 p.qSeqlen, p.kvSeqlen, s, p.curQSBlockTile, qSSize, maskType,
                 windowLeft, windowRight);
+            uint8_t* slot = maskPlanData + static_cast<uint64_t>(maskPlanBase + s) * maskStride;
+            if (maskType == 1U) {
+                *reinterpret_cast<CausalMaskPlan*>(slot) = value.causal;
+            } else {
+                *reinterpret_cast<SwaMaskPlan*>(slot) = value.swa;
+            }
         }
-        maskPlanBase += p.curQSBlockNum;
+        maskPlanBase += batchMaskCount;
+        BuildAppendPlan(appendPlans[b], p, ctx);
+        BuildAddressPlan(addressPlans[b], b, args, ctx, totalQTokens, qPrefix, kvPrefix);
+        qPrefix += p.qSeqlen;
+        if (ctx.seqlens_k_cpu != nullptr) kvPrefix += static_cast<uint32_t>(ctx.seqlens_k_cpu[b]);
     }
-    return headPlanBase;
+    return true;
 }
 
 inline void BuildAppendPlan(AppendPlan& plan, const fa_split::BatchParams& p,
@@ -111,15 +126,9 @@ inline void BuildAppendPlan(AppendPlan& plan, const fa_split::BatchParams& p,
 }
 
 inline void BuildAddressPlan(AddressPlan& plan, uint32_t batchIdx, const FAMetadataArgs& args,
-                             const fa_split::SplitContext& ctx, uint32_t totalQTokens)
+                             const fa_split::SplitContext& ctx, uint32_t totalQTokens,
+                             uint32_t qPrefix, uint32_t kvPrefix)
 {
-    uint32_t qPrefix = 0;
-    uint32_t kvPrefix = 0;
-    for (uint32_t i = 0; i < batchIdx; ++i) {
-        qPrefix += ctx.seqlens_q_cpu == nullptr ? static_cast<uint32_t>(ctx.seqlen_q)
-                                                : static_cast<uint32_t>(ctx.seqlens_q_cpu[i]);
-        kvPrefix += ctx.seqlens_k_cpu == nullptr ? 0U : static_cast<uint32_t>(ctx.seqlens_k_cpu[i]);
-    }
     const uint64_t qStride = static_cast<uint64_t>(args.numHeads) * args.embeddingSize;
     const uint64_t oStride = static_cast<uint64_t>(args.numHeads) * args.embeddingSizeV;
     const uint64_t kStride = static_cast<uint64_t>(args.numHeadsK) * args.embeddingSize;
@@ -141,7 +150,8 @@ inline void BuildAddressPlan(AddressPlan& plan, uint32_t batchIdx, const FAMetad
 }
 
 inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* tilingData,
-                                const fa_split::SplitContext& ctx, uint32_t groupSize)
+                                const fa_split::SplitContext& ctx, uint32_t groupSize,
+                                uint32_t totalQTokens)
 {
     auto* metaBase = reinterpret_cast<uint8_t*>(metaArgs->metaOutAddr);
     auto* header = reinterpret_cast<SchedulerHeader*>(metaBase + fa_metadata::SchedulerHeaderOffset());
@@ -162,54 +172,41 @@ inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* til
     header->maskPlanOffset = fa_metadata::MaskPlanOffsetForCapacity(
         metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
         metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, metaArgs->taskCapacityFactor);
-    header->maskPlanBytes = static_cast<uint64_t>(metaArgs->maskPlanCapacity) * sizeof(MaskPlan);
+    const uint64_t maskPlanBytes = fa_metadata::MaskPlanStorageBytes(
+        metaArgs->maskPlanCapacity, metaArgs->maskType);
+    header->maskPlanBytes = maskPlanBytes;
     header->appendPlanOffset = fa_metadata::AppendPlanOffsetForCapacity(
         metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
-        metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, metaArgs->maskPlanCapacity,
+        metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, maskPlanBytes,
         metaArgs->taskCapacityFactor);
     header->appendPlanBytes = static_cast<uint64_t>(metaArgs->batch) * sizeof(AppendPlan);
     header->appendPlanCount = metaArgs->batch;
     header->addressPlanOffset = fa_metadata::AddressPlanOffsetForCapacity(
         metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
-        metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, metaArgs->maskPlanCapacity, metaArgs->batch,
+        metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, maskPlanBytes, metaArgs->batch,
         metaArgs->taskCapacityFactor);
     header->addressPlanBytes = static_cast<uint64_t>(metaArgs->batch) * sizeof(AddressPlan);
     header->addressPlanCount = metaArgs->batch;
     auto* batchPlans = reinterpret_cast<BatchPlan*>(metaBase + header->batchPlanOffset);
     auto* headPlans = reinterpret_cast<HeadPlan*>(metaBase + header->headPlanOffset);
-    auto* maskPlans = reinterpret_cast<MaskPlan*>(metaBase + header->maskPlanOffset);
+    auto* maskPlanData = metaBase + header->maskPlanOffset;
     auto* appendPlans = reinterpret_cast<AppendPlan*>(metaBase + header->appendPlanOffset);
     auto* addressPlans = reinterpret_cast<AddressPlan*>(metaBase + header->addressPlanOffset);
 
-    const uint32_t actualHeadPlanCount =
-        BuildBatchPlans(batchPlans, headPlans, maskPlans, metaArgs->batch, groupSize,
-                        tilingData->maskType, tilingData->windowSizeLeft,
-                        tilingData->windowSizeRight, ctx);
-    for (uint32_t b = 0; b < metaArgs->batch; ++b) {
-        BuildAppendPlan(appendPlans[b], fa_split::getBatchParams(b, groupSize, ctx), ctx);
-    }
-    uint32_t totalQTokens = 0;
-    for (uint32_t b = 0; b < metaArgs->batch; ++b) {
-        totalQTokens += ctx.seqlens_q_cpu == nullptr ? static_cast<uint32_t>(ctx.seqlen_q)
-                                                     : static_cast<uint32_t>(ctx.seqlens_q_cpu[b]);
-    }
-    for (uint32_t b = 0; b < metaArgs->batch; ++b) {
-        BuildAddressPlan(addressPlans[b], b, *metaArgs, ctx, totalQTokens);
-    }
-    if (actualHeadPlanCount > metaArgs->headPlanCapacity) {
+    uint32_t actualHeadPlanCount = 0;
+    uint32_t actualMaskPlanCount = 0;
+    if (!BuildPlans(batchPlans, headPlans, maskPlanData, appendPlans, addressPlans,
+                    metaArgs->batch, groupSize, metaArgs->maskType,
+                    tilingData->windowSizeLeft, tilingData->windowSizeRight, *metaArgs,
+                    ctx, totalQTokens, metaArgs->headPlanCapacity,
+                    metaArgs->maskPlanCapacity, actualHeadPlanCount, actualMaskPlanCount)) {
         header->status = fa_metadata::TASK_METADATA_OVERFLOW;
         return false;
     }
     header->headPlanBytes = static_cast<uint64_t>(actualHeadPlanCount) * sizeof(HeadPlan);
     header->headPlanCount = actualHeadPlanCount;
-    uint32_t actualMaskPlanCount = 0;
-    for (uint32_t b = 0; b < metaArgs->batch; ++b) actualMaskPlanCount += batchPlans[b].maskPlanCount;
-    if (actualMaskPlanCount > metaArgs->maskPlanCapacity) {
-        header->status = fa_metadata::TASK_METADATA_OVERFLOW;
-        return false;
-    }
     header->maskPlanCount = actualMaskPlanCount;
-    header->maskPlanBytes = static_cast<uint64_t>(actualMaskPlanCount) * sizeof(MaskPlan);
+    header->maskPlanBytes = fa_metadata::MaskPlanStorageBytes(actualMaskPlanCount, metaArgs->maskType);
 
     return fa_metadata::BuildTaskSchedule(*header, ranges, batchPlans, headPlans, *tilingData);
 }
@@ -267,6 +264,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     uint32_t firstBatchTaskNum = 0;
     uint32_t maxQ = 0;
     uint32_t minQ = 0xFFFFFFFFu;
+    uint32_t totalQTokens = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (seqlensQ != nullptr) {
@@ -287,6 +285,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
         if (qSeqlen < minQ) {
             minQ = qSeqlen;
         }
+        totalQTokens += qSeqlen;
     }
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
     tilingData->totalTaskNum = totalTaskNum;
@@ -322,7 +321,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;
         }
-        if (!BuildSchedulerTasks(metaArgs, tilingData, ctx, groupSize)) {
+        if (!BuildSchedulerTasks(metaArgs, tilingData, ctx, groupSize, totalQTokens)) {
             AscendC::DataStoreBarrier();
             return 1;
         }

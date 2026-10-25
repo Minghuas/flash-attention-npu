@@ -128,22 +128,23 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
     header->fdPlanCount = 0;
     header->maskPlanOffset = fa_metadata::MaskPlanOffsetForCapacity(
         blockDim, batch, maxQSeqlen, numHeads, headPlanCapacity, fdPlanCapacity, taskCapacityFactor);
-    header->maskPlanBytes = static_cast<uint64_t>(maskPlanCapacity) * sizeof(MaskPlan);
+    const uint64_t maskPlanBytes = fa_metadata::MaskPlanStorageBytes(maskPlanCapacity, tiling->maskType);
+    header->maskPlanBytes = maskPlanBytes;
     header->maskPlanCount = 0;
     header->appendPlanOffset = fa_metadata::AppendPlanOffsetForCapacity(
-        blockDim, batch, maxQSeqlen, numHeads, headPlanCapacity, fdPlanCapacity, maskPlanCapacity,
+        blockDim, batch, maxQSeqlen, numHeads, headPlanCapacity, fdPlanCapacity, maskPlanBytes,
         taskCapacityFactor);
     header->appendPlanBytes = static_cast<uint64_t>(batch) * sizeof(AppendPlan);
     header->appendPlanCount = batch;
     header->addressPlanOffset = fa_metadata::AddressPlanOffsetForCapacity(
         blockDim, batch, maxQSeqlen, numHeads, headPlanCapacity, fdPlanCapacity,
-        maskPlanCapacity, batch, taskCapacityFactor);
+        maskPlanBytes, batch, taskCapacityFactor);
     header->addressPlanBytes = static_cast<uint64_t>(batch) * sizeof(AddressPlan);
     header->addressPlanCount = batch;
     header->flashDecodeFlag = tiling->flashDecodeFlag;
     auto* batchPlans = reinterpret_cast<BatchPlan*>(metadata + header->batchPlanOffset);
     auto* headPlans = reinterpret_cast<HeadPlan*>(metadata + header->headPlanOffset);
-    auto* maskPlans = reinterpret_cast<MaskPlan*>(metadata + header->maskPlanOffset);
+    auto* maskPlanData = metadata + header->maskPlanOffset;
     auto* appendPlans = reinterpret_cast<AppendPlan*>(metadata + header->appendPlanOffset);
     auto* addressPlans = reinterpret_cast<AddressPlan*>(metadata + header->addressPlanOffset);
     uint32_t totalQTokens = 0;
@@ -158,21 +159,12 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
         plan.qSeqlen = p.qSeqlen;
         plan.kvSeqlen = p.kvSeqlen;
         plan.qNBlockTile = p.curQNBlockTile;
-        plan.qNBlockNumPerGroup = p.qNBlockNumPerGroup;
         plan.qNBlockNum = p.curQNBlockNum;
         plan.qSBlockTile = p.curQSBlockTile;
         plan.qSBlockNum = p.curQSBlockNum;
-        plan.kSBlockTile = p.curKSBlockTile;
         plan.kSBlockNum = p.curKSBlockNum;
-        plan.kSBlockTail = p.curKSBlockTail;
-        plan.appendStartStack = ctx.kvNewSeqlen == 0
-            ? p.curKSBlockNum
-            : (static_cast<uint32_t>(p.kvSeqlen - ctx.kvNewSeqlen) + p.curKSBlockTile - 1) /
-                  p.curKSBlockTile;
         plan.headPlanBase = header->headPlanCount;
-        plan.headPlanCount = p.curQNBlockNum;
         plan.maskPlanBase = header->maskPlanCount;
-        plan.maskPlanCount = p.curQSBlockNum;
         TORCH_CHECK(header->headPlanCount + p.curQNBlockNum <= headPlanCapacity,
                     "scheduler HeadPlan capacity exceeded");
         for (uint32_t n = 0; n < p.curQNBlockNum; ++n) {
@@ -186,16 +178,24 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
             head.kvHeadOffset = kvHead;
         }
         header->headPlanCount += p.curQNBlockNum;
-        TORCH_CHECK(header->maskPlanCount + p.curQSBlockNum <= maskPlanCapacity,
+        const uint32_t batchMaskCount = tiling->maskType == 0U ? 0U : p.curQSBlockNum;
+        TORCH_CHECK(header->maskPlanCount + batchMaskCount <= maskPlanCapacity,
                     "scheduler MaskPlan capacity exceeded");
-        for (uint32_t s = 0; s < p.curQSBlockNum; ++s) {
+        const uint32_t maskStride = fa_metadata::MaskPlanStride(tiling->maskType);
+        for (uint32_t s = 0; s < batchMaskCount; ++s) {
             const uint32_t qSSize = s + 1 == p.curQSBlockNum
                 ? p.qSeqlen - s * p.curQSBlockTile : p.curQSBlockTile;
-            maskPlans[header->maskPlanCount + s] = fa_metadata::BuildMaskPlan(
+            const MaskPlan value = fa_metadata::BuildMaskPlan(
                 p.qSeqlen, p.kvSeqlen, s, p.curQSBlockTile, qSSize, tiling->maskType,
                 tiling->windowSizeLeft, tiling->windowSizeRight);
+            uint8_t* slot = maskPlanData + static_cast<uint64_t>(header->maskPlanCount + s) * maskStride;
+            if (tiling->maskType == 1U) {
+                *reinterpret_cast<CausalMaskPlan*>(slot) = value.causal;
+            } else {
+                *reinterpret_cast<SwaMaskPlan*>(slot) = value.swa;
+            }
         }
-        header->maskPlanCount += p.curQSBlockNum;
+        header->maskPlanCount += batchMaskCount;
         AppendPlan& append = appendPlans[b];
         const uint32_t kvNewSeqlen = ctx.kvNewSeqlen > 0 ? static_cast<uint32_t>(ctx.kvNewSeqlen) : 0U;
         const uint32_t kvSeqlenOld = p.kvSeqlen - kvNewSeqlen;
@@ -239,6 +239,7 @@ static void BuildHostTaskMetadata(uint8_t* metadata, FAInferTilingData* tiling, 
         address.vNewBOffset = static_cast<uint64_t>(b) * ctx.kvNewSeqlen * vStride;
         address.lseHeadStride = ctx.seqlens_q_cpu != nullptr ? totalQTokens : maxQSeqlen;
     }
+    header->maskPlanBytes = fa_metadata::MaskPlanStorageBytes(header->maskPlanCount, tiling->maskType);
     TORCH_CHECK(fa_metadata::BuildTaskSchedule(*header, ranges, batchPlans, headPlans, *tiling),
                 "invalid compact task schedule");
 }
@@ -248,7 +249,8 @@ static at::Tensor GetSchedulerMetadataImpl(FAMetadataArgs args, const at::Tensor
 {
     const int64_t bytes = static_cast<int64_t>(fa_metadata::MetadataBytes(
         args.maskType != 0, args.batch, args.maxQSeqlen, args.numHeads, args.blockDim,
-        args.headPlanCapacity, args.fdPlanCapacity, args.maskPlanCapacity, args.batch, args.batch,
+        args.headPlanCapacity, args.fdPlanCapacity,
+        fa_metadata::MaskPlanStorageBytes(args.maskPlanCapacity, args.maskType), args.batch, args.batch,
         args.taskCapacityFactor));
     at::Tensor meta = at::empty({bytes}, at::device(at::kPrivateUse1).dtype(at::kByte));
     args.metaOutAddr = reinterpret_cast<uint64_t>(meta.data_ptr());
@@ -580,13 +582,14 @@ std::vector<at::Tensor> mha_fwd(
         const uint32_t fdPlanCapacity = 0U;
         const uint32_t taskCapacityFactor = 1U;
         const uint32_t maskPlanCapacity = static_cast<uint32_t>(fa_metadata::MaskPlanCapacity(
-            static_cast<uint32_t>(batch_size), static_cast<uint32_t>(seqlen_q)));
+            static_cast<uint32_t>(batch_size), static_cast<uint32_t>(seqlen_q), maskDer.maskType));
         TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(
                         hasMask, static_cast<uint32_t>(batch_size), static_cast<uint32_t>(seqlen_q),
                         static_cast<uint32_t>(num_heads), blockDim,
                         fa_metadata::HeadPlanCapacity(static_cast<uint32_t>(batch_size),
                                                       static_cast<uint32_t>(num_heads)),
-                        fdPlanCapacity, maskPlanCapacity, static_cast<uint32_t>(batch_size),
+                        fdPlanCapacity, fa_metadata::MaskPlanStorageBytes(maskPlanCapacity, maskDer.maskType),
+                        static_cast<uint32_t>(batch_size),
                         static_cast<uint32_t>(batch_size), taskCapacityFactor),
                     "scheduler_metadata buffer size must exactly match this call's "
                     "causal/window-derived layout");
@@ -614,8 +617,6 @@ std::vector<at::Tensor> mha_fwd(
         launchBlockDim = blockDim;
     } else {
         const uint32_t taskCapacityFactor = 1U;
-        const uint32_t maskPlanCapacity = static_cast<uint32_t>(fa_metadata::MaskPlanCapacity(
-            static_cast<uint32_t>(batch_size), static_cast<uint32_t>(seqlen_q)));
         FAInferTilingData hostTilingData{};
         FAInferTilingData* tiling_cpu_ptr = &hostTilingData;
 
@@ -668,6 +669,9 @@ std::vector<at::Tensor> mha_fwd(
         } else if (is_causal) {
             tiling_cpu_ptr->set_maskType(static_cast<uint32_t>(FaiKenel::MaskType::MASK_CAUSAL));
         }
+        const uint32_t maskTypeForMetadata = tiling_cpu_ptr->get_maskType();
+        const uint32_t maskPlanCapacity = static_cast<uint32_t>(fa_metadata::MaskPlanCapacity(
+            static_cast<uint32_t>(batch_size), static_cast<uint32_t>(seqlen_q), maskTypeForMetadata));
 
         uint32_t totalTaskNum = 0;
         uint32_t groupSize = num_heads / num_heads_k;
@@ -743,7 +747,8 @@ std::vector<at::Tensor> mha_fwd(
                 static_cast<uint32_t>(num_heads), blockDim,
                 fa_metadata::HeadPlanCapacity(static_cast<uint32_t>(batch_size),
                                               static_cast<uint32_t>(num_heads)),
-                actualFdPlanCapacity, maskPlanCapacity, static_cast<uint32_t>(batch_size),
+                actualFdPlanCapacity, fa_metadata::MaskPlanStorageBytes(maskPlanCapacity, maskTypeForMetadata),
+                static_cast<uint32_t>(batch_size),
                 static_cast<uint32_t>(batch_size), taskCapacityFactor))},
             at::device(c10::kCPU).dtype(at::kByte));
         tiling_cpu_ptr = reinterpret_cast<FAInferTilingData*>(tiling_cpu_tensor.data_ptr<uint8_t>());
@@ -947,7 +952,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.taskCapacityFactor = 1U;
     args.fdPlanCapacity = 0U;
     args.headPlanCapacity = fa_metadata::HeadPlanCapacity(args.batch, args.numHeads);
-    args.maskPlanCapacity = static_cast<uint32_t>(fa_metadata::MaskPlanCapacity(args.batch, args.maxQSeqlen));
+    args.maskPlanCapacity = static_cast<uint32_t>(fa_metadata::MaskPlanCapacity(args.batch, args.maxQSeqlen, args.maskType));
     return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q);
 }
 

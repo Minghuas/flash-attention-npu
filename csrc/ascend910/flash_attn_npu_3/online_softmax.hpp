@@ -88,9 +88,6 @@ public:
         // Allocate UB space
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK32_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
-        constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 5 * UB_UINT8_BLOCK_SIZE;
 
         constexpr uint32_t TV_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t SOFTCAP_UB_TENSOR_OFFSET = 10 * UB_UINT8_BLOCK_SIZE + 8 * UB_UINT8_VECTOR_SIZE;
@@ -110,9 +107,6 @@ public:
 
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
-        maskUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(MASK_UB_TENSOR_OFFSET);
-        maskUbTensor16 = resource.ubBuf.template GetBufferByByte<half>(MASK16_UB_TENSOR_OFFSET);
-        maskUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(MASK32_UB_TENSOR_OFFSET);
         softcapUbTensor = resource.ubBuf.template GetBufferByByte<float>(SOFTCAP_UB_TENSOR_OFFSET);
         lmUbTensor = resource.ubBuf.template GetBufferByByte<float>(LM_UB_TENSOR_OFFSET);
         hmUbTensor = resource.ubBuf.template GetBufferByByte<float>(HM_UB_TENSOR_OFFSET);
@@ -160,6 +154,57 @@ public:
                 const uint64_t word = bits >= 64 ? UINT64_MAX :
                     (bits <= 0 ? uint64_t{0} : ((uint64_t{1} << bits) - uint64_t{1}));
                 keepWords.SetValue(r * (CAUSAL_KEEP_STRIDE / sizeof(uint64_t)) + j, word);
+            }
+            if (++token == qSBlockSize) {
+                token = 0;
+            }
+        }
+        AscendC::SetFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
+        AscendC::WaitFlag<AscendC::HardEvent::S_V>(maskSToVEventId);
+        AscendC::SetCmpMask(selectScalarUbTensor);
+        AscendC::PipeBarrier<PIPE_V>();
+
+        // Predicate rows are 32B-aligned slots, not a flat rows*W bitstream.
+        // Count mode handles W's partial repeat without touching the next row.
+        // The low-level overload emits vsel without scalar setup or mask resets.
+        AscendC::SetMaskCount();
+        AscendC::SetVectorMask<float, AscendC::MaskMode::COUNTER>(columnNumRound);
+        for (uint32_t r = 0; r < rowNumCurLoop; ++r) {
+            const uint32_t offset = sUbOffset + r * columnNumRound;
+            AscendC::Select(lsUbTensor[offset], keepUbTensor[r * CAUSAL_KEEP_STRIDE], lsUbTensor[offset],
+                static_cast<uint8_t>(1), AscendC::BinaryRepeatParams{});
+        }
+        AscendC::SetMaskNorm();
+        AscendC::ResetMask();
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    __aicore__ inline void ApplySwaArithMask(uint32_t sUbOffset, uint32_t rowNumCurLoop,
+        uint32_t columnNum, uint32_t columnNumRound, int64_t diagS0,
+        uint32_t rowOffset, uint32_t qSBlockSize,
+        int64_t leftS0, bool applyLeft, bool applyRight)
+    {
+        // The previous Select must finish reading keep before Scalar overwrites it.
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(maskVToSEventId);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(maskVToSEventId);
+        auto keepWords = keepUbTensor.ReinterpretCast<uint64_t>();
+        const uint32_t wordCount = CeilDiv(columnNumRound, 64U);
+        uint32_t token = rowOffset % qSBlockSize;
+        for (uint32_t r = 0; r < rowNumCurLoop; ++r) {
+            const int64_t rowVisible = applyRight ? diagS0 + static_cast<int64_t>(token) + 1 : columnNum;
+            const int64_t rowLeft = applyLeft ? leftS0 + static_cast<int64_t>(token) : 0;
+            const int32_t visible = rowVisible <= 0 ? 0 :
+                (rowVisible >= static_cast<int64_t>(columnNum) ? static_cast<int32_t>(columnNum) :
+                                                               static_cast<int32_t>(rowVisible));
+            for (uint32_t j = 0; j < wordCount; ++j) {
+                const int32_t bits = visible - static_cast<int32_t>(j * 64);
+                // LSB-first prefix; guard both endpoints to avoid invalid shifts.
+                const uint64_t word = bits >= 64 ? UINT64_MAX :
+                    (bits <= 0 ? uint64_t{0} : ((uint64_t{1} << bits) - uint64_t{1}));
+                const int64_t leftBits = rowLeft - static_cast<int64_t>(j * 64);
+                const uint64_t leftWord = leftBits >= 64 ? UINT64_MAX :
+                    (leftBits <= 0 ? uint64_t{0} : ((uint64_t{1} << leftBits) - uint64_t{1}));
+                keepWords.SetValue(r * (CAUSAL_KEEP_STRIDE / sizeof(uint64_t)) + j, word & ~leftWord);
             }
             if (++token == qSBlockSize) {
                 token = 0;
@@ -248,13 +293,32 @@ public:
             RowsumSPECTILE512(srcUb, outUb, partial, numRowsRound, numElems, numElemsAligned);
             return;
         }
-        const bool singleVector = numElems <= FLOAT_VECTOR_SIZE;
+        // Reuse the single-block tree for both narrow widths and two-block rows.
+        if (numElems <= 2 * FLOAT_VECTOR_SIZE) {
+            const auto blockRows = partial[DIRECT_REDUCED_OFFSET];
+            for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {
+                const uint32_t valid = AscendC::Std::min(numElems - v, FLOAT_VECTOR_SIZE);
+                SetVecMask(valid);
+                AscendC::BlockReduceSum<float, false>(
+                    partial, srcUb[v], numRowsRound, 0, 1, 1, numElemsAligned / FLOAT_BLOCK_SIZE);
+                AscendC::PipeBarrier<PIPE_V>();
+                SetBlockReduceMask(CeilDiv(valid, FLOAT_BLOCK_SIZE));
+                AscendC::BlockReduceSum<float, false>(
+                    v == 0 ? outUb : blockRows, partial,
+                    numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            if (numElems > FLOAT_VECTOR_SIZE) {
+                SetVecMask(numRowsRound);
+                AscendC::Add<float, false>(outUb, outUb, blockRows,
+                    (uint64_t)0, 1, AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+            return;
+        }
         const uint32_t partialRowBlocks = CeilDiv(numElems, FLOAT_VECTOR_SIZE);
         const auto reduced = partial[DIRECT_REDUCED_OFFSET];
-        if (!singleVector) {
-            AscendC::Duplicate(partial, 0.0f, numRowsRound * partialRowBlocks * FLOAT_BLOCK_SIZE);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
         for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {
             const uint32_t valid = AscendC::Std::min(numElems - v, FLOAT_VECTOR_SIZE);
             const uint64_t mask = valid == FLOAT_VECTOR_SIZE ? UINT64_MAX : ((1ULL << valid) - 1ULL);
@@ -264,14 +328,15 @@ public:
                 0, partialRowBlocks, 1, numElemsAligned / FLOAT_BLOCK_SIZE);
         }
         AscendC::PipeBarrier<PIPE_V>();
-        if (!singleVector) {
-            SetVecMask(partialRowBlocks * FLOAT_BLOCK_SIZE);
-            AscendC::BlockReduceSum<float, false>(reduced, partial, numRowsRound, 0, 1, 1, partialRowBlocks);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-        SetBlockReduceMask(singleVector ? CeilDiv(numElems, FLOAT_BLOCK_SIZE) : partialRowBlocks);
+        // Exclude unwritten tail slots instead of initializing shared scratch.
+        const uint32_t validSlots = (partialRowBlocks - 1) * FLOAT_BLOCK_SIZE +
+            CeilDiv(numElems - (partialRowBlocks - 1) * FLOAT_VECTOR_SIZE, FLOAT_BLOCK_SIZE);
+        SetVecMask(validSlots);
+        AscendC::BlockReduceSum<float, false>(reduced, partial, numRowsRound, 0, 1, 1, partialRowBlocks);
+        AscendC::PipeBarrier<PIPE_V>();
+        SetBlockReduceMask(partialRowBlocks);
         AscendC::BlockReduceSum<float, false>(
-            outUb, singleVector ? partial : reduced, numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
+            outUb, reduced, numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
@@ -311,13 +376,32 @@ public:
             RowmaxSPECTILE512(srcUb, outUb, partial, numRowsRound, numElems, numElemsAligned);
             return;
         }
-        const bool singleVector = numElems <= FLOAT_VECTOR_SIZE;
+        // Reuse the single-block tree for both narrow widths and two-block rows.
+        if (numElems <= 2 * FLOAT_VECTOR_SIZE) {
+            const auto blockRows = partial[DIRECT_REDUCED_OFFSET];
+            for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {
+                const uint32_t valid = AscendC::Std::min(numElems - v, FLOAT_VECTOR_SIZE);
+                SetVecMask(valid);
+                AscendC::BlockReduceMax<float, false>(
+                    partial, srcUb[v], numRowsRound, 0, 1, 1, numElemsAligned / FLOAT_BLOCK_SIZE);
+                AscendC::PipeBarrier<PIPE_V>();
+                SetBlockReduceMask(CeilDiv(valid, FLOAT_BLOCK_SIZE));
+                AscendC::BlockReduceMax<float, false>(
+                    v == 0 ? outUb : blockRows, partial,
+                    numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            if (numElems > FLOAT_VECTOR_SIZE) {
+                SetVecMask(numRowsRound);
+                AscendC::Max<float, false>(outUb, outUb, blockRows,
+                    (uint64_t)0, 1, AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+            return;
+        }
         const uint32_t partialRowBlocks = CeilDiv(numElems, FLOAT_VECTOR_SIZE);
         const auto reduced = partial[DIRECT_REDUCED_OFFSET];
-        if (!singleVector) {
-            AscendC::Duplicate(partial, -__builtin_inff(), numRowsRound * partialRowBlocks * FLOAT_BLOCK_SIZE);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
         for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {
             const uint32_t valid = AscendC::Std::min(numElems - v, FLOAT_VECTOR_SIZE);
             const uint64_t mask = valid == FLOAT_VECTOR_SIZE ? UINT64_MAX : ((1ULL << valid) - 1ULL);
@@ -327,33 +411,20 @@ public:
                 0, partialRowBlocks, 1, numElemsAligned / FLOAT_BLOCK_SIZE);
         }
         AscendC::PipeBarrier<PIPE_V>();
-        if (!singleVector) {
-            SetVecMask(partialRowBlocks * FLOAT_BLOCK_SIZE);
-            AscendC::BlockReduceMax<float, false>(reduced, partial, numRowsRound, 0, 1, 1, partialRowBlocks);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-        SetBlockReduceMask(singleVector ? CeilDiv(numElems, FLOAT_BLOCK_SIZE) : partialRowBlocks);
+        // Exclude unwritten tail slots instead of initializing shared scratch.
+        const uint32_t validSlots = (partialRowBlocks - 1) * FLOAT_BLOCK_SIZE +
+            CeilDiv(numElems - (partialRowBlocks - 1) * FLOAT_VECTOR_SIZE, FLOAT_BLOCK_SIZE);
+        SetVecMask(validSlots);
+        AscendC::BlockReduceMax<float, false>(reduced, partial, numRowsRound, 0, 1, 1, partialRowBlocks);
+        AscendC::PipeBarrier<PIPE_V>();
+        SetBlockReduceMask(partialRowBlocks);
         AscendC::BlockReduceMax<float, false>(
-            outUb, singleVector ? partial : reduced, numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
+            outUb, reduced, numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
 
 
-    __aicore__ inline void OperateMaskUb(uint32_t rowNumCurLoop, uint32_t columnNumRound, bool doTriUPreMask)
-    {
-        UpCastMask<half, ElementMask>(maskUbTensor16, maskUbTensor, rowNumCurLoop, columnNumRound);
-        UpCastMask<float, half>(maskUbTensor32, maskUbTensor16, rowNumCurLoop, columnNumRound);
-        if (doTriUPreMask) {
-            // 0 -> 1, 1 -> 0
-            uint32_t repeatTimes = CeilDiv(rowNumCurLoop * columnNumRound, FLOAT_VECTOR_SIZE);
-            AscendC::UnaryRepeatParams repeatParams(1, 1, 8, 8);
-            AscendC::Adds<float, false>(maskUbTensor32, maskUbTensor32, -1.0f, (uint64_t)0, repeatTimes, repeatParams);
-            AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Abs<float, false>(maskUbTensor32, maskUbTensor32, (uint64_t)0, repeatTimes, repeatParams);
-            AscendC::PipeBarrier<PIPE_V>();
-        }
-    }
 
     __aicore__ inline
     void CopySGmToUb(
@@ -371,43 +442,6 @@ public:
                 (columnNumPad - columnNumRound) / FLOAT_BLOCK_SIZE, 0));
     }
 
-    __aicore__ inline
-    void CopyMaskGmToUb(
-        AscendC::GlobalTensor<ElementMask> gMask,
-        uint32_t columnNum, uint32_t columnNumRound,
-        uint32_t maskStride, uint32_t tokenNumPerHead,
-        uint32_t proTokenIdx, uint32_t proTokenNum,
-        uint32_t integralHeadNum, uint32_t epiTokenNum, bool /*isNextMask*/)
-    {
-        // EVENT_ID6/4 serialize raw-mask reuse; 184 KiB is reserved for CANN Select scratch.
-        uint32_t innerUbRowOffset = 0;
-        if (proTokenNum != 0) {
-            AscendC::DataCopyPad(
-                maskUbTensor[innerUbRowOffset], gMask[proTokenIdx * maskStride],
-                AscendC::DataCopyExtParams(
-                    proTokenNum, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
-                AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
-            innerUbRowOffset += proTokenNum * columnNumRound;
-        }
-        for (uint32_t headIdx = 0; headIdx < integralHeadNum; headIdx++) {
-            AscendC::DataCopyPad(
-                maskUbTensor[innerUbRowOffset], gMask,
-                AscendC::DataCopyExtParams(
-                    tokenNumPerHead, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
-                AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
-            innerUbRowOffset += tokenNumPerHead * columnNumRound;
-        }
-        if (epiTokenNum != 0) {
-            AscendC::DataCopyPad(
-                maskUbTensor[innerUbRowOffset], gMask,
-                AscendC::DataCopyExtParams(
-                    epiTokenNum, columnNum * sizeof(ElementMask),
-                    (maskStride - columnNum) * sizeof(ElementMask), 0, 0),
-                AscendC::DataCopyPadExtParams<ElementMask>(false, 0, 0, 0));
-        }
-    }
 
     __aicore__ inline
     void ScaleS(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound)
@@ -455,74 +489,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
     }
 
-    template<typename ElementMaskDst, typename ElementMaskSrc>
-    __aicore__ inline
-    void UpCastMask(
-        const AscendC::LocalTensor<ElementMaskDst> &maskUbTensorDst,
-        const AscendC::LocalTensor<ElementMaskSrc> &maskUbTensorSrc,
-        uint32_t rowNumCurLoop,
-        uint32_t columnNumRound)
-    {
-        AscendC::Cast<ElementMaskDst, ElementMaskSrc, false>(
-            maskUbTensorDst, maskUbTensorSrc, AscendC::RoundMode::CAST_NONE, (uint64_t)0,
-            CeilDiv(rowNumCurLoop * columnNumRound, (uint32_t)(REPEAT_SIZE_IN_BYTE / sizeof(ElementMaskDst))),
-            AscendC::UnaryRepeatParams(1, 1, 8, 4));
-        AscendC::PipeBarrier<PIPE_V>();
-    }
 
-    __aicore__ inline
-    void ApplyMask(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t columnNumRound, uint32_t maskColumnRound,
-        uint32_t addMaskUbOffset)
-    {
-        AscendC::Muls<float, false>(
-            maskUbTensor32,
-            maskUbTensor32,
-            (float)-3e38,
-            (uint64_t)0,
-            CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
-            AscendC::UnaryRepeatParams(1, 1, 8, 8));
-        AscendC::PipeBarrier<PIPE_V>();
-        if (maskColumnRound == columnNumRound) {
-            AscendC::Add<float, false>(
-                lsUbTensor[sUbOffset],
-                lsUbTensor[sUbOffset],
-                maskUbTensor32,
-                (uint64_t)0,
-                CeilDiv(rowNumCurLoop * maskColumnRound, FLOAT_VECTOR_SIZE),
-                AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-        } else {
-            // Trim the mask span so it never crosses the tile into the next row's UB
-            uint32_t maskAddNum = AscendC::Std::min(maskColumnRound, columnNumRound - addMaskUbOffset);
-            uint32_t loop = maskAddNum / FLOAT_VECTOR_SIZE;
-            for (uint32_t i = 0; i < loop; i++) {
-                AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
-                    lsUbTensor[sUbOffset][addMaskUbOffset + i * FLOAT_VECTOR_SIZE],
-                    maskUbTensor32[i * FLOAT_VECTOR_SIZE],
-                    (uint64_t)0,
-                    rowNumCurLoop,
-                    AscendC::BinaryRepeatParams(
-                        1, 1, 1,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        maskColumnRound / FLOAT_BLOCK_SIZE));
-            }
-            if (maskAddNum % FLOAT_VECTOR_SIZE > 0) {
-                SetVecMask(maskAddNum % FLOAT_VECTOR_SIZE);
-                AscendC::Add<float, false>(lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
-                    lsUbTensor[sUbOffset][addMaskUbOffset + loop * FLOAT_VECTOR_SIZE],
-                    maskUbTensor32[loop * FLOAT_VECTOR_SIZE],
-                    (uint64_t)0,
-                    rowNumCurLoop,
-                    AscendC::BinaryRepeatParams(
-                        1, 1, 1,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        columnNumRound / FLOAT_BLOCK_SIZE,
-                        maskColumnRound / FLOAT_BLOCK_SIZE));
-                AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-            }
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-    }
 
     __aicore__ inline
     void CalcLocalRowMax(uint32_t sUbOffset, uint32_t rowNumCurLoopRound, uint32_t columnNum, uint32_t columnNumRound,
@@ -965,70 +932,27 @@ public:
 
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
-        AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
-        const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
+        const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
+        GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
         uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
-        uint32_t& softmaxPingPongFlag, int32_t kvSStartIdx, bool doTriUPreMask,
-        bool doTriUNextMask, int32_t preTokenStartLen, int32_t preTokenEndLen, int32_t nextTokenStartLen,
-        int32_t nextTokenEndLen, bool isSplitKV = false, uint32_t isLastNoMaskStackTile = 0,
-        bool startsWithMaskTile = false, bool startsWithMaskThenNomaskFlag = false)
+        uint32_t& softmaxPingPongFlag, int64_t diagS0, bool doTriUMask, bool isSplitKV,
+        int64_t leftS0, bool applyLeft, bool applyRight)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
-        const bool doTriUMask = doTriUPreMask || doTriUNextMask;
+        // Preserve each mode's original S/P row alignment.
         uint32_t columnNumRound = doTriUMask ? RoundUp(columnNum, BLOCK_SIZE_IN_BYTE) : RoundUp(columnNum, BLOCK_SIZE);
         uint32_t columnNumPad = layoutInput.stride(0);
-        uint32_t maskStride = 0;
         uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
         uint32_t subBlockNum = AscendC::GetSubBlockNum();
 
         uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t rowSplitSubBlock = (qNBlockSize == 1) ? (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ? (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
+        uint32_t rowSplitSubBlock = (qNBlockSize == 1) ?
+            (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
+        uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ?
+            (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
         uint32_t rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;
 
-        uint32_t tokenNumPerHeadThisSubBlock = 0;
-        uint32_t addMaskUbOffset = 0;
-
-        // SWA masks span the full aligned S row. The first mask is Pre if present.
-        AscendC::GlobalTensor<ElementMask> gMaskThisSubBlock;
-        AscendC::GlobalTensor<ElementMask> gMaskThisSubBlockNext;
-        if (doTriUMask) {
-            maskStride = layoutMask.stride(0);
-            tokenNumPerHeadThisSubBlock = Min(qSBlockSize, rowActualThisSubBlock);
-            uint32_t maskOffsetThisSubBlock = (qNBlockSize == 1) ? rowOffsetThisSubBlock : 0;
-            if (doTriUPreMask) {
-                uint32_t gmOffsetMaskRowPre = 0;
-                uint32_t gmOffsetMaskColumnPre = 0;
-                if (preTokenStartLen > kvSStartIdx) {
-                    gmOffsetMaskRowPre = preTokenStartLen - kvSStartIdx - 1;
-                    gmOffsetMaskColumnPre = 0;
-                } else {
-                    gmOffsetMaskRowPre = 0;
-                    gmOffsetMaskColumnPre = kvSStartIdx - preTokenStartLen + 1;
-                }
-                int64_t offsetMaskPre = layoutMask.GetOffset(
-                    MatrixCoord(gmOffsetMaskRowPre + maskOffsetThisSubBlock, gmOffsetMaskColumnPre));
-                gMaskThisSubBlock = gMask[offsetMaskPre];
-            }
-            if (doTriUNextMask) {
-                uint32_t gmOffsetMaskRowNext = 0;
-                uint32_t gmOffsetMaskColumnNext = 0;
-                if (nextTokenStartLen > kvSStartIdx) {
-                    gmOffsetMaskRowNext = nextTokenStartLen - kvSStartIdx;
-                    gmOffsetMaskColumnNext = 0;
-                } else {
-                    gmOffsetMaskRowNext = 0;
-                    gmOffsetMaskColumnNext = kvSStartIdx - nextTokenStartLen;
-                }
-                int64_t offsetMaskNext = layoutMask.GetOffset(
-                    MatrixCoord(gmOffsetMaskRowNext + maskOffsetThisSubBlock, gmOffsetMaskColumnNext));
-                gMaskThisSubBlockNext = gMask[offsetMaskNext];
-                if (!doTriUPreMask) {
-                    gMaskThisSubBlock = gMaskThisSubBlockNext;
-                }
-            }
-        }
         uint32_t maxRowNumPerLoop = MAX_UB_S_ELEM_NUM / columnNumRound;
         uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
         rowNumTile = AscendC::Std::min(rowNumTile, FLOAT_VECTOR_SIZE);
@@ -1039,46 +963,29 @@ public:
             Arch::CrossCoreWaitFlag(qkReady);
             return;
         }
-
         for (uint32_t rowLoopIdx = 0; rowLoopIdx < rowLoopNum + preLoad; rowLoopIdx++) {
             if (rowLoopIdx < rowLoopNum) {
                 uint32_t pingpongFlag = softmaxPingPongFlag % 2;
                 uint32_t rowOffsetCurLoop = rowLoopIdx * rowNumTile;
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
-                uint32_t rowNumCurLoop =
-                    (rowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
-                // loop 0 mask load before cross core sync
+                uint32_t rowNumCurLoop = (rowLoopIdx == rowLoopNum - 1) ?
+                    (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
                 if (rowLoopIdx == 0) {
-                    if (doTriUMask) {
-                        uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
-                        uint32_t proTokenNum =
-                            Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) % tokenNumPerHeadThisSubBlock;
-                        uint32_t integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
-                        uint32_t epiTokenNum =
-                            rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
-                        CopyMaskGmToUb(gMaskThisSubBlock, columnNumRound, columnNumRound, maskStride,
-                                       tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum,
-                                       epiTokenNum, false);
-                        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
-                    } else if (startsWithMaskTile) {
-                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
-                    }
                     Arch::CrossCoreWaitFlag(qkReady);
                 }
                 int64_t offsetInput = layoutInput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gInputCurLoop = gInput[offsetInput];
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(pingpongFlag);
-                CopySGmToUb(gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound,
-                            columnNumPad);
+                CopySGmToUb(
+                    gInputCurLoop, (pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumPad);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
             }
             if (rowLoopIdx >= preLoad) {
                 uint32_t delayedRowLoopIdx = rowLoopIdx - preLoad;
                 uint32_t pingpongFlag = (softmaxPingPongFlag - 1) % 2;
                 uint32_t rowOffsetCurLoop = delayedRowLoopIdx * rowNumTile;
-                uint32_t rowNumCurLoop =
-                    (delayedRowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
+                uint32_t rowNumCurLoop = (delayedRowLoopIdx == rowLoopNum - 1) ?
+                    (rowActualThisSubBlock - rowOffsetCurLoop) : rowNumTile;
 
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(pingpongFlag);
                 ScaleS((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
@@ -1086,37 +993,11 @@ public:
                     ApplySoftcap((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound);
                 }
                 if (doTriUMask) {
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
-                    // SWA mask conversion must wait for the aliased P staging buffers.
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
-                    AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID1);
-                    // Convert/apply the prefetched mask once for all three masked cases.
-                    OperateMaskUb(rowNumCurLoop, columnNumRound, doTriUPreMask);
-                    ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRound,
-                              addMaskUbOffset);
-                    if (doTriUPreMask && doTriUNextMask) {
-                        AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
-                        // *** TriUNextMask
-                        uint32_t proTokenIdx = rowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
-                        uint32_t proTokenNum = Min(rowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) %
-                                                tokenNumPerHeadThisSubBlock;
-                        uint32_t integralHeadNum = (rowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
-                        uint32_t epiTokenNum =
-                            rowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                        AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID6);
-                        CopyMaskGmToUb(gMaskThisSubBlockNext, columnNumRound, columnNumRound, maskStride,
-                                        tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum,
-                                        epiTokenNum, true);
-                        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
-                        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID6);
-                        OperateMaskUb(rowNumCurLoop, columnNumRound, false);
-                        ApplyMask((pingpongFlag * MAX_UB_S_ELEM_NUM), rowNumCurLoop, columnNumRound, columnNumRound,
-                                    addMaskUbOffset);
-                    }
+                    ApplySwaArithMask(pingpongFlag * MAX_UB_S_ELEM_NUM, rowNumCurLoop,
+                                   columnNum, columnNumRound, diagS0,
+                                   rowOffsetThisSubBlock + rowOffsetCurLoop, qSBlockSize,
+                                   leftS0, applyLeft, applyRight);
                 }
-                // P and mask share UB: finish SubCoreCompute (CopyP + Set EVENT_ID0)
-                // before prefetching the next mask tile.
                 uint32_t rowOffsetIoGm = rowOffsetCurLoop + rowOffsetThisSubBlock;
                 int64_t offsetOutput = layoutOutput.GetOffset(MatrixCoord(rowOffsetIoGm, 0));
                 auto gOutputCurLoop = gOutput[offsetOutput];
@@ -1126,7 +1007,7 @@ public:
                     layoutOutputCurLoop,
                     rowOffsetCurLoop,
                     isFirstStackTile,
-                    isLastNoMaskStackTile,
+                    0,
                     (delayedRowLoopIdx == 0),
                     (delayedRowLoopIdx == rowLoopNum - 1),
                     columnNumRound,
@@ -1134,31 +1015,15 @@ public:
                     curStackTileMod,
                     taskStateSlot,
                     isSplitKV,
-                    doTriUMask ? BufferSyncMode::Masked : BufferSyncMode::NoMask,
-                    startsWithMaskThenNomaskFlag);
-                // next loop mask load (after P copy releases shared UB via EVENT_ID0)
-                if (doTriUMask && rowLoopIdx < rowLoopNum) {
-                    uint32_t nextRowOffsetCurLoop = rowLoopIdx * rowNumTile;
-                    uint32_t nextRowNumCurLoop =
-                        (rowLoopIdx == rowLoopNum - 1) ? (rowActualThisSubBlock - nextRowOffsetCurLoop) : rowNumTile;
-                    uint32_t proTokenIdx = nextRowOffsetCurLoop % tokenNumPerHeadThisSubBlock;
-                    uint32_t proTokenNum =
-                        Min(nextRowNumCurLoop, (tokenNumPerHeadThisSubBlock - proTokenIdx)) % tokenNumPerHeadThisSubBlock;
-                    uint32_t integralHeadNum = (nextRowNumCurLoop - proTokenNum) / tokenNumPerHeadThisSubBlock;
-                    uint32_t epiTokenNum =
-                        nextRowNumCurLoop - proTokenNum - integralHeadNum * tokenNumPerHeadThisSubBlock;
-                    AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
-                    CopyMaskGmToUb(gMaskThisSubBlock, columnNumRound, columnNumRound, maskStride,
-                                   tokenNumPerHeadThisSubBlock, proTokenIdx, proTokenNum, integralHeadNum,
-                                   epiTokenNum, false);
-                    AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID2);
-                }
+                    // Arithmetic predicates do not alias P; both SWA tile modes use ping-pong sync.
+                    BufferSyncMode::NoMask);
             }
             if (rowLoopIdx < rowLoopNum) {
                 softmaxPingPongFlag++;
             }
         }
     }
+
 
 private:
     float scaleValue;
@@ -1171,9 +1036,6 @@ private:
 
     AscendC::LocalTensor<float> lsUbTensor;
     AscendC::LocalTensor<ElementOutput> lpUbTensor;
-    AscendC::LocalTensor<ElementMask> maskUbTensor;
-    AscendC::LocalTensor<half> maskUbTensor16;
-    AscendC::LocalTensor<float> maskUbTensor32;
     AscendC::LocalTensor<float> lmUbTensor;
     AscendC::LocalTensor<float> hmUbTensor;
     AscendC::LocalTensor<float> gmUbTensor;
