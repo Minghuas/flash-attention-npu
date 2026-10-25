@@ -81,8 +81,8 @@ public:
     ~BlockEpilogue() {}
 
     __aicore__ inline
-    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_, 
-        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, AscendC::GlobalTensor<ElementMask> gDrop_, 
+    void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_,
+        AscendC::GlobalTensor<ElementOutput> gPret_, uint64_t stridePret_, AscendC::GlobalTensor<ElementMask> gDrop_,
         uint64_t strideDrop_, uint32_t maxKvSeqlen_, AscendC::GlobalTensor<float> alibiSlopesGm_)
     {
         // Allocate UB space
@@ -134,7 +134,7 @@ public:
         alibiWorkUb = resource.ubBuf.template GetBufferByByte<float>(ALIBI_WORK_UB_OFFSET);
         dropUbTensor = resource.ubBuf.template GetBufferByByte<ElementMask>(DROP_UB_TENSOR_OFFSET);
     }
-    
+
     __aicore__ inline
     void set_gmOffsetPret(uint64_t gmOffsetPret_)
     {
@@ -1044,9 +1044,9 @@ public:
     void operator()(
         AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         AscendC::GlobalTensor<ElementMask> gMask, const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
-        const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile, 
-        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, 
-        Arch::CrossCoreFlag qkReady, uint32_t& softmaxPingPongFlag, int64_t triUp, int32_t kvSStartIdx, uint32_t kvSEndIdx, 
+        const LayoutInput &layoutMask, GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
+        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot,
+        Arch::CrossCoreFlag qkReady, uint32_t& softmaxPingPongFlag, int64_t triUp, int32_t kvSStartIdx, uint32_t kvSEndIdx,
         bool doTriUPreMask, bool doTriUNextMask, int32_t preTokenStartLen, int32_t nextTokenStartLen, bool startsWithMaskTile,
         bool startsWithMaskThenNomaskFlag, int64_t qSBlockBaseIdx = 0, int64_t qNBlockBaseIdx = 0, int64_t qKSeqDiff = 0,
         int64_t slopesBatchOffset = 0)

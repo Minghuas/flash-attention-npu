@@ -511,6 +511,10 @@ class FAInferKernel {
                 runtime.qBOffset = addressPlan->qBOffset;
                 runtime.kBOffset = addressPlan->kBOffset;
                 runtime.vBOffset = addressPlan->vBOffset;
+                if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
+                    runtime.kBOffset = static_cast<uint64_t>(batchIdx) * kvHeads * kvHeadStrideK;
+                    runtime.vBOffset = static_cast<uint64_t>(batchIdx) * kvHeads * kvHeadStrideV;
+                }
                 runtime.oBOffset = addressPlan->oBOffset;
                 runtime.lseBOffset = addressPlan->lseBOffset;
                 runtime.blockBOffset = addressPlan->blockBOffset;
@@ -542,6 +546,10 @@ class FAInferKernel {
                         runtime.qBOffset = addressPlan->qBOffset;
                         runtime.kBOffset = addressPlan->kBOffset;
                         runtime.vBOffset = addressPlan->vBOffset;
+                        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
+                            runtime.kBOffset = static_cast<uint64_t>(batchIdx) * kvHeads * kvHeadStrideK;
+                            runtime.vBOffset = static_cast<uint64_t>(batchIdx) * kvHeads * kvHeadStrideV;
+                        }
                         runtime.oBOffset = addressPlan->oBOffset;
                         runtime.lseBOffset = addressPlan->lseBOffset;
                         runtime.blockBOffset = addressPlan->blockBOffset;
@@ -712,8 +720,13 @@ class FAInferKernel {
                                                  uint32_t qSeqlen, uint32_t kvSeqlen,
                                                  uint32_t qPrefix, uint32_t kvPrefix) const
     {
-        runtime.qBOffset = static_cast<uint64_t>(qPrefix) * strideQ;
-        runtime.oBOffset = static_cast<uint64_t>(qPrefix) * strideO;
+        if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
+            runtime.qBOffset = static_cast<uint64_t>(batchIdx) * qHeads * qHeadStride;
+            runtime.oBOffset = static_cast<uint64_t>(batchIdx) * qHeads * oHeadStride;
+        } else {
+            runtime.qBOffset = static_cast<uint64_t>(qPrefix) * strideQ;
+            runtime.oBOffset = static_cast<uint64_t>(qPrefix) * strideO;
+        }
         runtime.lseBOffset = INPUT_LAYOUT == FaiKenel::inputLayout::TND
             ? qPrefix : static_cast<uint64_t>(qPrefix) * qHeads;
         runtime.lseHeadStride = INPUT_LAYOUT == FaiKenel::inputLayout::TND ? totalQTokens : maxQSeqlen;
@@ -721,8 +734,13 @@ class FAInferKernel {
         runtime.vBOffset = 0;
         runtime.blockBOffset = 0;
         if constexpr (!PAGED_CACHE_FLAG) {
-            runtime.kBOffset = static_cast<uint64_t>(kvPrefix) * strideK;
-            runtime.vBOffset = static_cast<uint64_t>(kvPrefix) * strideV;
+            if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::BNSD) {
+                runtime.kBOffset = static_cast<uint64_t>(batchIdx) * kvHeads * kvHeadStrideK;
+                runtime.vBOffset = static_cast<uint64_t>(batchIdx) * kvHeads * kvHeadStrideV;
+            } else {
+                runtime.kBOffset = static_cast<uint64_t>(kvPrefix) * strideK;
+                runtime.vBOffset = static_cast<uint64_t>(kvPrefix) * strideV;
+            }
         } else {
             runtime.blockBOffset = static_cast<uint64_t>(batchIdx) * maxNumBlocksPerBatch;
         }
@@ -1039,14 +1057,16 @@ class FAInferKernel {
                              gLse[task.gmOffsetLse], layoutO, layoutOTmp, layoutUpdate, layoutLse,
                              actualBlockShapePV, pvReady, task.qSBlockSize, task.qNBlockSize,
                              pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot, pvDesc.taskStateSlot,
-                             splitParams);
+                             splitParams, 0, 0, 0, 0, 1,
+                             static_cast<uint32_t>(strideO), static_cast<uint32_t>(oHeadStride));
         } else {
             epilogueRescaleO(
                 gO[task.gmOffsetO], gOTmp[gmOffsetOTmp], gOUpdate[gmOffsetUpdate], gLse[task.gmOffsetLse],
                 layoutO, layoutOTmp, layoutUpdate, layoutLse, actualBlockShapePV, pvReady, task.qSBlockSize,
                 task.qNBlockSize, pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot, pvDesc.taskStateSlot,
                 typename EpilogueRescaleO::SplitKVParams(), task.invalidSuffixStartRow,
-                task.invalidPrefixEndRow, task.qSeqlen, task.qSBlockIdx, task.curQNBlockTile);
+                task.invalidPrefixEndRow, task.qSeqlen, task.qSBlockIdx, task.curQNBlockTile,
+                static_cast<uint32_t>(strideO), static_cast<uint32_t>(oHeadStride));
         }
 #endif
     }
