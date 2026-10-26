@@ -462,6 +462,12 @@ def _flash_attn_backward_op(
     softcap: float,
     deterministic: bool,
 ) -> torch.Tensor:
+    # Same storage detection as forward; retain logical BSND shapes for host/output.
+    if cu_seqlens_q is not None:
+        layout = _LAYOUT_TND
+    else:
+        layout = _detect_layout(q, k, v, None, cu_seqlens_k)[0]
+
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     _dq, _dk, _dv, softmax_d = flash_attn_npu_4.bwd(
         dout,
@@ -486,6 +492,7 @@ def _flash_attn_backward_op(
         softcap,
         deterministic,
         0,  # sm_margin
+        layout,
     )
     return softmax_d
 
@@ -610,11 +617,11 @@ def _flash_attn_backward(
     assert learnable_sink is None, "flash_attn_npu_v4 bwd does not support learnable_sink"
 
     if dq is None:
-        dq = torch.empty_like(q)
+        dq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if dk is None:
-        dk = torch.empty_like(k)
+        dk = torch.empty(k.shape, dtype=k.dtype, device=k.device)
     if dv is None:
-        dv = torch.empty_like(v)
+        dv = torch.empty(v.shape, dtype=v.dtype, device=v.device)
 
     _flash_attn_backward_op(
         dout,

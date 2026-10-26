@@ -410,6 +410,12 @@ def _flash_attn_backward(
     deterministic: bool = False,
     sm_margin: int = 0,
 ) -> torch.Tensor:
+    # Same storage detection as forward; retain logical BSND shapes for host/output.
+    if cu_seqlens_q is not None:
+        layout = _LAYOUT_TND
+    else:
+        layout = _detect_layout(q, k, v, None, cu_seqlens_k)[0]
+
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     (
@@ -440,6 +446,7 @@ def _flash_attn_backward(
         softcap,
         deterministic,
         sm_margin,
+        layout,
     )
     return softmax_d
 

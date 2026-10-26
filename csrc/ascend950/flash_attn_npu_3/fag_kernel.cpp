@@ -51,7 +51,6 @@ static constexpr uint16_t SYNC_C34_TO_V5_FLAG = 11; // dk column ready
 static constexpr uint16_t SYNC_C5_TO_V6_FLAG = 12;  // dv column ready
 static constexpr uint16_t SYNC_V5_TO_C34_FLAG = 13; // dk buffer free
 static constexpr uint16_t SYNC_V6_TO_C5_FLAG = 14;  // dv buffer free
-static constexpr uint32_t DET_CAST_CHUNK_ROWS = 32;
 
 /*
  * FAG arch35 task pipeline and L1-buffer ownership:
@@ -100,6 +99,17 @@ class FlashAttentionScoreGrad950 {
     void Init(FAGKernelParams const& params)
     {
         tiling_ = reinterpret_cast<const __gm__ TilingData*>(params.tiling);
+        inputStrides_.q = {tiling_->inputStrides.q.batch, tiling_->inputStrides.q.sequence,
+                           tiling_->inputStrides.q.head};
+        inputStrides_.k = {tiling_->inputStrides.k.batch, tiling_->inputStrides.k.sequence,
+                           tiling_->inputStrides.k.head};
+        inputStrides_.v = {tiling_->inputStrides.v.batch, tiling_->inputStrides.v.sequence,
+                           tiling_->inputStrides.v.head};
+        inputStrides_.dout = {tiling_->inputStrides.dout.batch, tiling_->inputStrides.dout.sequence,
+                              tiling_->inputStrides.dout.head};
+        inputStrides_.out = {tiling_->inputStrides.out.batch, tiling_->inputStrides.out.sequence,
+                             tiling_->inputStrides.out.head};
+        inputStrides_.enabled = tiling_->inputStrides.enabled;
 
         doutGm_.SetGlobalBuffer((__gm__ DataType*)params.dout);
         qGm_.SetGlobalBuffer((__gm__ DataType*)params.q);
@@ -186,15 +196,16 @@ class FlashAttentionScoreGrad950 {
                 totalRounds_ = static_cast<uint32_t>(tiling_->detMaxRound);
                 totalBlockNum_ = static_cast<uint64_t>(totalRounds_) * waveSize_;
 
-                // AIV dk/dv cast buffers live in a dedicated tail region of
-                // UB; fag_tiling.cpp checks the budget against ubSize.
-                castChunkRows_ = kvBlockSize_ < DET_CAST_CHUNK_ROWS ? kvBlockSize_ : DET_CAST_CHUNK_ROWS;
-                const uint64_t inCol = qkHeadDimAlign_ > vHeadDimAlign_ ? qkHeadDimAlign_ : vHeadDimAlign_;
-                const uint64_t headCol = qkHeadDim_ > vHeadDim_ ? qkHeadDim_ : vHeadDim_;
-                const uint64_t castInBytes = RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * inCol * sizeof(float));
-                const uint64_t castOutBytes =
-                    RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * headCol * sizeof(DataType));
-                if (tiling_->ubSize > castInBytes + castOutBytes) {
+                // Use the host's UB-budgeted chunk size. The cast tail must
+                // remain disjoint from both live pipeline slots.
+                if (detPrivDkv_) {
+                    castChunkRows_ = tiling_->detCastChunkRows;
+                    const uint64_t inCol = qkHeadDimAlign_ > vHeadDimAlign_ ? qkHeadDimAlign_ : vHeadDimAlign_;
+                    const uint64_t headCol = qkHeadDim_ > vHeadDim_ ? qkHeadDim_ : vHeadDim_;
+                    const uint64_t castInBytes =
+                        RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * inCol * sizeof(float));
+                    const uint64_t castOutBytes =
+                        RoundUp<32>(static_cast<uint64_t>(castChunkRows_) * headCol * sizeof(DataType));
                     castInUb_ =
                         resource.ubBuf.template GetBufferByByte<float>(tiling_->ubSize - castInBytes - castOutBytes);
                     castOutUb_ = resource.ubBuf.template GetBufferByByte<DataType>(tiling_->ubSize - castOutBytes);
@@ -551,6 +562,18 @@ class FlashAttentionScoreGrad950 {
             block.detFoldS2Start[p] = foldKvStart + foldS2Start;
             block.detFoldS2Extend[p] = Min(kvBlockSize_, s2Len - foldS2Start);
         }
+    }
+
+    CATLASS_DEVICE uint64_t InputOffset(const FagTensorStrides& strides, const FAGBlockInfo& block, bool isQ) const
+    {
+        uint64_t token = isQ ? block.s1Start : block.s2Start;
+        uint64_t batchOffset = block.batchIdx * strides.batch;
+        if constexpr (INPUT_LAYOUT == FAGTiling950::Layout::TND) {
+            token = isQ ? block.totalS1Start : block.totalS2Start;
+            batchOffset = 0;
+        }
+        const uint64_t head = isQ ? block.n2Idx * groupNum_ + block.groupIdx : block.n2Idx;
+        return batchOffset + token * strides.sequence + head * strides.head;
     }
 
     CATLASS_DEVICE
@@ -1028,9 +1051,12 @@ class FlashAttentionScoreGrad950 {
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C1_TO_V1_FLAG[slot];
-        auto q = MakeGmTensor(qGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
-        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto q = MakeGmTensor(qGm_, InputOffset(inputStrides_.q, block, true), block.s1Extend, qkHeadDim_,
+                              inputStrides_.q.sequence);
+        auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                              inputStrides_.k.sequence);
+        auto v = MakeGmTensor(vGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
+                              inputStrides_.v.sequence);
         auto sLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
                                        tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto s = tla::MakeTensor(ubMm1ResTensor[slot], sLayout, Catlass::Arch::PositionUB{});
@@ -1046,8 +1072,10 @@ class FlashAttentionScoreGrad950 {
     {
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
         const uint16_t flagId = SYNC_C2_TO_V2_FLAG[slot];
-        auto dy = MakeGmTensor(doutGm_, block.doutOffset, block.s1Extend, vHeadDim_, qHeadNum_ * vHeadDim_);
-        auto v = MakeGmTensor(vGm_, block.vOffset, block.s2Extend, vHeadDim_, kvHeadNum_ * vHeadDim_);
+        auto dy = MakeGmTensor(doutGm_, InputOffset(inputStrides_.dout, block, true), block.s1Extend, vHeadDim_,
+                               inputStrides_.dout.sequence);
+        auto v = MakeGmTensor(vGm_, InputOffset(inputStrides_.v, block, false), block.s2Extend, vHeadDim_,
+                              inputStrides_.v.sequence);
         auto dpLayout = tla::MakeLayout(tla::MakeShape(block.s1Extend, block.s2Extend),
                                         tla::MakeStride(kvBlockSize_, tla::Int<1>{}));
         auto dp = tla::MakeTensor(ubMm2ResTensor[slot], dpLayout, Catlass::Arch::PositionUB{});
@@ -1070,13 +1098,15 @@ class FlashAttentionScoreGrad950 {
         // D<=128: prefetch RowMajor K into RES_KT upper half so MTE2 overlaps
         // with dv cube; subsequent C34 tasks in the group reuse it.
         if (block.initDkv && qkHeadDim_ <= 128U) {
-            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                                  inputStrides_.k.sequence);
             mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
         }
 
-        // Reuse L1 dY from C2. Single AIC owns (b,n2,s2) → no GM atomic on dv.
+        // Reuse L1 dY from C2. Small D accumulates in L0C until flush;
+        // large D flushes each slice/task into the zero-initialized full workspace.
         mm345.ComputeDv(l1PTensor[slot], dv, Catlass::GemmCoord(block.s1Extend, vHeadDim_, block.s2Extend), slot,
-                        block.initDkv, block.flushDkv, /*enAtomicDv=*/false);
+                        block.initDkv, block.flushDkv, /*enAtomicDv=*/vHeadDim_ > BlockMmaddQKV::BASE);
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG);
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C5_TO_V1_FLAG + V0_V1_FLAG_ID_OFFSET);
@@ -1090,16 +1120,19 @@ class FlashAttentionScoreGrad950 {
         AscendC::CrossCoreWaitFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_V2_TO_C34_FLAG + V0_V1_FLAG_ID_OFFSET);
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                              inputStrides_.k.sequence);
         auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
         auto dk = MakeGmTensor(dkWorkspaceGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
 
         // D<=128: waitResidentK on first task (C5 prefetched); later tasks hit
-        // resident K. D>128: ComputeDqDk streams K via DY scratch.
+        // resident K. D>128 streams K via DY scratch and accumulates each
+        // flushed slice/task into the zero-initialized full workspace.
         mm345.ComputeDqDk(l1dSTensor[slot], k, dq, dk, Catlass::GemmCoord(block.s1Extend, qkHeadDim_, block.s2Extend),
                           slot,
                           /*waitResidentK=*/block.initDkv,
-                          /*enAtomicDq=*/true, block.initDkv, block.flushDkv, /*enAtomicDk=*/false);
+                          /*enAtomicDq=*/true, block.initDkv, block.flushDkv,
+                          /*enAtomicDk=*/qkHeadDim_ > BlockMmaddQKV::BASE);
         if (returnL1) {
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG);
             AscendC::CrossCoreSetFlag<CROSS_CORE_SYNC_MODE, PIPE_MTE1>(SYNC_C34_TO_V2_FLAG + V0_V1_FLAG_ID_OFFSET);
@@ -1142,7 +1175,8 @@ class FlashAttentionScoreGrad950 {
         // Prefetch RowMajor K for the following C34 (D<=128).  Per-task group:
         // the previous C34 released the resident slot on its flush.
         if (qkHeadDim_ <= 128U) {
-            auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+            auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                                  inputStrides_.k.sequence);
             mm345.LoadResidentK(k, block.s2Extend, qkHeadDim_);
         }
         // dY is already in L1 DY[slot] from C2; release it here.
@@ -1197,7 +1231,8 @@ class FlashAttentionScoreGrad950 {
         dkBufOpen_[parity] = true;
 
         const uint32_t slot = static_cast<uint32_t>(block.taskId % TASK_PINGPONG);
-        auto k = MakeGmTensor(kGm_, block.kOffset, block.s2Extend, qkHeadDim_, kvHeadNum_ * qkHeadDim_);
+        auto k = MakeGmTensor(kGm_, InputOffset(inputStrides_.k, block, false), block.s2Extend, qkHeadDim_,
+                              inputStrides_.k.sequence);
         auto dq = MakeGmTensor(dqWorkspaceGm_, block.qOffset, block.s1Extend, qkHeadDim_, qHeadNum_ * qkHeadDim_);
         // Q is read from L1 Q[slot] (loaded by C1), K from the resident slot
         // (prefetched by C5) for D<=128; D>128 streams K through DY scratch.
@@ -1574,6 +1609,7 @@ class FlashAttentionScoreGrad950 {
     uint32_t batchNum_ = 0;
     uint32_t qSeqlen_ = 0;
     uint32_t kvSeqlen_ = 0;
+    FagInputStrides inputStrides_;
     uint64_t qHeadNum_ = 0;
     uint64_t kvHeadNum_ = 0;
     uint32_t groupNum_ = 0;
@@ -1613,8 +1649,8 @@ class FlashAttentionScoreGrad950 {
 template <typename DataType, FAGTiling950::Layout INPUT_LAYOUT, bool IS_CAUSAL, bool IS_DETERMINISTIC, bool IS_SOFTCAP>
 CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR out, GM_ADDR mask,
                                            GM_ADDR softmax_lse, GM_ADDR cu_seqlens_q, GM_ADDR cu_seqlens_k,
-                                           GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq,
-                                           GM_ADDR dk, GM_ADDR dv, GM_ADDR workspace, GM_ADDR tiling)
+                                           GM_ADDR seqUsedQ, GM_ADDR seqUsedKv, GM_ADDR dq, GM_ADDR dk, GM_ADDR dv,
+                                           GM_ADDR workspace, GM_ADDR tiling)
 {
     using ArchTag = Catlass::Arch::Ascend950;
     using L1TileShape = tla::Shape<tla::Int<128>, tla::Int<256>, tla::Int<256>>;
@@ -1645,8 +1681,8 @@ CATLASS_GLOBAL void FlashAttentionV3Bwd950(GM_ADDR dout, GM_ADDR q, GM_ADDR k, G
     using FAGKernel950 =
         FlashAttentionScoreGrad950<DataType, BlockMmadSdP, BlockMmaddQKV, EpilogueScaledMaskSoftmax, EpilogueSubMul,
                                    INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>;
-    FAGKernelParams params{dout,         q,  k,  v,  out,       mask,  softmax_lse, cu_seqlens_q,
-                           cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk, dv, workspace, tiling};
+    FAGKernelParams params{dout,         q,        k,         v,  out, mask, softmax_lse, cu_seqlens_q,
+                           cu_seqlens_k, seqUsedQ, seqUsedKv, dq, dk,  dv,   workspace,   tiling};
     FAGKernel950 fag;
     fag(params);
 }

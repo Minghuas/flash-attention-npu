@@ -744,7 +744,7 @@ std::vector<at::Tensor> mha_bwd(
     std::optional<at::Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
     std::optional<int64_t> max_seqlen_q_, std::optional<int64_t> max_seqlen_k_, std::optional<double> softmax_scale_,
     bool is_causal, int64_t window_size_left, int64_t window_size_right, double softcap, bool deterministic,
-    int64_t sm_margin)
+    int64_t sm_margin, int64_t layout)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(q));
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -761,22 +761,28 @@ std::vector<at::Tensor> mha_bwd(
     if (dq_.has_value()) {
         dq = dq_.value();
     } else {
-        dq = torch::empty_like(q);
+        dq = torch::empty(q.sizes(), q.options());
     }
     if (dk_.has_value()) {
         dk = dk_.value();
     } else {
-        dk = torch::empty_like(k);
+        dk = torch::empty(k.sizes(), k.options());
     }
     if (dv_.has_value()) {
         dv = dv_.value();
     } else {
-        dv = torch::empty_like(v);
+        dv = torch::empty(v.sizes(), v.options());
     }
     TORCH_CHECK(dq.dtype() == q_dtype && dk.dtype() == q_dtype && dv.dtype() == q_dtype,
                 "mha_bwd: dq/dk/dv must have the same dtype as q/k/v");
 
     const bool is_varlen_q = cu_seqlens_q_.has_value();
+    TORCH_CHECK(layout >= 0 && layout <= 2, "mha_bwd: layout must be 0 (TND), 1 (BSND), or 2 (BNSD)");
+    const bool is_bnsd = layout == 2;
+    TORCH_CHECK(layout != 0 || is_varlen_q, "mha_bwd: TND requires cu_seqlens_q/k");
+    TORCH_CHECK(!is_bnsd ||
+                    (!is_varlen_q && !cu_seqlens_k_.has_value() && !seqused_q_.has_value() && !seqused_k_.has_value()),
+                "mha_bwd: BNSD does not support cu_seqlens or seqused");
     const bool is_varlen_kv = cu_seqlens_k_.has_value();
     TORCH_CHECK(softcap >= 0.0f, "softcap must be non-negative (0.0 disables softcap)");
     TORCH_CHECK(!is_varlen_q || is_varlen_kv, "If cu_seqlens_q is provided in bwd, cu_seqlens_k must also be provided");
@@ -807,6 +813,14 @@ std::vector<at::Tensor> mha_bwd(
     TORCH_CHECK(dq.sizes() == qsizes && dk.sizes() == ksizes && dv.sizes() == vsizes,
                 "mha_bwd: dq/dk/dv must match q/k/v shapes");
 
+    for (const auto& tensor : {q, k, v, out, dout}) {
+        TORCH_CHECK(tensor.stride(-1) == 1, "mha_bwd: input last dimension must be contiguous");
+        TORCH_CHECK(tensor.device() == q.device(), "mha_bwd: inputs must share q device");
+    }
+    for (const auto& tensor : {dq, dk, dv}) {
+        TORCH_CHECK(tensor.is_contiguous() && tensor.device() == q.device(),
+                    "mha_bwd: gradients must be contiguous BSND/TND on q device");
+    }
     uint32_t nheads = is_varlen_q ? qsizes[1] : qsizes[2];
     uint32_t nheads_k = is_varlen_q ? ksizes[1] : ksizes[2];
     uint32_t q_headdim = is_varlen_q ? qsizes[2] : qsizes[3];
@@ -888,7 +902,7 @@ std::vector<at::Tensor> mha_bwd(
     fagInfo.kvHeadNum = nheads_k;
     fagInfo.vHeadDim = v_headdim;
     fagInfo.isDeterministic = deterministic;
-    fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : BSND);
+    fagInfo.layout = static_cast<int32_t>(is_varlen_q ? TND : (is_bnsd ? BNSD : BSND));
     at::Tensor cu_seqlens_q_cpu_for_tiling;
     at::Tensor cu_seqlens_k_cpu_for_tiling;
     at::Tensor seqused_q_cpu_for_tiling;
@@ -914,6 +928,15 @@ std::vector<at::Tensor> mha_bwd(
     platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ubSize);
     FAGTilingData fagTilingData;
     FAGTiling::GetFAGTilingParam(fagInfo, blockDim, aivNum, ubSize, fagTilingData);
+    for (const auto& tensor : {q, k, v, out, dout}) {
+        TORCH_CHECK(tensor.stride(is_varlen_q ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
+    }
+    auto tensor_strides = [is_varlen_q](const at::Tensor& tensor) {
+        return FagTensorStrides{is_varlen_q ? 0 : tensor.stride(0), tensor.stride(is_varlen_q ? 0 : 1),
+                                tensor.stride(is_varlen_q ? 1 : 2)};
+    };
+    fagTilingData.inputStrides = {tensor_strides(q),    tensor_strides(k),   tensor_strides(v),
+                                  tensor_strides(dout), tensor_strides(out), 1};
     fagTilingData.actualSeqQlen.clear();
     fagTilingData.actualSeqKvlen.clear();
     std::memcpy(tiling_cpu_tensor.data_ptr<uint8_t>(), &fagTilingData, sizeof(FAGTilingData));
@@ -935,19 +958,24 @@ std::vector<at::Tensor> mha_bwd(
     uint32_t fftsLen{0};
     rtError_t error = rtGetC2cCtrlAddr(&fftsAddr, &fftsLen);
     (void)error;
-    auto qDevice = static_cast<uint8_t*>(const_cast<void*>(q.storage().data()));
-    auto kDevice = static_cast<uint8_t*>(const_cast<void*>(k.storage().data()));
-    auto vDevice = static_cast<uint8_t*>(const_cast<void*>(v.storage().data()));
-    auto outDevice = static_cast<uint8_t*>(const_cast<void*>(out.storage().data()));
-    auto dOutDevice = static_cast<uint8_t*>(const_cast<void*>(dout.storage().data()));
+    auto qDevice = static_cast<uint8_t*>(q.data_ptr());
+    auto kDevice = static_cast<uint8_t*>(k.data_ptr());
+    auto vDevice = static_cast<uint8_t*>(v.data_ptr());
+    auto outDevice = static_cast<uint8_t*>(out.data_ptr());
+    auto dOutDevice = static_cast<uint8_t*>(dout.data_ptr());
     uint8_t* attenMaskDevice = nullptr;
     if (mask_gpu_tensor.defined()) {
         attenMaskDevice = static_cast<uint8_t*>(const_cast<void*>(mask_gpu_tensor.storage().data()));
     }
+    if (is_bnsd) {
+        TORCH_CHECK(softmax_lse.scalar_type() == at::kFloat && softmax_lse.device() == q.device(),
+                    "mha_bwd: BNSD LSE must be float32 on q device");
+    }
     at::Tensor softmax_lse_kernel = softmax_lse;
     if (!is_varlen_q) {
         TORCH_CHECK(softmax_lse.dim() == 3, "mha_bwd: softmax_lse for BSND must be a 3D tensor.");
-        TORCH_CHECK(softmax_lse.size(1) == nheads && softmax_lse.size(2) == max_seqlen_q,
+        TORCH_CHECK(softmax_lse.size(0) == batch_size && softmax_lse.size(1) == nheads &&
+                        softmax_lse.size(2) == max_seqlen_q,
                     "mha_bwd: softmax_lse must be BNS in BSND mode.");
         if (!softmax_lse.is_contiguous()) {
             softmax_lse_kernel = softmax_lse.contiguous();
@@ -961,13 +989,13 @@ std::vector<at::Tensor> mha_bwd(
             softmax_lse_kernel = softmax_lse.contiguous();
         }
     }
-    auto softMaxLseDevice = static_cast<uint8_t*>(const_cast<void*>(softmax_lse_kernel.storage().data()));
+    auto softMaxLseDevice = static_cast<uint8_t*>(softmax_lse_kernel.data_ptr());
 
     auto workspaceDevice = static_cast<uint8_t*>(const_cast<void*>(workspace_tensor.storage().data()));
     auto tilingDevice = static_cast<uint8_t*>(const_cast<void*>(tiling_gpu_tensor.storage().data()));
-    auto dqDevice = static_cast<uint8_t*>(const_cast<void*>(dq.storage().data()));
-    auto dkDevice = static_cast<uint8_t*>(const_cast<void*>(dk.storage().data()));
-    auto dvDevice = static_cast<uint8_t*>(const_cast<void*>(dv.storage().data()));
+    auto dqDevice = static_cast<uint8_t*>(dq.data_ptr());
+    auto dkDevice = static_cast<uint8_t*>(dk.data_ptr());
+    auto dvDevice = static_cast<uint8_t*>(dv.data_ptr());
     uint8_t* cuSeqQlenDevice = nullptr;
     uint8_t* cuSeqKvlenDevice = nullptr;
     uint8_t* seqUsedQDevice = nullptr;
@@ -1014,6 +1042,8 @@ std::vector<at::Tensor> mha_bwd(
     bwd_args.tilingDevice = tilingDevice;
     if (is_varlen_q) {
         launch_bwd<TND>(bwd_args);
+    } else if (is_bnsd) {
+        launch_bwd<BNSD>(bwd_args);
     } else {
         launch_bwd<BSND>(bwd_args);
     }
