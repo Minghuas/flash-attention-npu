@@ -53,7 +53,6 @@ public:
     static constexpr uint32_t VECTOR_SIZE = 128;
     static constexpr uint32_t MAX_UB_S_ELEM_NUM = 8192;
 
-    static constexpr uint32_t REDUCE_UB_SIZE = 1024;
     // Compact row partials occupy at most 6 KiB; reduced rows use the final 2 KiB.
     static constexpr uint32_t DIRECT_REDUCED_OFFSET = 6 * UB_UINT8_VECTOR_SIZE / sizeof(float);
     static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
@@ -259,64 +258,10 @@ public:
     }
 
     __aicore__ inline
-    void RowsumSPECTILE512(const AscendC::LocalTensor<float> &srcUb, const AscendC::LocalTensor<float> &rowsumUb,
-        const AscendC::LocalTensor<float> &tvUbTensor, uint32_t numRowsRound, uint32_t numElems,
-        uint32_t numElemsAligned)
-    {
-        AscendC::BlockReduceSum<float, false>(
-            tvUbTensor,
-            srcUb,
-            numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE,
-            0, 1, 1, 8);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::BlockReduceSum<float, false>(
-            tvUbTensor[REDUCE_UB_SIZE],
-            tvUbTensor,
-            numRowsRound * numElemsAligned / FLOAT_BLOCK_SIZE / FLOAT_VECTOR_SIZE,
-            0, 1, 1, 8);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::BlockReduceSum<float, false>(
-            rowsumUb,
-            tvUbTensor[REDUCE_UB_SIZE],
-            numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE / FLOAT_VECTOR_SIZE,
-            0, 1, 1, 8);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline
     void Rowsum(const AscendC::LocalTensor<float> &srcUb, const AscendC::LocalTensor<float> &outUb,
         const AscendC::LocalTensor<float> &partial, uint32_t numRowsRound, uint32_t numElems,
         uint32_t numElemsAligned)
     {
-        if (numElems == 512U) {
-            RowsumSPECTILE512(srcUb, outUb, partial, numRowsRound, numElems, numElemsAligned);
-            return;
-        }
-        // Reuse the single-block tree for both narrow widths and two-block rows.
-        if (numElems <= 2 * FLOAT_VECTOR_SIZE) {
-            const auto blockRows = partial[DIRECT_REDUCED_OFFSET];
-            for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {
-                const uint32_t valid = AscendC::Std::min(numElems - v, FLOAT_VECTOR_SIZE);
-                SetVecMask(valid);
-                AscendC::BlockReduceSum<float, false>(
-                    partial, srcUb[v], numRowsRound, 0, 1, 1, numElemsAligned / FLOAT_BLOCK_SIZE);
-                AscendC::PipeBarrier<PIPE_V>();
-                SetBlockReduceMask(CeilDiv(valid, FLOAT_BLOCK_SIZE));
-                AscendC::BlockReduceSum<float, false>(
-                    v == 0 ? outUb : blockRows, partial,
-                    numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-            if (numElems > FLOAT_VECTOR_SIZE) {
-                SetVecMask(numRowsRound);
-                AscendC::Add<float, false>(outUb, outUb, blockRows,
-                    (uint64_t)0, 1, AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-            return;
-        }
         const uint32_t partialRowBlocks = CeilDiv(numElems, FLOAT_VECTOR_SIZE);
         const auto reduced = partial[DIRECT_REDUCED_OFFSET];
         for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {
@@ -343,63 +288,10 @@ public:
 
 
     __aicore__ inline
-    void RowmaxSPECTILE512(const AscendC::LocalTensor<float> &srcUb, const AscendC::LocalTensor<float> &rowmaxUb,
-        const AscendC::LocalTensor<float> &tvUbTensor, uint32_t numRowsRound, uint32_t numElems,
-        uint32_t numElemsAligned)
-    {
-        AscendC::BlockReduceMax<float, false>(
-            tvUbTensor,
-            srcUb,
-            numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE,
-            0, 1, 1, 8);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::BlockReduceMax<float, false>(
-            tvUbTensor[REDUCE_UB_SIZE],
-            tvUbTensor,
-            numRowsRound * numElemsAligned / FLOAT_BLOCK_SIZE / FLOAT_VECTOR_SIZE,
-            0, 1, 1, 8);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::BlockReduceMax<float, false>(
-            rowmaxUb,
-            tvUbTensor[REDUCE_UB_SIZE],
-            numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE / FLOAT_VECTOR_SIZE,
-            0, 1, 1, 8);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-
-    __aicore__ inline
     void Rowmax(const AscendC::LocalTensor<float> &srcUb, const AscendC::LocalTensor<float> &outUb,
         const AscendC::LocalTensor<float> &partial, uint32_t numRowsRound, uint32_t numElems,
         uint32_t numElemsAligned)
     {
-        if (numElems == 512U) {
-            RowmaxSPECTILE512(srcUb, outUb, partial, numRowsRound, numElems, numElemsAligned);
-            return;
-        }
-        // Reuse the single-block tree for both narrow widths and two-block rows.
-        if (numElems <= 2 * FLOAT_VECTOR_SIZE) {
-            const auto blockRows = partial[DIRECT_REDUCED_OFFSET];
-            for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {
-                const uint32_t valid = AscendC::Std::min(numElems - v, FLOAT_VECTOR_SIZE);
-                SetVecMask(valid);
-                AscendC::BlockReduceMax<float, false>(
-                    partial, srcUb[v], numRowsRound, 0, 1, 1, numElemsAligned / FLOAT_BLOCK_SIZE);
-                AscendC::PipeBarrier<PIPE_V>();
-                SetBlockReduceMask(CeilDiv(valid, FLOAT_BLOCK_SIZE));
-                AscendC::BlockReduceMax<float, false>(
-                    v == 0 ? outUb : blockRows, partial,
-                    numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-            if (numElems > FLOAT_VECTOR_SIZE) {
-                SetVecMask(numRowsRound);
-                AscendC::Max<float, false>(outUb, outUb, blockRows,
-                    (uint64_t)0, 1, AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-                AscendC::PipeBarrier<PIPE_V>();
-            }
-            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-            return;
-        }
         const uint32_t partialRowBlocks = CeilDiv(numElems, FLOAT_VECTOR_SIZE);
         const auto reduced = partial[DIRECT_REDUCED_OFFSET];
         for (uint32_t v = 0; v < numElems; v += FLOAT_VECTOR_SIZE) {

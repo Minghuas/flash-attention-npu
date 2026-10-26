@@ -269,6 +269,9 @@ struct FAMetadataArgs {
     uint32_t headPlanCapacity;
     uint32_t fdPlanCapacity;
     uint32_t maskPlanCapacity;
+    // Physical packed-storage prefixes; seqused lengths above only describe work.
+    uint64_t cuSeqlensQAddr;
+    uint64_t cuSeqlensKAddr;
 };
 
 #undef FA_METADATA_INLINE

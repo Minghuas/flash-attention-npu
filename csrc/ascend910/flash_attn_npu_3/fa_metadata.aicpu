@@ -133,9 +133,14 @@ inline void BuildAddressPlan(AddressPlan& plan, uint32_t batchIdx, const FAMetad
     const uint64_t oStride = static_cast<uint64_t>(args.numHeads) * args.embeddingSizeV;
     const uint64_t kStride = static_cast<uint64_t>(args.numHeadsK) * args.embeddingSize;
     const uint64_t vStride = static_cast<uint64_t>(args.numHeadsK) * args.embeddingSizeV;
+    const auto* cuQ = reinterpret_cast<const int32_t*>(args.cuSeqlensQAddr);
+    const auto* cuK = reinterpret_cast<const int32_t*>(args.cuSeqlensKAddr);
     const bool append = args.kvNewSeqlen != 0U;
-    const uint32_t qBase = args.isVarlen != 0U ? qPrefix : batchIdx * args.maxQSeqlen;
-    const uint32_t kvBase = append ? batchIdx * args.kvCacheSeqlen : kvPrefix;
+    const uint32_t qBase = args.isVarlen != 0U
+        ? (cuQ != nullptr ? static_cast<uint32_t>(cuQ[batchIdx]) : qPrefix)
+        : batchIdx * args.maxQSeqlen;
+    const uint32_t kvBase = append ? batchIdx * args.kvCacheSeqlen
+        : (cuK != nullptr ? static_cast<uint32_t>(cuK[batchIdx]) : kvPrefix);
     plan.qBOffset = static_cast<uint64_t>(qBase) * qStride;
     plan.oBOffset = static_cast<uint64_t>(qBase) * oStride;
     plan.kBOffset = args.pagedKV != 0U ? 0U : static_cast<uint64_t>(kvBase) * kStride;
@@ -289,6 +294,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     }
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
     tilingData->totalTaskNum = totalTaskNum;
+    if (metaArgs->cuSeqlensQAddr != 0U) {
+        const auto* cuQ = reinterpret_cast<const int32_t*>(metaArgs->cuSeqlensQAddr);
+        totalQTokens = static_cast<uint32_t>(cuQ[metaArgs->batch]);
+    }
 
         const uint32_t bd = metaArgs->blockDim;
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
