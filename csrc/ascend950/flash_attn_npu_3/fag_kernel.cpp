@@ -365,30 +365,52 @@ class FlashAttentionScoreGrad950 {
     }
 
     CATLASS_DEVICE
-    uint32_t FirstValidS1Block(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx)
+    void GetValidS1BlockRange(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockIdx,
+                              uint32_t& firstValidS1, uint32_t& validS1Num)
     {
+        validS1Num = 0;
+        // No mask: every S1 block is valid.
         if constexpr (!IS_ATTEN_MASK) {
-            return 0;
+            validS1Num = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
+            return;
+        }
+        firstValidS1 = 0;
+        const int64_t s2Start = static_cast<int64_t>(s2BlockIdx) * kvBlockSize_;
+        const int64_t delta = static_cast<int64_t>(s2Length) - s1Length;
+        // Causal: only the first S1 block is restricted; the range extends
+        // to the final Q block, without a left-window or KV-tail calculation.
+        if (tiling_->maskType == static_cast<uint32_t>(FAGTiling950::MaskType::CAUSAL)) {
+            const int64_t s1IdxUp = Max(static_cast<int64_t>(0), s2Start - delta);
+            if (s1IdxUp >= s1Length) {
+                return;
+            }
+            firstValidS1 = static_cast<uint32_t>(s1IdxUp / qBlockSize_);
+            validS1Num = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_)) - firstValidS1;
+            return;
         }
 
-        // floor((s2BlockIdx * kvBlockSize - (s2Length - s1Length)) /
-        //       qBlockSize), clamped to [0, ceil(s1Length / qBlockSize)].
-        const int64_t numerator =
-            static_cast<int64_t>(s2BlockIdx) * kvBlockSize_ - (static_cast<int64_t>(s2Length) - s1Length);
-        if (numerator <= 0) {
-            return 0;
+        // BAND: both S1 boundaries depend on the window and actual KV tile size.
+        const int64_t s1IdxUp = tiling_->s2Token == INT32_MAX ? 0 :
+            Max(static_cast<int64_t>(0), s2Start - delta - tiling_->s2Token);
+        const int64_t s2RealSize = Min(static_cast<int64_t>(kvBlockSize_), static_cast<int64_t>(s2Length) - s2Start);
+        const int64_t s1IdxDown = tiling_->s1Token == INT32_MAX ? s1Length :
+            Min(static_cast<int64_t>(s1Length), s2Start + s2RealSize - delta + tiling_->s1Token);
+        if (s1IdxUp >= s1IdxDown) {
+            return;
         }
-        const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
-        return Min(static_cast<uint32_t>(numerator / qBlockSize_), s1BlockNum);
+        firstValidS1 = static_cast<uint32_t>(s1IdxUp / qBlockSize_);
+        validS1Num = static_cast<uint32_t>((s1IdxDown + qBlockSize_ - 1) / qBlockSize_) - firstValidS1;
     }
 
     CATLASS_DEVICE
     uint64_t CountValidS1Blocks(uint32_t s1Length, uint32_t s2Length, uint32_t s2BlockNum)
     {
-        const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
         uint64_t count = 0;
         for (uint32_t s2BlockIdx = 0; s2BlockIdx < s2BlockNum; ++s2BlockIdx) {
-            count += s1BlockNum - FirstValidS1Block(s1Length, s2Length, s2BlockIdx);
+            uint32_t firstValidS1 = 0;
+            uint32_t validS1Num = 0;
+            GetValidS1BlockRange(s1Length, s2Length, s2BlockIdx, firstValidS1, validS1Num);
+            count += validS1Num;
         }
         return count;
     }
@@ -398,27 +420,48 @@ class FlashAttentionScoreGrad950 {
     CATLASS_DEVICE
     uint32_t ValidS2BlockNum(uint32_t s1Length, uint32_t s2Length, uint32_t s1BlockIdx)
     {
-        const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
         if constexpr (!IS_ATTEN_MASK) {
+            const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
             return s2BlockNum;
         }
-
-        // Causal: kv col j is visible to q row i iff
-        // j <= i + (s2Length - s1Length).  The last visible col of this s1
-        // block is (s1BlockIdx + 1) * qBlockSize - 1 + (s2Length - s1Length).
-        const int64_t lastCol =
-            static_cast<int64_t>(s1BlockIdx + 1) * qBlockSize_ - 1 + (static_cast<int64_t>(s2Length) - s1Length);
-        if (lastCol < 0) {
+        const int64_t s1Start = static_cast<int64_t>(s1BlockIdx) * qBlockSize_;
+        if (s1Start >= s1Length || s2Length == 0) {
             return 0;
         }
-        return Min(static_cast<uint32_t>(lastCol / kvBlockSize_), s2BlockNum - 1) + 1;
+        const int64_t s1RealSize = Min(static_cast<int64_t>(qBlockSize_), static_cast<int64_t>(s1Length) - s1Start);
+        const int64_t s1End = s1Start + s1RealSize;
+        int64_t firstCol = 0;
+        int64_t endCol = s2Length;
+        if constexpr (IS_ATTEN_MASK) {
+            const int64_t delta = static_cast<int64_t>(s2Length) - s1Length;
+            if (tiling_->s1Token != INT32_MAX) {
+                firstCol = Max(static_cast<int64_t>(0), s1Start + delta - tiling_->s1Token);
+            }
+            if (tiling_->s2Token != INT32_MAX) {
+                endCol = Min(endCol, s1End + delta + tiling_->s2Token);
+            }
+        }
+        if (firstCol >= endCol) {
+            return 0;
+        }
+        return static_cast<uint32_t>((endCol + kvBlockSize_ - 1) / kvBlockSize_ - firstCol / kvBlockSize_);
     }
 
     CATLASS_DEVICE
     uint32_t LastValidS2Block(uint32_t s1Length, uint32_t s2Length, uint32_t s1BlockIdx)
     {
-        // Mirror of FirstValidS1Block; requires ValidS2BlockNum > 0.
-        return ValidS2BlockNum(s1Length, s2Length, s1BlockIdx) - 1;
+        // Requires ValidS2BlockNum > 0.
+        int64_t endCol = s2Length;
+        if constexpr (IS_ATTEN_MASK) {
+            if (tiling_->s2Token != INT32_MAX) {
+                const int64_t s1Start = static_cast<int64_t>(s1BlockIdx) * qBlockSize_;
+                const int64_t s1RealSize =
+                    Min(static_cast<int64_t>(qBlockSize_), static_cast<int64_t>(s1Length) - s1Start);
+                const int64_t s1End = s1Start + s1RealSize;
+                endCol = Min(endCol, s1End + static_cast<int64_t>(s2Length) - s1Length + tiling_->s2Token);
+            }
+        }
+        return static_cast<uint32_t>((endCol + kvBlockSize_ - 1) / kvBlockSize_ - 1);
     }
 
     CATLASS_DEVICE
@@ -610,17 +653,18 @@ class FlashAttentionScoreGrad950 {
                     return false;
                 }
                 FillBlockInfoBn2s2(blockId, c, block);
-                // Causal mask is right-down aligned (j <= i + (sk - sq)); a block
-                // entirely above the diagonal contributes exact zeros, so skip it
-                // and let the dense schedule pay only for the causal region.
-                // Semantic no-op (the epilogue would mask the whole block).
-                if (tiling_->maskType != 0 && detBufNum_ <= 1 &&
+                // Keep the round/core schedule, but skip tiles outside the
+                // right-down causal or BAND window. All cores still join barriers.
+                if (tiling_->maskType != static_cast<uint32_t>(FAGTiling950::MaskType::NO_MASK) && detBufNum_ <= 1 &&
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_LEFT_UP_CAUSAL_SWIZZLE) &&
                     detKind_ != static_cast<uint32_t>(fag_det::KIND_TND_CAUSAL)) {
-                    const int64_t diagOffset =
-                        static_cast<int64_t>(block.curBatchS2) - static_cast<int64_t>(block.curBatchS1);
-                    if (static_cast<int64_t>(block.s2Start) >
-                        static_cast<int64_t>(block.s1Start) + static_cast<int64_t>(block.s1Extend) - 1 + diagOffset) {
+                    const int64_t delta = static_cast<int64_t>(block.curBatchS2) - block.curBatchS1;
+                    const int64_t firstCol = tiling_->s1Token == INT32_MAX ? 0 :
+                        static_cast<int64_t>(block.s1Start) + delta - tiling_->s1Token;
+                    const int64_t endCol = tiling_->s2Token == INT32_MAX ? block.curBatchS2 :
+                        static_cast<int64_t>(block.s1Start) + block.s1Extend + delta + tiling_->s2Token;
+                    if (static_cast<int64_t>(block.s2Start) + block.s2Extend <= firstCol ||
+                        static_cast<int64_t>(block.s2Start) >= endCol) {
                         return false;
                     }
                 }
@@ -672,7 +716,16 @@ class FlashAttentionScoreGrad950 {
             // ------------gIdx & s2Idx------------
             const uint64_t blockInS1 = blockInN2 - decoderS1BlockBegin_;
             const uint32_t groupIdx = static_cast<uint32_t>(blockInS1 / validS2Num);
-            const uint32_t s2BlockIdx = static_cast<uint32_t>(blockInS1 % validS2Num);
+            int64_t firstCol = 0;
+            if constexpr (IS_ATTEN_MASK) {
+                if (tiling_->s1Token != INT32_MAX) {
+                    firstCol = Max(static_cast<int64_t>(0),
+                        static_cast<int64_t>(decoderS1BlockIdx_) * qBlockSize_ +
+                        static_cast<int64_t>(decoderS2Length_) - decoderS1Length_ - tiling_->s1Token);
+                }
+            }
+            const uint32_t s2BlockIdx = static_cast<uint32_t>(firstCol / kvBlockSize_) +
+                static_cast<uint32_t>(blockInS1 % validS2Num);
             FillBlockInfo(blockId, n2Idx, groupIdx, decoderS1BlockIdx_, s2BlockIdx, block);
             return true;
         }
@@ -680,8 +733,7 @@ class FlashAttentionScoreGrad950 {
         uint32_t firstValidS1 = 0;
         uint32_t validS1Num = 0;
         while (decoderS2BlockIdx_ < decoderS2BlockNum_) {
-            firstValidS1 = FirstValidS1Block(decoderS1Length_, decoderS2Length_, decoderS2BlockIdx_);
-            validS1Num = decoderS1BlockNum_ - firstValidS1;
+            GetValidS1BlockRange(decoderS1Length_, decoderS2Length_, decoderS2BlockIdx_, firstValidS1, validS1Num);
             const uint64_t s2BlockTasks = static_cast<uint64_t>(groupNum_) * validS1Num;
             if (blockInN2 < decoderS2BlockBegin_ + s2BlockTasks) {
                 break;
@@ -890,7 +942,6 @@ class FlashAttentionScoreGrad950 {
             uint32_t s1Length = 0;
             uint32_t s2Length = 0;
             GetBatchShape(batchIdx, qBatchStart, kvBatchStart, s1Length, s2Length);
-            const uint32_t s1BlockNum = static_cast<uint32_t>(CeilDiv(s1Length, qBlockSize_));
             const uint32_t s2BlockNum = static_cast<uint32_t>(CeilDiv(s2Length, kvBlockSize_));
 
             for (uint32_t n2Idx = 0; n2Idx < kvHeadNum_; ++n2Idx) {
@@ -899,12 +950,9 @@ class FlashAttentionScoreGrad950 {
                         continue;
                     }
 
-                    const uint32_t firstValidS1 = FirstValidS1Block(s1Length, s2Length, s2BlockIdx);
-                    if (firstValidS1 >= s1BlockNum) {
-                        continue;
-                    }
-
-                    const uint32_t validS1Num = s1BlockNum - firstValidS1;
+                    uint32_t firstValidS1 = 0;
+                    uint32_t validS1Num = 0;
+                    GetValidS1BlockRange(s1Length, s2Length, s2BlockIdx, firstValidS1, validS1Num);
                     const uint32_t tasksInGroup = groupNum_ * validS1Num;
                     if (tasksInGroup == 0) {
                         continue;
@@ -1330,9 +1378,10 @@ class FlashAttentionScoreGrad950 {
         const uint32_t firstHalf = (s2Extend + 1U) / 2U;
         const uint32_t rowBegin = subBlockIdx * firstHalf;
         const uint32_t rowLimit = (rowBegin + firstHalf < s2Extend) ? rowBegin + firstHalf : s2Extend;
+        const uint32_t chunkRows = (headDim * sizeof(DataType)) % 32U == 0U ? castChunkRows_ : 1U;
         uint32_t row = rowBegin;
         while (row < rowLimit) {
-            const uint32_t rows = (rowLimit - row < castChunkRows_) ? rowLimit - row : castChunkRows_;
+            const uint32_t rows = (rowLimit - row < chunkRows) ? rowLimit - row : chunkRows;
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(castMte3ToMte2_);
             AscendC::DataCopyExtParams inParams{static_cast<uint16_t>(rows),
                                                 static_cast<uint32_t>(headDim * sizeof(float)),
@@ -1456,7 +1505,7 @@ class FlashAttentionScoreGrad950 {
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
             epilogueScaledMaskSoftmax_(block, attenMaskGmTensor, softmaxLseGmTensor, attenMaskUbTensor[flagSlot],
                                        lseUbTensor[flagSlot], ubMm1ResTensor[flagSlot], ubPTensor[flagSlot],
-                                       l1PTensor[flagSlot], mte2ToVEvent, vToMte3Event, mte3ToVEvent,
+                                       l1PTensor[flagSlot], mte2ToVEvent, vToMte2Event, vToMte3Event, mte3ToVEvent,
                                        softcapInputScale_, softcapValue_, subBlockRealS1, subBlockIdx);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vToMte2Event);
         }

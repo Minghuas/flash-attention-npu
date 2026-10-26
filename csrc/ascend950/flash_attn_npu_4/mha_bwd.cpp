@@ -44,8 +44,6 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     // seqused caps used lengths only; offsets and sizing still follow cu.
     TORCH_CHECK(!seqused_q_.has_value() || is_varlen, "Ascend950 v4 bwd: seqused_q requires cu_seqlens_q");
     TORCH_CHECK(!seqused_k_.has_value() || is_varlen, "Ascend950 v4 bwd: seqused_k requires cu_seqlens_q");
-    TORCH_CHECK(window_size_left == -1 && window_size_right == -1,
-                "Ascend950 v4 bwd does not support sliding-window attention now");
     TORCH_CHECK(std::isfinite(softcap) && softcap >= 0.0 && softcap <= std::numeric_limits<float>::max(),
                 "Ascend950 v4 bwd: softcap must be finite and non-negative");
     TORCH_CHECK(sm_margin == 0, "Ascend950 v4 bwd does not support sm_margin");
@@ -138,7 +136,31 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     fag_info.softcapValue = static_cast<float>(softcap);
     fag_info.layout =
         is_varlen ? FAGTiling950::Layout::TND : (is_bnsd ? FAGTiling950::Layout::BNSD : FAGTiling950::Layout::BSND);
-    fag_info.maskType = is_causal ? FAGTiling950::MaskType::CAUSAL : FAGTiling950::MaskType::NO_MASK;
+    if (window_size_left >= kv_seqlen - 1) {
+        window_size_left = -1;
+    }
+    if (window_size_right >= q_seqlen - 1) {
+        window_size_right = -1;
+    }
+    if (is_causal) {
+        window_size_right = 0;
+    }
+    is_causal = window_size_left < 0 && window_size_right == 0;
+    const bool is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
+    const bool has_attn_mask = is_causal || is_local;
+    if (is_causal) {
+        fag_info.maskType = FAGTiling950::MaskType::CAUSAL;
+        fag_info.window_size_left = window_size_left;
+        fag_info.window_size_right = 0;
+    } else if (is_local) {
+        fag_info.maskType = FAGTiling950::MaskType::BAND;
+        fag_info.window_size_left = window_size_left;
+        fag_info.window_size_right = window_size_right;
+    } else {
+        fag_info.maskType = FAGTiling950::MaskType::NO_MASK;
+        fag_info.window_size_left = window_size_left;
+        fag_info.window_size_right = window_size_right;
+    }
     fag_info.deterministic = deterministic ? 1U : 0U;
     // Deterministic accumulation strategy.  BN2S2 applies the arch35
     // column-private schedule when the shape is covered; the tiler rejects
@@ -266,6 +288,17 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     FAGTiling950::FAGTilingData fag_tiling_data{};
     const int64_t tiling_status = FAGTiling950::GetFAGTilingParam(fag_info, fag_tiling_data);
     TORCH_CHECK(tiling_status == 0, "Ascend950 v4 bwd: arch35 GetFAGTilingParam failed");
+    // Entire BAND-masked KV columns never reach the private-column cast.
+    if (is_local && fag_tiling_data.detPrivDkv != 0) {
+        bool hasEmptyKvColumns = !is_varlen && kv_seqlen - q_seqlen > fag_tiling_data.s1Token;
+        for (int64_t b = 0; is_varlen && b < batch_size && !hasEmptyKvColumns; ++b) {
+            hasEmptyKvColumns = actual_seq_kv[b] - actual_seq_q[b] > fag_tiling_data.s1Token;
+        }
+        if (hasEmptyKvColumns) {
+            dk.zero_();
+            dv.zero_();
+        }
+    }
     for (const auto& tensor : {q, k, v, out, dout}) {
         TORCH_CHECK(tensor.stride(is_varlen ? 0 : 1) >= tensor.size(-1), "mha_bwd: token rows must not overlap");
     }
@@ -341,7 +374,7 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
     at::Tensor mask_cpu_tensor;
     at::Tensor mask_npu_tensor;
     uint8_t* mask = nullptr;
-    if (is_causal) {
+    if (has_attn_mask) {
         mask_cpu_tensor =
             at::triu(at::ones({256, 256}, at::device(c10::kCPU).dtype(at::kByte)), 1).to(at::Device(at::kPrivateUse1));
         mask_npu_tensor = mask_cpu_tensor.to(at::Device(at::kPrivateUse1));
@@ -360,15 +393,15 @@ std::vector<at::Tensor> mha_bwd(at::Tensor dout, at::Tensor q, at::Tensor k, at:
                                       ? fag_tiling_data.usedCoreNum
                                       : aic_num;
 
-#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP)                                    \
-    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_CAUSAL, IS_DETERMINISTIC, IS_SOFTCAP>         \
+#define LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP)                                    \
+    FlashAttentionV3Bwd950<DTYPE, FAGTiling950::Layout::INPUT_LAYOUT, IS_ATTEN_MASK, IS_DETERMINISTIC, IS_SOFTCAP>         \
         <<<launch_cores, nullptr, stream>>>(ptr(dout), ptr(q), ptr(k), ptr(v), ptr(out), mask, ptr(softmax_lse), cu_q, \
                                             cu_k, seq_used_q, seq_used_k, ptr(dq), ptr(dk), ptr(dv), ptr(workspace),   \
                                             ptr(tiling_device))
 
 #define DISPATCH_BWD950_FLAGS(DTYPE, INPUT_LAYOUT)                                                                     \
     do {                                                                                                               \
-        if (is_causal) {                                                                                               \
+        if (has_attn_mask) {                                                                                               \
             if (deterministic) {                                                                                       \
                 if (has_softcap) {                                                                                     \
                     LAUNCH_BWD950(DTYPE, INPUT_LAYOUT, true, true, true);                                              \
