@@ -31,6 +31,12 @@ class BlockEpilogue<
     MaskType_>
 {
 public:
+    struct TaskPlan {
+        uint32_t subBlockIdx;
+        uint32_t rowActualThisSubBlock;
+        uint32_t rowOffsetThisSubBlock;
+    };
+
     using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_>;
     using ArchTag = typename DispatchPolicy::ArchTag;
     using ElementOutput = typename OutputType_::Element;
@@ -80,6 +86,21 @@ public:
 
     __aicore__ inline
     ~BlockEpilogue() {}
+
+    __aicore__ inline static TaskPlan MakeTaskPlan(uint32_t rowNum, uint32_t qSBlockSize,
+                                                   uint32_t qNBlockSize)
+    {
+        TaskPlan plan{};
+        plan.subBlockIdx = AscendC::GetSubBlockIdx();
+        const uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        const uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
+        const uint32_t rowSplitSubBlock = (qNBlockSize == 1U)
+            ? qSBlockSize / 2U : qSBlockSize * qNSplitSubBlock;
+        plan.rowActualThisSubBlock = (plan.subBlockIdx == 1U)
+            ? rowNum - rowSplitSubBlock : rowSplitSubBlock;
+        plan.rowOffsetThisSubBlock = plan.subBlockIdx * rowSplitSubBlock;
+        return plan;
+    }
 
     __aicore__ inline
     void init(Arch::Resource<ArchTag> &resource, float scaleValue_, float softcapValue_)
@@ -639,6 +660,7 @@ public:
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput, GemmCoord actualBlockShape,
+        const TaskPlan& taskPlan,
         uint32_t isFirstStackTile, uint32_t isLastNoMaskStackTile,
         uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot,
         Arch::CrossCoreFlag qkReady, uint32_t& softmaxPingPongFlag, bool isSplitKV = false,
@@ -649,14 +671,9 @@ public:
         uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE);
         uint32_t columnNumPad = layoutInput.stride(0);
 
-        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
-        uint32_t subBlockNum = AscendC::GetSubBlockNum();
-
-        uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t rowSplitSubBlock = (qNBlockSize == 1) ?
-            (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ? (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
-        uint32_t rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;
+        const uint32_t subBlockIdx = taskPlan.subBlockIdx;
+        const uint32_t rowActualThisSubBlock = taskPlan.rowActualThisSubBlock;
+        const uint32_t rowOffsetThisSubBlock = taskPlan.rowOffsetThisSubBlock;
         uint32_t maxRowNumPerLoop = MAX_UB_S_ELEM_NUM / columnNumRound;
         uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
         rowNumTile = AscendC::Std::min(rowNumTile, FLOAT_VECTOR_SIZE);
@@ -733,8 +750,9 @@ public:
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
-        GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
+        GemmCoord actualBlockShape, const TaskPlan& taskPlan, uint32_t isFirstStackTile,
+        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod,
+        uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
         uint32_t& softmaxPingPongFlag, int64_t diagS0, bool doTriUMask, bool isSplitKV = false)
     {
         uint32_t rowNum = actualBlockShape.m();
@@ -742,15 +760,9 @@ public:
         // Preserve each mode's original S/P row alignment.
         uint32_t columnNumRound = doTriUMask ? RoundUp(columnNum, BLOCK_SIZE_IN_BYTE) : RoundUp(columnNum, BLOCK_SIZE);
         uint32_t columnNumPad = layoutInput.stride(0);
-        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
-        uint32_t subBlockNum = AscendC::GetSubBlockNum();
-
-        uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t rowSplitSubBlock = (qNBlockSize == 1) ?
-            (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ?
-            (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
-        uint32_t rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;
+        const uint32_t subBlockIdx = taskPlan.subBlockIdx;
+        const uint32_t rowActualThisSubBlock = taskPlan.rowActualThisSubBlock;
+        const uint32_t rowOffsetThisSubBlock = taskPlan.rowOffsetThisSubBlock;
 
         uint32_t maxRowNumPerLoop = MAX_UB_S_ELEM_NUM / columnNumRound;
         uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
@@ -825,8 +837,9 @@ public:
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
         const LayoutOutput &layoutOutput, const LayoutInput &layoutInput,
-        GemmCoord actualBlockShape, uint32_t isFirstStackTile, uint32_t qSBlockSize,
-        uint32_t qNBlockSize, uint32_t curStackTileMod, uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
+        GemmCoord actualBlockShape, const TaskPlan& taskPlan, uint32_t isFirstStackTile,
+        uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t curStackTileMod,
+        uint32_t taskStateSlot, Arch::CrossCoreFlag qkReady,
         uint32_t& softmaxPingPongFlag, int64_t diagS0, bool doTriUMask, bool isSplitKV,
         int64_t leftS0, bool applyLeft, bool applyRight)
     {
@@ -835,15 +848,9 @@ public:
         // Preserve each mode's original S/P row alignment.
         uint32_t columnNumRound = doTriUMask ? RoundUp(columnNum, BLOCK_SIZE_IN_BYTE) : RoundUp(columnNum, BLOCK_SIZE);
         uint32_t columnNumPad = layoutInput.stride(0);
-        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
-        uint32_t subBlockNum = AscendC::GetSubBlockNum();
-
-        uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t rowSplitSubBlock = (qNBlockSize == 1) ?
-            (qSBlockSize / 2) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t rowActualThisSubBlock = (subBlockIdx == 1) ?
-            (rowNum - rowSplitSubBlock) : rowSplitSubBlock;
-        uint32_t rowOffsetThisSubBlock = subBlockIdx * rowSplitSubBlock;
+        const uint32_t subBlockIdx = taskPlan.subBlockIdx;
+        const uint32_t rowActualThisSubBlock = taskPlan.rowActualThisSubBlock;
+        const uint32_t rowOffsetThisSubBlock = taskPlan.rowOffsetThisSubBlock;
 
         uint32_t maxRowNumPerLoop = MAX_UB_S_ELEM_NUM / columnNumRound;
         uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);

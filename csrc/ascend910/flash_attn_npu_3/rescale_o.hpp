@@ -20,6 +20,18 @@ namespace Catlass::Epilogue::Block {
 template <class OutputType_, class InputType_, class UpdateType_, class LseType_, LseModeT LSE_MODE_>
 class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, InputType_, UpdateType_, LseType_> {
   public:
+    struct TaskPlan {
+        uint32_t rowNumTile;
+        uint32_t subBlockIdx;
+        uint32_t qNSplitSubBlock;
+        uint32_t qNThisSubBlock;
+        uint32_t inRowActualThisSubBlock;
+        uint32_t inRowOffsetThisSubBlock;
+        uint32_t qSThisSubBlock;
+        uint32_t rowLoop;
+        uint32_t needRowLoop;
+    };
+
     using DispatchPolicy = EpilogueAtlasA2RescaleOT<LSE_MODE_, float>;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
@@ -99,6 +111,30 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                           LSE_STAGING_UB_OFFSET,
                       "LSE staging overlaps live DM rows");
         lseStagingUbTensor = resource.ubBuf.template GetBufferByByte<float>(LSE_STAGING_UB_OFFSET);
+    }
+
+    __aicore__ inline static TaskPlan MakeTaskPlan(uint32_t rowNum, uint32_t qSBlockSize,
+                                                   uint32_t qNBlockSize, uint32_t embedRoundV)
+    {
+        TaskPlan plan{};
+        const uint32_t maxRowNumPerLoop = MAX_UB_O_ELEM_NUM / embedRoundV;
+        plan.rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
+        plan.subBlockIdx = AscendC::GetSubBlockIdx();
+        const uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        plan.qNSplitSubBlock = qNBlockSize / subBlockNum;
+        plan.qNThisSubBlock = (qNBlockSize == 1U) ? 0U
+            : (plan.subBlockIdx == 1U ? qNBlockSize - plan.qNSplitSubBlock : plan.qNSplitSubBlock);
+        const uint32_t inRowSplitSubBlock = (qNBlockSize == 1U)
+            ? qSBlockSize / subBlockNum : qSBlockSize * plan.qNSplitSubBlock;
+        plan.inRowActualThisSubBlock = (plan.subBlockIdx == 1U)
+            ? rowNum - inRowSplitSubBlock : inRowSplitSubBlock;
+        plan.inRowOffsetThisSubBlock = plan.subBlockIdx * inRowSplitSubBlock;
+        plan.qSThisSubBlock = (qNBlockSize == 1U)
+            ? plan.inRowActualThisSubBlock : qSBlockSize;
+        plan.rowLoop = plan.inRowActualThisSubBlock == 0U
+            ? 0U : CeilDiv(plan.inRowActualThisSubBlock, plan.rowNumTile);
+        plan.needRowLoop = plan.rowLoop > 1U ? 1U : 0U;
+        return plan;
     }
 
     __aicore__ inline void SetMask(int32_t len)
@@ -250,6 +286,38 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
         }
     }
 
+    __aicore__ inline void CopyLseToGm(AscendC::GlobalTensor<ElementLse> gLse, const LayoutLse& layoutLse,
+                                       uint32_t qNThisSubBlock, uint32_t qSThisSubBlock, uint32_t totalRowNum,
+                                       const SplitKVParams& splitParams)
+    {
+        const uint32_t headCount = qNThisSubBlock == 0U ? 1U : qNThisSubBlock;
+        const uint32_t rowsPerHead = qNThisSubBlock == 0U ? totalRowNum : qSThisSubBlock;
+        uint32_t headStride = layoutLse.stride(0);
+        uint32_t tokenGapBytes = 0U;
+        if (splitParams.isSplitkv) {
+            gLse = splitParams.gCombineLse;
+            headStride = 1U;
+            tokenGapBytes = (splitParams.layoutgmLse->shape(1) - 1U) * sizeof(float);
+        }
+        if (!splitParams.isSplitkv && (headCount == 1U || headStride == rowsPerHead)) {
+            AscendC::DataCopyPad(gLse, lseStagingUbTensor,
+                                 AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
+            return;
+        }
+
+        // Brcb already stores each LSE scalar in its own 32-byte UB block.
+        // Four-byte copies consume one such source block per token, including
+        // unaligned head lengths, without staging through GM for UB alignment.
+        uint32_t sourceOffset = FLOAT_VECTOR_SIZE;
+        uint64_t gmOffset = 0U;
+        for (uint32_t head = 0U; head < headCount; ++head) {
+            AscendC::DataCopyPad(gLse[gmOffset], lseStagingUbTensor[sourceOffset],
+                                 AscendC::DataCopyExtParams(rowsPerHead, sizeof(float), 0, tokenGapBytes, 0));
+            sourceOffset += rowsPerHead * FLOAT_BLOCK_SIZE;
+            gmOffset += headStride;
+        }
+    }
+
     __aicore__ inline
     void SubCoreCompute(
         AscendC::GlobalTensor<ElementOutput> gOutput,
@@ -343,17 +411,14 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
             // These values describe only the final GM writeback layout. Keeping
             // them out of non-final stack iterations reduces steady-loop scalar
             // work and avoids carrying dead arguments through every call.
-            uint32_t qSBlockSize = layoutOutput.shape(0);
             uint32_t oHiddenSize = layoutOutput.shape(1);
             uint32_t proTokenIdx = rowOffsetLoop % qSThisSubBlock;
             uint32_t proTokenNum = AscendC::Std::min(curRowNum, (qSThisSubBlock - proTokenIdx)) % qSThisSubBlock;
             uint32_t integralHeadNum = (curRowNum - proTokenNum) / qSThisSubBlock;
             uint32_t epiTokenNum = curRowNum - proTokenNum - integralHeadNum * qSThisSubBlock;
             uint32_t oHiddenSize_gmlo = 0;
-            uint32_t qHeads_gmlse = 0;
             if (splitParams.isSplitkv) {
                 oHiddenSize_gmlo = splitParams.layoutgmLo->shape(1);
-                qHeads_gmlse = splitParams.layoutgmLse->shape(1);
             }
             // *** gl_block = expand_to_block(gl)
             AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
@@ -395,31 +460,26 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                         AscendC::UnaryRepeatParams(1, 1, 4, 8));
                 }
             }
-            uint32_t rowStart = qSBlockIdx * VECTOR_SIZE + rowOffsetCurLoop;
-            uint32_t subBlockStart = (qNThisSubBlock == 0U)
-                                         ? rowStart
-                                         : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
-            if (!splitParams.isSplitkv) {
-                if (qNThisSubBlock == 0U) {
-                    ClearInvalidOutputRows(0U, rowStart, curRowNum, invalidSuffixStartRow, invalidPrefixEndRow, qSeqlen,
-                                           embedRound);
-                } else {
-                    uint32_t innerGOUbRowOffset = 0U;
-                    uint32_t qBlockStart = qSBlockIdx * VECTOR_SIZE;
-                    if (proTokenNum != 0U) {
-                        ClearInvalidOutputRows(innerGOUbRowOffset, subBlockStart, proTokenNum, invalidSuffixStartRow,
-                                               invalidPrefixEndRow, qSeqlen, embedRound);
-                        innerGOUbRowOffset += proTokenNum;
-                    }
-                    for (uint32_t qNIdx = 0U; qNIdx < integralHeadNum; qNIdx++) {
-                        ClearInvalidOutputRows(innerGOUbRowOffset, qBlockStart, qSThisSubBlock, invalidSuffixStartRow,
-                                               invalidPrefixEndRow, qSeqlen, embedRound);
-                        innerGOUbRowOffset += qSThisSubBlock;
-                    }
-                    if (epiTokenNum != 0U) {
-                        ClearInvalidOutputRows(innerGOUbRowOffset, qBlockStart, epiTokenNum, invalidSuffixStartRow,
-                                               invalidPrefixEndRow, qSeqlen, embedRound);
-                    }
+            const bool hasInvalidRows = invalidSuffixStartRow > 0 ||
+                (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != static_cast<int32_t>(qSeqlen));
+            if (!splitParams.isSplitkv && hasInvalidRows) {
+                // Keep one inline clear body for the initial fragment, complete
+                // heads and final fragment. Reuse the existing segmentation.
+                const uint32_t qBlockStart = qSBlockIdx * VECTOR_SIZE;
+                const uint32_t rowStart = qBlockStart + rowOffsetCurLoop;
+                const uint32_t subBlockStart = qNThisSubBlock == 0U ? rowStart
+                    : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+                uint32_t tokenStart = qNThisSubBlock == 0U ? rowStart
+                    : (proTokenNum != 0U ? subBlockStart : qBlockStart);
+                uint32_t clearRows = qNThisSubBlock == 0U ? curRowNum
+                    : (proTokenNum != 0U ? proTokenNum : AscendC::Std::min(curRowNum, qSThisSubBlock));
+                uint32_t sourceRow = 0U;
+                while (sourceRow < curRowNum) {
+                    ClearInvalidOutputRows(sourceRow, tokenStart, clearRows, invalidSuffixStartRow,
+                                           invalidPrefixEndRow, qSeqlen, embedRound);
+                    sourceRow += clearRows;
+                    tokenStart = qBlockStart;
+                    clearRows = AscendC::Std::min(curRowNum - sourceRow, qSThisSubBlock);
                 }
             }
 
@@ -460,51 +520,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
 
-                    if (splitParams.isSplitkv) {
-                        // isSplitkv: per-head strided write to token-major gCombineLse. UNCHANGED.
-                        if (qNThisSubBlock == 0U) {
-                            AscendC::DataCopyPad(splitParams.gCombineLse, lseBroadcastUbTensor,
-                                                 AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0,
-                                                                            (qHeads_gmlse - 1) * sizeof(float), 0));
-                        } else {
-                            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                                AscendC::DataCopyPad(splitParams.gCombineLse[qNIdx],
-                                                     lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
-                                                     AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0,
-                                                                                (qHeads_gmlse - 1) * sizeof(float), 0));
-                            }
-                        }
-                    } else {
-                        // BNS/single-batch NT heads are contiguous; multi-batch NT strides by total tokens.
-                        uint32_t lseHeadCount = (qNThisSubBlock == 0U) ? 1U : qNThisSubBlock;
-                        uint32_t lseSeqLen = totalRowNum / lseHeadCount;
-                        uint32_t lseHeadStrideGm = layoutLse.stride(0);
-                        bool isLseContiguous = (lseHeadCount == 1U) || (lseHeadStrideGm == lseSeqLen);
-                        if (isLseContiguous) {
-                            AscendC::DataCopyPad(gLse, lseUbTensor,
-                                                 AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
-                        } else if (lseSeqLen % FLOAT_BLOCK_SIZE == 0U) {
-                            AscendC::DataCopyPad(
-                                gLse, lseUbTensor,
-                                AscendC::DataCopyExtParams(lseHeadCount, lseSeqLen * sizeof(float), 0,
-                                                           (lseHeadStrideGm - lseSeqLen) * sizeof(float), 0));
-                        } else {
-                            AscendC::DataCopyPad(gUpdate, lseUbTensor,
-                                                 AscendC::DataCopyExtParams(1, totalRowNum * sizeof(float), 0, 0, 0));
-                            AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-                            AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID1);
-                            AscendC::DataCopyPad(
-                                lseStagingUbTensor, gUpdate,
-                                AscendC::DataCopyExtParams(lseHeadCount, qSBlockSize * sizeof(float), 0, 0, 0),
-                                AscendC::DataCopyPadExtParams<ElementLse>());
-                            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE3>(EVENT_ID0);
-                            AscendC::DataCopyPad(
-                                gLse, lseStagingUbTensor,
-                                AscendC::DataCopyExtParams(lseHeadCount, qSBlockSize * sizeof(float), 0,
-                                                           (lseHeadStrideGm - qSBlockSize) * sizeof(float), 0));
-                        }
-                    }
+                    CopyLseToGm(gLse, layoutLse, qNThisSubBlock, qSThisSubBlock, totalRowNum, splitParams);
                 }
             } else {
                 // FD SplitKV must still write partial LSE even when LSE_MODE != OUT_ONLY,
@@ -529,18 +545,7 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                         AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                         AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
 
-                        if (qNThisSubBlock == 0U) {
-                            AscendC::DataCopyPad(splitParams.gCombineLse, lseBroadcastUbTensor,
-                                                 AscendC::DataCopyExtParams(totalRowNum, sizeof(float), 0,
-                                                                            (qHeads_gmlse - 1) * sizeof(float), 0));
-                        } else {
-                            for (uint32_t qNIdx = 0; qNIdx < qNThisSubBlock; qNIdx++) {
-                                AscendC::DataCopyPad(splitParams.gCombineLse[qNIdx],
-                                                     lseBroadcastUbTensor[qNIdx * qSBlockSize * FLOAT_BLOCK_SIZE],
-                                                     AscendC::DataCopyExtParams(qSBlockSize, sizeof(float), 0,
-                                                                                (qHeads_gmlse - 1) * sizeof(float), 0));
-                            }
-                        }
+                        CopyLseToGm(gLse, layoutLse, qNThisSubBlock, qSThisSubBlock, totalRowNum, splitParams);
                     }
                 }
             }
@@ -552,7 +557,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
     operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
                AscendC::GlobalTensor<ElementUpdate> gUpdate, AscendC::GlobalTensor<ElementLse> gLse,
                const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutUpdate& layoutUpdate,
-               const LayoutLse& layoutLse, GemmCoord actualBlockShape, Arch::CrossCoreFlag pvReady,
+               const LayoutLse& layoutLse, GemmCoord actualBlockShape, const TaskPlan& taskPlan,
+               Arch::CrossCoreFlag pvReady,
                uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t isFirstStackTile, uint32_t isLastStackTile,
                uint32_t curStackTileMod, uint32_t taskStateSlot, const SplitKVParams& splitParams,
                int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx,
@@ -560,25 +566,16 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t embed = actualBlockShape.n();
-        uint32_t embedRoundV = (layoutInput.stride(0) == 0) ? BLOCK_SIZE : layoutInput.stride(0);
-        uint32_t maxRowNumPerLoop = MAX_UB_O_ELEM_NUM / embedRoundV;
-        uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
-
-        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
-        uint32_t subBlockNum = AscendC::GetSubBlockNum();
-
-        uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t qNThisSubBlock = (qNBlockSize == 1U)   ? 0
-                                  : (subBlockIdx == 1U) ? (qNBlockSize - qNSplitSubBlock)
-                                                        : qNSplitSubBlock;
-        uint32_t inRowSplitSubBlock =
-            (qNBlockSize == 1U) ? (qSBlockSize / subBlockNum) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t inRowActualThisSubBlock = (subBlockIdx == 1U) ? (rowNum - inRowSplitSubBlock) : inRowSplitSubBlock;
-        uint32_t inRowOffsetThisSubBlock = subBlockIdx * inRowSplitSubBlock;
+        const uint32_t rowNumTile = taskPlan.rowNumTile;
+        const uint32_t subBlockIdx = taskPlan.subBlockIdx;
+        const uint32_t qNSplitSubBlock = taskPlan.qNSplitSubBlock;
+        const uint32_t qNThisSubBlock = taskPlan.qNThisSubBlock;
+        const uint32_t inRowActualThisSubBlock = taskPlan.inRowActualThisSubBlock;
+        const uint32_t inRowOffsetThisSubBlock = taskPlan.inRowOffsetThisSubBlock;
         uint32_t outRowOffsetThisSubBlock = (qNBlockSize == 1U) ? inRowOffsetThisSubBlock : 0;
         uint32_t outHeadOffsetThisSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock;
         uint32_t outColOffsetThisSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock * embed;
-        uint32_t qSThisSubBlock = (qNBlockSize == 1U) ? inRowActualThisSubBlock : qSBlockSize;
+        uint32_t qSThisSubBlock = taskPlan.qSThisSubBlock;
         // Rows step by the token stride, heads by the per-head plane pitch (BSND:
         // qHeads*embedV / embedV; BNSD: embedV / S_alloc*embedV).
         int64_t outOffsetSubBlock = static_cast<int64_t>(outRowOffsetThisSubBlock) * outputStride +
@@ -620,8 +617,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
         }
 
         if (inRowActualThisSubBlock > 0U) {
-            uint32_t rowLoop = CeilDiv(inRowActualThisSubBlock, rowNumTile);
-            uint32_t needRowLoop = (rowLoop > 1U) ? 1 : 0;
+            uint32_t rowLoop = taskPlan.rowLoop;
+            uint32_t needRowLoop = taskPlan.needRowLoop;
 
             // The rows of each cycle consist of multiple heads with several tokens.
             // There are several integral heads, one prologue head, one epilogue head.
