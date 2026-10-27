@@ -20,6 +20,18 @@ namespace Catlass::Epilogue::Block {
 template <class OutputType_, class InputType_, class UpdateType_, class LseType_, LseModeT LSE_MODE_>
 class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, InputType_, UpdateType_, LseType_> {
   public:
+    struct TaskPlan {
+        uint32_t rowNumTile;
+        uint32_t subBlockIdx;
+        uint32_t qNSplitSubBlock;
+        uint32_t qNThisSubBlock;
+        uint32_t inRowActualThisSubBlock;
+        uint32_t inRowOffsetThisSubBlock;
+        uint32_t qSThisSubBlock;
+        uint32_t rowLoop;
+        uint32_t needRowLoop;
+    };
+
     using DispatchPolicy = EpilogueAtlasA2RescaleOT<LSE_MODE_, float>;
     using ArchTag = typename DispatchPolicy::ArchTag;
 
@@ -71,6 +83,30 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
     __aicore__ inline BlockEpilogue() {}
 
     __aicore__ inline ~BlockEpilogue() {}
+
+    __aicore__ inline static TaskPlan MakeTaskPlan(uint32_t rowNum, uint32_t qSBlockSize,
+                                                   uint32_t qNBlockSize, uint32_t embedRoundV)
+    {
+        TaskPlan plan{};
+        const uint32_t maxRowNumPerLoop = MAX_UB_O_ELEM_NUM / embedRoundV;
+        plan.rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
+        plan.subBlockIdx = AscendC::GetSubBlockIdx();
+        const uint32_t subBlockNum = AscendC::GetSubBlockNum();
+        plan.qNSplitSubBlock = qNBlockSize / subBlockNum;
+        plan.qNThisSubBlock = (qNBlockSize == 1U) ? 0U
+            : (plan.subBlockIdx == 1U ? qNBlockSize - plan.qNSplitSubBlock : plan.qNSplitSubBlock);
+        const uint32_t inRowSplitSubBlock = (qNBlockSize == 1U)
+            ? qSBlockSize / subBlockNum : qSBlockSize * plan.qNSplitSubBlock;
+        plan.inRowActualThisSubBlock = (plan.subBlockIdx == 1U)
+            ? rowNum - inRowSplitSubBlock : inRowSplitSubBlock;
+        plan.inRowOffsetThisSubBlock = plan.subBlockIdx * inRowSplitSubBlock;
+        plan.qSThisSubBlock = (qNBlockSize == 1U)
+            ? plan.inRowActualThisSubBlock : qSBlockSize;
+        plan.rowLoop = plan.inRowActualThisSubBlock == 0U
+            ? 0U : CeilDiv(plan.inRowActualThisSubBlock, plan.rowNumTile);
+        plan.needRowLoop = plan.rowLoop > 1U ? 1U : 0U;
+        return plan;
+    }
 
     __aicore__ inline void init(Arch::Resource<ArchTag>& resource)
     {
@@ -546,7 +582,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
     operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
                AscendC::GlobalTensor<ElementUpdate> gUpdate, AscendC::GlobalTensor<ElementLse> gLse,
                const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutUpdate& layoutUpdate,
-               const LayoutLse& layoutLse, GemmCoord actualBlockShape, Arch::CrossCoreFlag pvReady,
+               const LayoutLse& layoutLse, GemmCoord actualBlockShape, const TaskPlan& taskPlan,
+               Arch::CrossCoreFlag pvReady,
                uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t isFirstStackTile, uint32_t isLastStackTile,
                uint32_t curStackTileMod, uint32_t taskStateSlot, const SplitKVParams& splitParams,
                int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx,
@@ -554,25 +591,16 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t embed = actualBlockShape.n();
-        uint32_t embedRoundV = (layoutInput.stride(0) == 0) ? BLOCK_SIZE : layoutInput.stride(0);
-        uint32_t maxRowNumPerLoop = MAX_UB_O_ELEM_NUM / embedRoundV;
-        uint32_t rowNumTile = RoundDown(maxRowNumPerLoop, FLOAT_BLOCK_SIZE);
-
-        uint32_t subBlockIdx = AscendC::GetSubBlockIdx();
-        uint32_t subBlockNum = AscendC::GetSubBlockNum();
-
-        uint32_t qNSplitSubBlock = qNBlockSize / subBlockNum;
-        uint32_t qNThisSubBlock = (qNBlockSize == 1U)   ? 0
-                                  : (subBlockIdx == 1U) ? (qNBlockSize - qNSplitSubBlock)
-                                                        : qNSplitSubBlock;
-        uint32_t inRowSplitSubBlock =
-            (qNBlockSize == 1U) ? (qSBlockSize / subBlockNum) : (qSBlockSize * qNSplitSubBlock);
-        uint32_t inRowActualThisSubBlock = (subBlockIdx == 1U) ? (rowNum - inRowSplitSubBlock) : inRowSplitSubBlock;
-        uint32_t inRowOffsetThisSubBlock = subBlockIdx * inRowSplitSubBlock;
+        const uint32_t rowNumTile = taskPlan.rowNumTile;
+        const uint32_t subBlockIdx = taskPlan.subBlockIdx;
+        const uint32_t qNSplitSubBlock = taskPlan.qNSplitSubBlock;
+        const uint32_t qNThisSubBlock = taskPlan.qNThisSubBlock;
+        const uint32_t inRowActualThisSubBlock = taskPlan.inRowActualThisSubBlock;
+        const uint32_t inRowOffsetThisSubBlock = taskPlan.inRowOffsetThisSubBlock;
         uint32_t outRowOffsetThisSubBlock = (qNBlockSize == 1U) ? inRowOffsetThisSubBlock : 0;
         uint32_t outHeadOffsetThisSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock;
         uint32_t outColOffsetThisSubBlock = (qNBlockSize == 1U) ? 0 : subBlockIdx * qNSplitSubBlock * embed;
-        uint32_t qSThisSubBlock = (qNBlockSize == 1U) ? inRowActualThisSubBlock : qSBlockSize;
+        uint32_t qSThisSubBlock = taskPlan.qSThisSubBlock;
         // Rows step by the token stride, heads by the per-head plane pitch (BSND:
         // qHeads*embedV / embedV; BNSD: embedV / S_alloc*embedV).
         int64_t outOffsetSubBlock = static_cast<int64_t>(outRowOffsetThisSubBlock) * outputStride +
@@ -614,8 +642,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
         }
 
         if (inRowActualThisSubBlock > 0U) {
-            uint32_t rowLoop = CeilDiv(inRowActualThisSubBlock, rowNumTile);
-            uint32_t needRowLoop = (rowLoop > 1U) ? 1 : 0;
+            uint32_t rowLoop = taskPlan.rowLoop;
+            uint32_t needRowLoop = taskPlan.needRowLoop;
 
             // The rows of each cycle consist of multiple heads with several tokens.
             // There are several integral heads, one prologue head, one epilogue head.
