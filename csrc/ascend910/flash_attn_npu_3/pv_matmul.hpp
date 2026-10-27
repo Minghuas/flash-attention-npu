@@ -17,6 +17,7 @@
 #include "catlass/gemm/tile/tile_mmad.hpp"
 #include "fa_block.h"
 #include "kernel_common.hpp"
+#include "copy_l1_to_l0.hpp"
 
 namespace Catlass::Gemm::Block {
 
