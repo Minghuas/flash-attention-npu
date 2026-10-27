@@ -373,6 +373,10 @@ class FAInferKernel {
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 
         epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL ||
+                      MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+            epilogueOnlineSoftmax.InitArithMask(resource);
+        }
         epilogueRescaleO.init(resource);
 
         coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
@@ -584,6 +588,10 @@ class FAInferKernel {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL ||
+                      MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+            epilogueOnlineSoftmax.ReleaseArithMaskEvents();
+        }
 #endif
         AscendC::PipeBarrier<PIPE_ALL>();
 
@@ -612,7 +620,6 @@ class FAInferKernel {
         auto& gQ = globalTensors.gQ;
         auto& gK = globalTensors.gK;
         auto& gV = globalTensors.gV;
-        auto& gMask = globalTensors.gMask;
         auto& gBlockTable = globalTensors.gBlockTable;
         auto& gActualQseqlen = globalTensors.gActualQseqlen;
         auto& gActualKvseqlen = globalTensors.gActualKvseqlen;
@@ -745,8 +752,6 @@ class FAInferKernel {
         bool notNextMask = true;
         int32_t invalidSuffixStartRow = 0;     // 0 disables suffix clearing.
         int32_t invalidPrefixEndRow = qSeqlen; // qSeqlen disables prefix clearing.
-        bool startsWithMaskTile = false;
-        bool startsWithMaskThenNomaskFlag = false;
         if (maskType == 1U) {
             int64_t diffS = static_cast<int64_t>(kvSeqlen) - static_cast<int64_t>(qSeqlen);
             int64_t causalKvEnd = static_cast<int64_t>((qSBlockIdx + 1U) * curQSBlockTile) + diffS;
@@ -936,51 +941,17 @@ class FAInferKernel {
 #endif
 #ifdef __DAV_C220_VEC__
                 LayoutP layOutP(rowNum, desc.stackSeqTile, stackSeqTilePad);
-                LayoutMask layOutMask(COMP_TRIU_MASK_DIM_LEN, COMP_TRIU_MASK_DIM_LEN);
                 uint64_t gmOffsetP = gmOffsetS;
                 uint32_t kvSStartIdx = isAppendBlock ? kvSeqlenOld + kvSIdxLocal * kvStackLen : kvSIdx * kvStackLen;
                 uint32_t kvSEndIdx = kvSStartIdx + desc.stackSeqTile;
                 if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL) {
                     int64_t triUp = static_cast<int64_t>(noSkipKvS) - static_cast<int64_t>(qSBlockSize);
-                    uint32_t triDown = static_cast<uint32_t>(noSkipKvS);
                     bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1U);
-                    if (doTriUMask) {
-                        if constexpr (FLASH_DECODE_FLAG) {
-                            epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
-                                                  actualBlockShapeQK, softmaxTaskPlan, desc.firstStack, qSBlockSize, qNBlockSize,
-                                                  curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                                  triUp, triDown, kvSStartIdx, kvSEndIdx, isSplitKV);
-                        } else {
-                            epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
-                                                  actualBlockShapeQK, softmaxTaskPlan, desc.firstStack, qSBlockSize, qNBlockSize,
-                                                  curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                                  triUp, triDown, kvSStartIdx, kvSEndIdx, false);
-                        }
-                    } else {
-                        uint32_t lastNoMaskTile;
-                        if (triUp + 1U == kvSeqlen) {
-                            lastNoMaskTile = kvSLoopNumTotal - 1U;
-                        } else if (triUp + 1U == kvSeqlenOld) {
-                            lastNoMaskTile = kvStartOld - 1U;
-                        } else if (triUp + 1U < kvSeqlenOld) {
-                            lastNoMaskTile = (triUp + 1U) / kvStackLen - 1U;
-                        } else {
-                            lastNoMaskTile = kvStartOld + (triUp + 1U - kvSeqlenOld) / kvStackLen - 1U;
-                        }
-                        int32_t lastNoMaskStackId;
-                        if constexpr (FLASH_DECODE_FLAG) {
-                            lastNoMaskStackId = (int32_t)lastNoMaskTile - (int32_t)kvStart;
-                            epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK, softmaxTaskPlan,
-                                                  desc.firstStack, (stackSeqCount == lastNoMaskStackId), qSBlockSize,
-                                                  qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
-                                                  softmaxPingPongFlag, isSplitKV, false, false);
-                        } else {
-                            epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK, softmaxTaskPlan,
-                                                  desc.firstStack, (stackSeqCount == lastNoMaskTile), qSBlockSize,
-                                                  qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
-                                                  softmaxPingPongFlag, false, false, false);
-                        }
-                    }
+                    int64_t diagS0 = triUp - static_cast<int64_t>(kvSStartIdx);
+                    epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
+                                          softmaxTaskPlan, desc.firstStack, qSBlockSize,
+                                          curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
+                                          diagS0, doTriUMask, isSplitKV);
                 } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
                     // StartLen can be negative when Sq>>Sk; compare in int32 so
                     // it is not promoted against uint32 kvSStartIdx/kvSEndIdx.
@@ -998,30 +969,14 @@ class FAInferKernel {
                             : (windowSizeRightStartLen >= kvStartI && windowSizeRightStartLen < kvEndI) ||
                                   (windowSizeRightEndLen > kvStartI && windowSizeRightEndLen <= kvEndI) ||
                                   (windowSizeRightStartLen <= kvStartI && windowSizeRightEndLen >= kvEndI);
-                    bool doTriUMask = (doTriUPreMask || doTriUNextMask);
-                    if (doTriUMask) {
-                        startsWithMaskTile = true;
-                        startsWithMaskThenNomaskFlag = true;
-                        epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
-                                              actualBlockShapeQK, softmaxTaskPlan, desc.firstStack, qSBlockSize, qNBlockSize,
-                                              curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                              kvSStartIdx, doTriUPreMask, doTriUNextMask, windowSizeLeftStartLen,
-                                              windowSizeLeftEndLen, windowSizeRightStartLen, windowSizeRightEndLen,
-                                              FLASH_DECODE_FLAG ? isSplitKV : false);
-                    } else {
-                        bool isLastNoMaskStackTile =
-                            (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
-                        uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
-                        uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile ? RoundUp(kvSeqlenLimit, kvStackLen)
-                                                                              : RoundDown(kvSeqlenLimit, kvStackLen);
-                        uint32_t noMaskStackSeqNum = (alignedKvSeqlenLimit - kvStart * kvStackLen) / kvStackLen;
-                        epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK, softmaxTaskPlan,
-                                              desc.firstStack, (stackSeqCount == noMaskStackSeqNum - 1), qSBlockSize,
-                                              qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
-                                              softmaxPingPongFlag, FLASH_DECODE_FLAG ? isSplitKV : false,
-                                              startsWithMaskTile, startsWithMaskThenNomaskFlag);
-                        startsWithMaskTile = false;
-                    }
+                    bool doTriUMask = doTriUPreMask || doTriUNextMask;
+                    int64_t leftS0 = static_cast<int64_t>(windowSizeLeftStartLen) - kvSStartIdx;
+                    int64_t rightS0 = static_cast<int64_t>(windowSizeRightStartLen) - kvSStartIdx;
+                    epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
+                                          softmaxTaskPlan, desc.firstStack, qSBlockSize,
+                                          curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
+                                          rightS0, doTriUMask, isSplitKV,
+                                          leftS0, doTriUPreMask, doTriUNextMask);
                 } else {
                     if constexpr (FLASH_DECODE_FLAG) {
                         epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK, softmaxTaskPlan,
