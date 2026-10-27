@@ -5,7 +5,6 @@
 
 #include "aicpu_api.h"
 #include "fa_metadata_args.h"
-#include "fa_task_schedule.h"
 #include "fa_split.h"
 #include "tilingdata.h"
 #include <cstdint>
@@ -34,188 +33,7 @@ inline uint32_t GetQNBlockTile(uint32_t qSeqlen, uint32_t groupSize)
     return qNBlockTile;
 }
 
-inline void InitSchedulerHeader(SchedulerHeader& header, uint32_t coreNum)
-{
-    std::memset(&header, 0, sizeof(SchedulerHeader));
-    header.version = fa_metadata::TASK_METADATA_VERSION;
-    header.coreNum = coreNum;
-    header.status = fa_metadata::TASK_METADATA_OK;
-}
-
-inline void BuildAppendPlan(AppendPlan& plan, const fa_split::BatchParams& p,
-                            const fa_split::SplitContext& ctx);
-inline void BuildAddressPlan(AddressPlan& plan, uint32_t batchIdx, const FAMetadataArgs& args,
-                             const fa_split::SplitContext& ctx, uint32_t totalQTokens,
-                             uint32_t qPrefix, uint32_t kvPrefix);
-
-inline bool BuildPlans(BatchPlan* plans, HeadPlan* headPlans, uint8_t* maskPlanData,
-                       AppendPlan* appendPlans, AddressPlan* addressPlans,
-                       uint32_t batch, uint32_t groupSize, uint32_t maskType,
-                       int64_t windowLeft, int64_t windowRight, const FAMetadataArgs& args,
-                       const fa_split::SplitContext& ctx, uint32_t totalQTokens,
-                       uint32_t headCapacity, uint32_t maskCapacity,
-                       uint32_t& headPlanBase, uint32_t& maskPlanBase)
-{
-    uint32_t qPrefix = 0;
-    uint32_t kvPrefix = 0;
-    for (uint32_t b = 0; b < batch; ++b) {
-        const fa_split::BatchParams p = fa_split::getBatchParams(b, groupSize, ctx);
-        const uint32_t batchMaskCount = maskType == 0U ? 0U : p.curQSBlockNum;
-        if (p.curQNBlockNum > headCapacity - headPlanBase ||
-            batchMaskCount > maskCapacity - maskPlanBase) return false;
-        BatchPlan& plan = plans[b];
-        std::memset(&plan, 0, sizeof(BatchPlan));
-        plan.qSeqlen = p.qSeqlen;
-        plan.kvSeqlen = p.kvSeqlen;
-        plan.qNBlockTile = p.curQNBlockTile;
-        plan.qNBlockNum = p.curQNBlockNum;
-        plan.qSBlockTile = p.curQSBlockTile;
-        plan.qSBlockNum = p.curQSBlockNum;
-        plan.kSBlockNum = p.curKSBlockNum;
-        plan.headPlanBase = headPlanBase;
-        plan.maskPlanBase = maskPlanBase;
-        for (uint32_t n = 0; n < p.curQNBlockNum; ++n) {
-            const uint32_t nInGroup = n % p.qNBlockNumPerGroup;
-            const uint32_t kvHead = n / p.qNBlockNumPerGroup;
-            HeadPlan& head = headPlans[headPlanBase + n];
-            head.qNStart = kvHead * groupSize + nInGroup * p.curQNBlockTile;
-            head.qNSize = nInGroup + 1 == p.qNBlockNumPerGroup
-                ? groupSize - nInGroup * p.curQNBlockTile
-                : p.curQNBlockTile;
-            head.kvHeadOffset = kvHead;
-        }
-        headPlanBase += p.curQNBlockNum;
-        const uint32_t maskStride = fa_metadata::MaskPlanStride(maskType);
-        for (uint32_t s = 0; s < batchMaskCount; ++s) {
-            const uint32_t qSSize = s + 1 == p.curQSBlockNum
-                ? p.qSeqlen - s * p.curQSBlockTile : p.curQSBlockTile;
-            const MaskPlan value = fa_metadata::BuildMaskPlan(
-                p.qSeqlen, p.kvSeqlen, s, p.curQSBlockTile, qSSize, maskType,
-                windowLeft, windowRight);
-            uint8_t* slot = maskPlanData + static_cast<uint64_t>(maskPlanBase + s) * maskStride;
-            if (maskType == 1U) {
-                *reinterpret_cast<CausalMaskPlan*>(slot) = value.causal;
-            } else {
-                *reinterpret_cast<SwaMaskPlan*>(slot) = value.swa;
-            }
-        }
-        maskPlanBase += batchMaskCount;
-        BuildAppendPlan(appendPlans[b], p, ctx);
-        BuildAddressPlan(addressPlans[b], b, args, ctx, totalQTokens, qPrefix, kvPrefix);
-        qPrefix += p.qSeqlen;
-        if (ctx.seqlens_k_cpu != nullptr) kvPrefix += static_cast<uint32_t>(ctx.seqlens_k_cpu[b]);
-    }
-    return true;
-}
-
-inline void BuildAppendPlan(AppendPlan& plan, const fa_split::BatchParams& p,
-                            const fa_split::SplitContext& ctx)
-{
-    const uint32_t kvNewSeqlen = ctx.kvNewSeqlen > 0 ? static_cast<uint32_t>(ctx.kvNewSeqlen) : 0U;
-    const uint32_t kvSeqlenOld = p.kvSeqlen - kvNewSeqlen;
-    plan.kvSeqlenOld = kvSeqlenOld;
-    plan.kvStartOld = kvNewSeqlen == 0U ? 0U :
-        (kvSeqlenOld + fa_split::MAX_KV_STACK_LEN - 1) / fa_split::MAX_KV_STACK_LEN;
-    plan.kvLoopNumTotalNew = kvNewSeqlen == 0U ? 0U :
-        (kvNewSeqlen + fa_split::MAX_KV_STACK_LEN - 1) / fa_split::MAX_KV_STACK_LEN;
-    plan.kvNewSeqlen = kvNewSeqlen;
-    plan.flags = kvNewSeqlen != 0U ? fa_metadata::APPEND_PLAN_ENABLED : 0U;
-    plan.reserved[0] = 0;
-    plan.reserved[1] = 0;
-    plan.reserved[2] = 0;
-}
-
-inline void BuildAddressPlan(AddressPlan& plan, uint32_t batchIdx, const FAMetadataArgs& args,
-                             const fa_split::SplitContext& ctx, uint32_t totalQTokens,
-                             uint32_t qPrefix, uint32_t kvPrefix)
-{
-    const uint64_t qStride = static_cast<uint64_t>(args.numHeads) * args.embeddingSize;
-    const uint64_t oStride = static_cast<uint64_t>(args.numHeads) * args.embeddingSizeV;
-    const uint64_t kStride = static_cast<uint64_t>(args.numHeadsK) * args.embeddingSize;
-    const uint64_t vStride = static_cast<uint64_t>(args.numHeadsK) * args.embeddingSizeV;
-    const auto* cuQ = reinterpret_cast<const int32_t*>(args.cuSeqlensQAddr);
-    const auto* cuK = reinterpret_cast<const int32_t*>(args.cuSeqlensKAddr);
-    const bool append = args.kvNewSeqlen != 0U;
-    const uint32_t qBase = args.isVarlen != 0U
-        ? (cuQ != nullptr ? static_cast<uint32_t>(cuQ[batchIdx]) : qPrefix)
-        : batchIdx * args.maxQSeqlen;
-    const uint32_t kvBase = append ? batchIdx * args.kvCacheSeqlen
-        : (cuK != nullptr ? static_cast<uint32_t>(cuK[batchIdx]) : kvPrefix);
-    plan.qBOffset = static_cast<uint64_t>(qBase) * qStride;
-    plan.oBOffset = static_cast<uint64_t>(qBase) * oStride;
-    plan.kBOffset = args.pagedKV != 0U ? 0U : static_cast<uint64_t>(kvBase) * kStride;
-    plan.vBOffset = args.pagedKV != 0U ? 0U : static_cast<uint64_t>(kvBase) * vStride;
-    plan.lseBOffset = args.isVarlen != 0U
-        ? qBase : static_cast<uint64_t>(qBase) * args.numHeads;
-    plan.blockBOffset = args.pagedKV != 0U
-        ? static_cast<uint64_t>(batchIdx) * args.maxNumBlocksPerBatch : 0U;
-    plan.kNewBOffset = static_cast<uint64_t>(batchIdx) * args.kvNewSeqlen * kStride;
-    plan.vNewBOffset = static_cast<uint64_t>(batchIdx) * args.kvNewSeqlen * vStride;
-    plan.lseHeadStride = args.isVarlen != 0U ? totalQTokens : args.maxQSeqlen;
-}
-
-inline bool BuildSchedulerTasks(FAMetadataArgs* metaArgs, FAInferTilingData* tilingData,
-                                const fa_split::SplitContext& ctx, uint32_t groupSize,
-                                uint32_t totalQTokens)
-{
-    auto* metaBase = reinterpret_cast<uint8_t*>(metaArgs->metaOutAddr);
-    auto* header = reinterpret_cast<SchedulerHeader*>(metaBase + fa_metadata::SchedulerHeaderOffset());
-    auto* ranges = reinterpret_cast<CoreTaskRange*>(metaBase + fa_metadata::CoreRangeOffset());
-    InitSchedulerHeader(*header, metaArgs->blockDim);
-    header->flashDecodeFlag = tilingData->flashDecodeFlag;
-    header->batchPlanOffset = fa_metadata::BatchPlanOffset(
-        metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
-        metaArgs->taskCapacityFactor);
-    header->batchPlanBytes = static_cast<uint64_t>(metaArgs->batch) * sizeof(BatchPlan);
-    header->batchPlanCount = metaArgs->batch;
-    header->headPlanOffset = fa_metadata::HeadPlanOffset(
-        metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
-        metaArgs->taskCapacityFactor);
-    header->headPlanBytes = static_cast<uint64_t>(metaArgs->headPlanCapacity) * sizeof(HeadPlan);
-    header->fdPlanOffset = 0;
-    header->fdPlanBytes = 0;
-    header->maskPlanOffset = fa_metadata::MaskPlanOffsetForCapacity(
-        metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
-        metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, metaArgs->taskCapacityFactor);
-    const uint64_t maskPlanBytes = fa_metadata::MaskPlanStorageBytes(
-        metaArgs->maskPlanCapacity, metaArgs->maskType);
-    header->maskPlanBytes = maskPlanBytes;
-    header->appendPlanOffset = fa_metadata::AppendPlanOffsetForCapacity(
-        metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
-        metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, maskPlanBytes,
-        metaArgs->taskCapacityFactor);
-    header->appendPlanBytes = static_cast<uint64_t>(metaArgs->batch) * sizeof(AppendPlan);
-    header->appendPlanCount = metaArgs->batch;
-    header->addressPlanOffset = fa_metadata::AddressPlanOffsetForCapacity(
-        metaArgs->blockDim, metaArgs->batch, metaArgs->maxQSeqlen, metaArgs->numHeads,
-        metaArgs->headPlanCapacity, metaArgs->fdPlanCapacity, maskPlanBytes, metaArgs->batch,
-        metaArgs->taskCapacityFactor);
-    header->addressPlanBytes = static_cast<uint64_t>(metaArgs->batch) * sizeof(AddressPlan);
-    header->addressPlanCount = metaArgs->batch;
-    auto* batchPlans = reinterpret_cast<BatchPlan*>(metaBase + header->batchPlanOffset);
-    auto* headPlans = reinterpret_cast<HeadPlan*>(metaBase + header->headPlanOffset);
-    auto* maskPlanData = metaBase + header->maskPlanOffset;
-    auto* appendPlans = reinterpret_cast<AppendPlan*>(metaBase + header->appendPlanOffset);
-    auto* addressPlans = reinterpret_cast<AddressPlan*>(metaBase + header->addressPlanOffset);
-
-    uint32_t actualHeadPlanCount = 0;
-    uint32_t actualMaskPlanCount = 0;
-    if (!BuildPlans(batchPlans, headPlans, maskPlanData, appendPlans, addressPlans,
-                    metaArgs->batch, groupSize, metaArgs->maskType,
-                    tilingData->windowSizeLeft, tilingData->windowSizeRight, *metaArgs,
-                    ctx, totalQTokens, metaArgs->headPlanCapacity,
-                    metaArgs->maskPlanCapacity, actualHeadPlanCount, actualMaskPlanCount)) {
-        header->status = fa_metadata::TASK_METADATA_OVERFLOW;
-        return false;
-    }
-    header->headPlanBytes = static_cast<uint64_t>(actualHeadPlanCount) * sizeof(HeadPlan);
-    header->headPlanCount = actualHeadPlanCount;
-    header->maskPlanCount = actualMaskPlanCount;
-    header->maskPlanBytes = fa_metadata::MaskPlanStorageBytes(actualMaskPlanCount, metaArgs->maskType);
-
-    return fa_metadata::BuildTaskSchedule(*header, ranges, batchPlans, headPlans, *tilingData);
-}
-}
+} // namespace
 
 __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
 {
@@ -269,7 +87,6 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
     uint32_t firstBatchTaskNum = 0;
     uint32_t maxQ = 0;
     uint32_t minQ = 0xFFFFFFFFu;
-    uint32_t totalQTokens = 0;
     for (uint32_t batchIdx = 0; batchIdx < metaArgs->batch; ++batchIdx) {
         uint32_t qSeqlen = metaArgs->maxQSeqlen;
         if (seqlensQ != nullptr) {
@@ -290,14 +107,10 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
         if (qSeqlen < minQ) {
             minQ = qSeqlen;
         }
-        totalQTokens += qSeqlen;
     }
     tilingData->firstBatchTaskNum = firstBatchTaskNum;
     tilingData->totalTaskNum = totalTaskNum;
-    if (metaArgs->cuSeqlensQAddr != 0U) {
-        const auto* cuQ = reinterpret_cast<const int32_t*>(metaArgs->cuSeqlensQAddr);
-        totalQTokens = static_cast<uint32_t>(cuQ[metaArgs->batch]);
-    }
+
 
         const uint32_t bd = metaArgs->blockDim;
         const uint32_t numTasks = metaArgs->batch * metaArgs->numHeadsK;
@@ -330,10 +143,7 @@ __global__ __aicpu__ uint32_t ComputeFAMetadataV3(void *args)
             tilingData->workSpaceSize = fa_metadata::WorkSpaceSize(static_cast<uint64_t>(bd))
                 + tilingData->splitLseTotalSize + tilingData->splitOTotalSize;
         }
-        if (!BuildSchedulerTasks(metaArgs, tilingData, ctx, groupSize, totalQTokens)) {
-            AscendC::DataStoreBarrier();
-            return 1;
-        }
+
 
     AscendC::DataStoreBarrier();
     return 0;
