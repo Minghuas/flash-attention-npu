@@ -122,6 +122,9 @@ def _flash_attn_forward(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = (_maybe_contiguous(x) for x in (q, k, k_new, v_new))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    q_descale, k_descale, v_descale = (
+        _maybe_contiguous(x) for x in (q_descale, k_descale, v_descale)
+    )
     cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new = (
         _maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new)
     )
@@ -219,7 +222,7 @@ def _flash_attn_forward_fake(
     layout,
 ):
     is_varlen_q = cu_seqlens_q is not None
-    out_dtype = q.dtype
+    out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
     head_size_v = v.size(-1)
 
     if is_varlen_q:
@@ -388,6 +391,7 @@ def _get_scheduler_metadata_op(
     max_seqlen_k: int,
     window_left: int,
     window_right: int,
+    quant_mode: int = 0,
 ) -> torch.Tensor:
     return flash_attn_npu_3_950.get_scheduler_metadata(
         batch_size,
@@ -406,6 +410,7 @@ def _get_scheduler_metadata_op(
         max_seqlen_k,
         window_left,
         window_right,
+        quant_mode,
     )
 
 
@@ -427,6 +432,7 @@ def _get_scheduler_metadata_fake(
     max_seqlen_k: int,
     window_left: int,
     window_right: int,
+    quant_mode: int = 0,
 ) -> torch.Tensor:
     ctx = torch.library.get_ctx()
     metadata_size = ctx.new_dynamic_size()
@@ -481,8 +487,9 @@ def get_scheduler_metadata(
         seqlens_q = _maybe_contiguous(seqlens_q)
     if headdim_v is None:
         headdim_v = headdim
-    if qkv_dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("qkv_dtype must be torch.float16 or torch.bfloat16")
+    if qkv_dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError("qkv_dtype must be FP16, BF16 or FP8_E4M3FN")
+    quant_mode = 1 if qkv_dtype == torch.float8_e4m3fn else 0
     if cu_seqlens_k_new is not None or max_seqlen_k_new:
         raise ValueError("Ascend 950 does not support append-KV (cu_seqlens_k_new)")
     if cache_leftpad is not None:
@@ -508,6 +515,7 @@ def get_scheduler_metadata(
         max_seqlen_k,
         window_size[0],
         window_size[1],
+        quant_mode,
     )
     return scheduler_metadata
 
@@ -528,6 +536,9 @@ def _training_forward(
     seqused_q=None,
     seqused_k=None,
     layout=_LAYOUT_BSND,
+    q_descale=None,
+    k_descale=None,
+    v_descale=None,
 ):
     if seqused_k is None:
         if cu_seqlens_q is None:
@@ -562,9 +573,9 @@ def _training_forward(
         None,
         None,
         None,  # rotary
-        None,
-        None,
-        None,  # descales
+        q_descale,
+        k_descale,
+        v_descale,  # descales
         softmax_scale,
         causal,
         window_size[0],
@@ -604,7 +615,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_softmax,
         scheduler_metadata,
     ):
-        if any(x is not None for x in (qv, q_descale, k_descale, v_descale)):
+        if qv is not None:
             raise NotImplementedError("Ascend950 v3 training scaffold only supports q/k/v inputs")
         if attention_chunk != 0:
             raise NotImplementedError(
@@ -616,6 +627,7 @@ class FlashAttnFunc(torch.autograd.Function):
             )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+        quant_mode = 1 if q.dtype == torch.float8_e4m3fn else 0
 
         # get_scheduler_metadata only takes numbers and reads them as BSND, so the sizes
         # below come from the pre-detection shapes; BNSD only re-views the same storage.
@@ -658,7 +670,11 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size,
             scheduler_metadata,
             layout=layout,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
+        ctx.quant_mode = quant_mode
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
         ctx.softcap = softcap
@@ -670,6 +686,8 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):
+        if ctx.quant_mode == 1:
+            raise NotImplementedError("Ascend950 V3 FP8 supports forward only")
         if ctx.window_size != (-1, -1):
             raise NotImplementedError(
                 "Ascend950 v3 backward does not support sliding-window attention"
@@ -732,18 +750,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_softmax,
         scheduler_metadata,
     ):
-        if any(
-            x is not None
-            for x in (
-                qv,
-                q_descale,
-                k_descale,
-                v_descale,
-            )
-        ):
-            raise NotImplementedError(
-                "Ascend950 v3 varlen training scaffold does not support optional tensor inputs"
-            )
+        if qv is not None:
+            raise NotImplementedError("Ascend950 v3 does not support qv")
         if attention_chunk != 0:
             raise NotImplementedError(
                 "Ascend950 v3 training scaffold does not support attention_chunk"
@@ -754,6 +762,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             )
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
+        quant_mode = 1 if q.dtype == torch.float8_e4m3fn else 0
 
         seqused_q = _maybe_contiguous(seqused_q)
         seqused_k = _maybe_contiguous(seqused_k)
@@ -788,6 +797,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 max_seqlen_k,
                 window_size[0],
                 window_size[1],
+                quant_mode,
             )
 
         out, softmax_lse, _, _ = _training_forward(
@@ -806,7 +816,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q,
             seqused_k,
             layout=layout,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
+        ctx.quant_mode = quant_mode
         ctx.save_for_backward(
             q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k
         )
@@ -822,6 +836,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *unused_grads):
+        if ctx.quant_mode == 1:
+            raise NotImplementedError("Ascend950 V3 FP8 supports forward only")
         if ctx.window_size != (-1, -1):
             raise NotImplementedError(
                 "Ascend950 v3 backward does not support sliding-window attention"
