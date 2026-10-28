@@ -125,7 +125,7 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
                                 static_cast<int64_t>(s0) * lSeq;
         // Align the 8-float transfer to 32B; use scalar loads if it crosses the row.
         const uint32_t loadElems = AlignUp(nrows, 8U);
-        const bool vectorLoad = (loadElems <= (seqlen - s0));
+        const bool vectorLoad = (lSeq == 1 && loadElems <= (seqlen - s0));
         if (vectorLoad) {
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 AscendC::DataCopyPad(
@@ -138,7 +138,9 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 const int64_t base = lseBase + static_cast<int64_t>(split) * lSplit;
                 for (uint32_t row = 0U; row < nrows; ++row) {
-                    lseUb.SetValue(split * rA + row, gPartialLse.GetValue(base + static_cast<int64_t>(row)));
+                    lseUb.SetValue(
+                        split * rA + row,
+                        gPartialLse.GetValue(base + static_cast<int64_t>(row) * lSeq));
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
@@ -237,8 +239,8 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
             AscendC::Adds(accUb, oUb, 0.0f, static_cast<int32_t>(rA * dA));
             AscendC::PipeBarrier<PIPE_V>();
         }
-        // Fold the compensation into the sum before normalising.
-        AscendC::Add(accUb, accUb, compUb, static_cast<int32_t>(rA * dA));
+        // comp stores the negated low-order error, so subtract it before normalising.
+        AscendC::Sub(accUb, accUb, compUb, static_cast<int32_t>(rA * dA));
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::BroadCast<float, 2, 1>(wTileUb, denUb, dstShapeO, srcShapeO, sharedTmpUb);
         AscendC::PipeBarrier<PIPE_V>();

@@ -34,11 +34,12 @@ __aicore__ inline uint32_t AlignUp(uint32_t value, uint32_t align)
 
 template <class OutDType>
 __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_ADDR lsePartial, GM_ADDR outGm,
-                                     GM_ADDR lseOutGm, uint32_t isDense, uint32_t writeLse, uint32_t numSplits,
-                                     uint32_t batch, uint32_t seqlen, uint32_t numHeads, uint32_t headDim,
-                                     uint32_t tileRows, int64_t oSplit, int64_t oBatch, int64_t oSeq, int64_t oHead,
-                                     int64_t lSplit, int64_t lBatch, int64_t lSeq, int64_t lHead, int64_t outBatch,
-                                     int64_t outSeq, int64_t outHead, int64_t lseOutBatch, int64_t lseOutHead)
+                                     GM_ADDR lseOutGm, GM_ADDR virtualBatchIdx, uint32_t isDense,
+                                     uint32_t writeLse, uint32_t numSplits, uint32_t batch, uint32_t seqlen,
+                                     uint32_t numHeads, uint32_t headDim, uint32_t tileRows, int64_t oSplit,
+                                     int64_t oBatch, int64_t oSeq, int64_t oHead, int64_t lSplit, int64_t lBatch,
+                                     int64_t lSeq, int64_t lHead, int64_t outBatch, int64_t outSeq, int64_t outHead,
+                                     int64_t lseOutBatch, int64_t lseOutHead)
 {
     AscendC::SetSyncBaseAddr(fftsAddr);
 #ifdef __DAV_C220_VEC__
@@ -92,11 +93,15 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
     AscendC::GlobalTensor<float> gPartialLse;
     AscendC::GlobalTensor<OutDType> gOut;
     AscendC::GlobalTensor<float> gLseOut;
+    AscendC::GlobalTensor<int32_t> gVirtualBatchIdx;
     gPartialO.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(outPartial));
     gPartialLse.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(lsePartial));
     gOut.SetGlobalBuffer(reinterpret_cast<__gm__ OutDType*>(outGm));
     if (writeLse != 0U) {
         gLseOut.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(lseOutGm));
+    }
+    if (virtualBatchIdx != nullptr) {
+        gVirtualBatchIdx.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(virtualBatchIdx));
     }
 
     const uint32_t rowBlocks = (seqlen + tileRows - 1U) / tileRows;
@@ -109,7 +114,11 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
     for (uint32_t task = AscendC::GetBlockIdx(); task < taskCount; task += threads) {
         const uint32_t hb = task / rowBlocks;
         const uint32_t rb = task - hb * rowBlocks;
-        const uint32_t bIdx = (isDense != 0U) ? (hb / numHeads) : 0U;
+        const uint32_t virtualBIdx = (isDense != 0U) ? (hb / numHeads) : 0U;
+        const uint32_t bIdx =
+            (isDense != 0U && virtualBatchIdx != nullptr)
+                ? static_cast<uint32_t>(gVirtualBatchIdx.GetValue(virtualBIdx))
+                : virtualBIdx;
         const uint32_t hIdx = (isDense != 0U) ? (hb % numHeads) : hb;
         const uint32_t s0 = rb * tileRows;
         const uint32_t remain = seqlen - s0;
@@ -125,7 +134,7 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
                                 static_cast<int64_t>(s0) * lSeq;
         // Align the 8-float transfer to 32B; use scalar loads if it crosses the row.
         const uint32_t loadElems = AlignUp(nrows, 8U);
-        const bool vectorLoad = (loadElems <= (seqlen - s0));
+        const bool vectorLoad = (lSeq == 1 && loadElems <= (seqlen - s0));
         if (vectorLoad) {
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 AscendC::DataCopyPad(
@@ -138,7 +147,9 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 const int64_t base = lseBase + static_cast<int64_t>(split) * lSplit;
                 for (uint32_t row = 0U; row < nrows; ++row) {
-                    lseUb.SetValue(split * rA + row, gPartialLse.GetValue(base + static_cast<int64_t>(row)));
+                    lseUb.SetValue(
+                        split * rA + row,
+                        gPartialLse.GetValue(base + static_cast<int64_t>(row) * lSeq));
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
@@ -237,8 +248,8 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
             AscendC::Adds(accUb, oUb, 0.0f, static_cast<int32_t>(rA * dA));
             AscendC::PipeBarrier<PIPE_V>();
         }
-        // Fold the compensation into the sum before normalising.
-        AscendC::Add(accUb, accUb, compUb, static_cast<int32_t>(rA * dA));
+        // comp stores the negated low-order error, so subtract it before normalising.
+        AscendC::Sub(accUb, accUb, compUb, static_cast<int32_t>(rA * dA));
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::BroadCast<float, 2, 1>(wTileUb, denUb, dstShapeO, srcShapeO, sharedTmpUb);
         AscendC::PipeBarrier<PIPE_V>();
@@ -298,9 +309,10 @@ template <class OutDType>
 inline void LaunchCombine(const CombineLaunchArgs& a)
 {
     FACombine<OutDType><<<a.launchBlockDim, nullptr, a.aclStream>>>(
-        a.fftsAddr, a.outPartial, a.lsePartial, a.out, a.lseOut, a.isDense, a.writeLse, a.numSplits, a.batch,
-        a.seqlen, a.numHeads, a.headDim, a.tileRows, a.oSplit, a.oBatch, a.oSeq, a.oHead, a.lSplit, a.lBatch,
-        a.lSeq, a.lHead, a.outBatch, a.outSeq, a.outHead, a.lseOutBatch, a.lseOutHead);
+        a.fftsAddr, a.outPartial, a.lsePartial, a.out, a.lseOut, a.virtualBatchIdx, a.isDense, a.writeLse,
+        a.numSplits, a.batch, a.seqlen, a.numHeads, a.headDim, a.tileRows, a.oSplit, a.oBatch, a.oSeq,
+        a.oHead, a.lSplit, a.lBatch, a.lSeq, a.lHead, a.outBatch, a.outSeq, a.outHead, a.lseOutBatch,
+        a.lseOutHead);
 }
 
 } // namespace FaCombine

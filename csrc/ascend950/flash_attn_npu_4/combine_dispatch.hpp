@@ -29,6 +29,7 @@ struct CombineLaunchArgs {
     uint8_t* lsePartial{nullptr};
     uint8_t* out{nullptr};
     uint8_t* lseOut{nullptr};
+    uint8_t* virtualBatchIdx{nullptr};
 
     int64_t oSplit{0};
     int64_t oBatch{0};

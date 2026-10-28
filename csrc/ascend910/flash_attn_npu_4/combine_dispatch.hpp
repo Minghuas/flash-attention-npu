@@ -33,6 +33,7 @@ struct CombineLaunchArgs {
     uint8_t* lsePartial{nullptr};
     uint8_t* out{nullptr};
     uint8_t* lseOut{nullptr};
+    uint8_t* virtualBatchIdx{nullptr};
 
     // Element strides of out_partial (last dim is always contiguous).
     int64_t oSplit{0};
@@ -40,7 +41,7 @@ struct CombineLaunchArgs {
     int64_t oSeq{0};
     int64_t oHead{0};
 
-    // Element strides of lse_partial (seqlen dim must be contiguous).
+    // Element strides of lse_partial.
     int64_t lSplit{0};
     int64_t lBatch{0};
     int64_t lSeq{0};

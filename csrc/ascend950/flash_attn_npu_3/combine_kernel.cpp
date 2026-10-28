@@ -120,7 +120,7 @@ CATLASS_GLOBAL void FACombine(GM_ADDR outPartial, GM_ADDR lsePartial, GM_ADDR ou
         const int64_t lseBase = static_cast<int64_t>(bIdx) * lBatch + static_cast<int64_t>(hIdx) * lHead +
                                 static_cast<int64_t>(s0) * lSeq;
         const uint32_t loadElems = AlignUp(nrows, 8U);
-        const bool vectorLoad = (loadElems <= (seqlen - s0));
+        const bool vectorLoad = (lSeq == 1 && loadElems <= (seqlen - s0));
         if (vectorLoad) {
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 AscendC::DataCopyPad(
@@ -133,7 +133,9 @@ CATLASS_GLOBAL void FACombine(GM_ADDR outPartial, GM_ADDR lsePartial, GM_ADDR ou
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 const int64_t base = lseBase + static_cast<int64_t>(split) * lSplit;
                 for (uint32_t row = 0U; row < nrows; ++row) {
-                    lseUb.SetValue(split * rA + row, gPartialLse.GetValue(base + static_cast<int64_t>(row)));
+                    lseUb.SetValue(
+                        split * rA + row,
+                        gPartialLse.GetValue(base + static_cast<int64_t>(row) * lSeq));
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
@@ -226,8 +228,8 @@ CATLASS_GLOBAL void FACombine(GM_ADDR outPartial, GM_ADDR lsePartial, GM_ADDR ou
             }
             AscendC::PipeBarrier<PIPE_V>();
         }
-        // Fold the compensation in, then normalise the row by den.
-        AscendC::Add(accUb, accUb, compUb, static_cast<int32_t>(rA * dA));
+        // comp stores the negated low-order error, so subtract it before normalising.
+        AscendC::Sub(accUb, accUb, compUb, static_cast<int32_t>(rA * dA));
         AscendC::PipeBarrier<PIPE_V>();
         for (uint32_t row = 0U; row < rA; ++row) {
             AscendC::Muls(accUb[row * dA], accUb[row * dA], 1.0f / denUb.GetValue(row),

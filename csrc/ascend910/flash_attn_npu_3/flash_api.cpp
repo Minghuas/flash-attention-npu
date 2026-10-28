@@ -1099,7 +1099,6 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     TORCH_CHECK(out_partial.dim() == 4 || out_partial.dim() == 5,
                 "out_partial must have 4 or 5 dimensions");
     TORCH_CHECK(out_partial.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(lse_partial.stride(-2) == 1, "LSE tensor must be contiguous in the seqlen dimension");
 
     const bool is_dense = out_partial.dim() == 5;
     TORCH_CHECK(lse_partial.dim() == out_partial.dim() - 1,
@@ -1132,7 +1131,9 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
                     " out_partial=", out_partial.sizes());
     }
 
-    const auto out_type = out_dtype_.value_or(out_partial.scalar_type());
+    const auto out_type = out_.has_value()
+                              ? out_->scalar_type()
+                              : out_dtype_.value_or(out_partial.scalar_type());
     TORCH_CHECK(out_type == at::kFloat || out_type == at::kHalf || out_type == at::kBFloat16,
                 "Output type must be FP32, FP16 or BF16");
 
@@ -1140,7 +1141,6 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.device().type() == at::kPrivateUse1, "out must be on NPU");
-        TORCH_CHECK(out.scalar_type() == out_type, "out dtype must match out_dtype");
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         if (is_dense) {
             TORCH_CHECK(out.dim() == 4 && out.size(0) == batch_size && out.size(1) == seqlen &&
@@ -1199,6 +1199,8 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
             break;
         }
     }
+    TORCH_CHECK(static_cast<uint64_t>(tile_rows) * per_row <= 150U * 1024U,
+                "combine tile exceeds 150 KiB UB budget for head_dim=", head_dim);
 
     const uint64_t head_batch = is_dense ? static_cast<uint64_t>(batch_size) * num_heads
                                          : static_cast<uint64_t>(num_heads);

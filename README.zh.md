@@ -647,10 +647,11 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
         out_partial: fp32 分片输出。
             BSND: (num_splits, batch, seqlen, nheads, headdim)
             TND:  (num_splits, total_q, nheads, headdim)
-        lse_partial: fp32 分片 logsumexp，要求 seqlen 维连续。
+        lse_partial: fp32 分片 logsumexp，逻辑布局为 (..., seqlen, nheads)。
             BSND: (num_splits, batch, seqlen, nheads)
             TND:  (num_splits, total_q, nheads)
         out [可选]: 预分配输出，原地写回。
+            传入时以 out.dtype 为准。
         out_dtype [可选]: fp16 / bf16 / fp32；缺省取 out_partial.dtype（fp32），
             与 flash-attention 一致。
 
@@ -658,6 +659,9 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
         (out, softmax_lse)。softmax_lse 为 fp32，形状 (batch, seqlen, nheads)
         或 (total_q, nheads)；其 seqlen 维连续，与 flash_attn_func 返回的
         (batch, nheads, seqlen) 布局不同。
+
+    当前仓内 v3 forward 尚未暴露真实的 split accumulator；调用方需从外部
+    split-attention 生产者获取 out_partial/lse_partial。
     """
 ```
 
@@ -760,14 +764,17 @@ def flash_attn_varlen_func(
 
 ```python
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
-                       cu_seqlens=None, seqused=None, return_lse=True):
+                       cu_seqlens=None, seqused=None, virtual_batch_idx=None,
+                       return_lse=True):
     """
     FA4 的分片合并入口（合并数学与 v3 一致）。out_partial 为 4 维时按变长
     (TND) 解释，为 5 维时按批量 (BSND) 解释。
 
-    cu_seqlens / seqused: 可选 int32 元信息，用于界定有效行。
+    out_partial 支持 fp16 / bf16 / fp32；低精度 partial 会转换为 fp32 后累加。
+    传入 out 时以 out.dtype 为准。
+    cu_seqlens / seqused: 为接口兼容而接受并校验，当前不参与行数限定。
+    virtual_batch_idx: dense 布局下从虚拟 batch 槽位到真实 batch 的映射。
     return_lse=False 时返回 (out, None)。
-    virtual_batch_idx 在 NPU 上不支持。
     """
 ```
 
@@ -825,11 +832,13 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
 
 | 特性                        | v3 | v4 |
 | --------------------------- | -- | -- |
-| FP32 partial / LSE 输入     | ✅ | ✅ |
+| FP16 / BF16 / FP32 partial 输入 | -  | ✅ |
+| FP32 LSE 输入               | ✅ | ✅ |
 | FP16 / BF16 / FP32 输出     | ✅ | ✅ |
 | 批量 (BSND) 分片            | ✅ | ✅ |
 | 变长 (TND) 分片             | ✅ | ✅ |
-| cu_seqlens / seqused        | -  | ✅ |
+| cu_seqlens / seqused        | -  | ✅ 接受但当前忽略 |
+| virtual_batch_idx           | -  | ✅ dense |
 | 合并后的 LSE 输出           | ✅ | ✅ (`return_lse`) |
 
 ## 许可证

@@ -1651,7 +1651,7 @@ def _combine_ref(out_partial, lse_partial):
 
 
 def _make_combine_lse_partial(num_splits, batch, seqlen, heads):
-    # Keep the sequence dimension contiguous, as required by the combine API.
+    # Produce the seqlen-contiguous view used by the in-tree attention kernels.
     return torch.randn(
         num_splits,
         batch,
@@ -1878,6 +1878,55 @@ def test_combine_large_seqlen_and_dtype_default():
     torch.testing.assert_close(lse, lse_ref, atol=1e-4, rtol=1e-4)
 
 
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+def test_combine_accepts_standard_lse_layout(layout):
+    num_splits, batch, seqlen, heads, head_dim = 3, 2, 17, 4, 96
+    if layout == "BSND":
+        out_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            batch,
+            seqlen,
+            heads,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    else:
+        out_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            head_dim,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.randn(
+            num_splits,
+            seqlen,
+            heads,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out_ref, lse_ref = _combine_ref(
+            out_partial.unsqueeze(1),
+            lse_partial.unsqueeze(1),
+        )
+        out_ref = out_ref.squeeze(0)
+        lse_ref = lse_ref.squeeze(0)
+
+    out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.bfloat16)
+
+
 def test_combine_preallocated_out_is_written_in_place():
     num_splits, batch, seqlen, heads, head_dim = 4, 1, 64, 4, 128
     out_partial = torch.randn(
@@ -1909,13 +1958,72 @@ def test_combine_preallocated_out_is_written_in_place():
         out_partial,
         lse_partial,
         out=out,
-        out_dtype=torch.bfloat16,
     )
     assert result.data_ptr() == ptr
     out_ref, _ = _combine_ref(out_partial, lse_partial)
     cast_ref = out_ref.to(torch.bfloat16)
     cast_err = (cast_ref.float() - out_ref).abs().max().item()
     assert (result.float() - out_ref).abs().max().item() <= 2.0 * cast_err + 1e-3
+
+
+def test_combine_fake_tensor():
+    with FakeTensorMode():
+        out_partial = torch.empty(
+            2,
+            1,
+            8,
+            2,
+            64,
+            device="npu",
+            dtype=torch.float32,
+        )
+        lse_partial = torch.empty(
+            2,
+            1,
+            8,
+            2,
+            device="npu",
+            dtype=torch.float32,
+        )
+        out, lse = flash_attn_combine(
+            out_partial,
+            lse_partial,
+            out_dtype=torch.bfloat16,
+        )
+    assert out.shape == (1, 8, 2, 64)
+    assert out.dtype == torch.bfloat16
+    assert lse.shape == (1, 8, 2)
+    assert lse.dtype == torch.float32
+
+
+def test_combine_torch_compile():
+    num_splits, batch, seqlen, heads, head_dim = 2, 1, 8, 2, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="npu",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        device="npu",
+        dtype=torch.float32,
+    )
+    compiled = torch.compile(
+        flash_attn_combine,
+        backend="aot_eager",
+        fullgraph=True,
+        dynamic=False,
+    )
+    out, lse = compiled(out_partial, lse_partial, out_dtype=torch.bfloat16)
+    out_ref, lse_ref = _combine_ref(out_partial, lse_partial)
+    _assert_combine_close(out, lse, out_ref, lse_ref, torch.bfloat16)
 
 
 def test_combine_all_masked_rows_produce_zero():
@@ -1976,12 +2084,12 @@ def test_combine_error_contract():
     bad_lse = torch.randn(
         num_splits,
         batch,
-        seqlen,
+        seqlen + 1,
         heads,
         device="npu",
         dtype=torch.float32,
     )
-    with pytest.raises(RuntimeError, match="seqlen"):
+    with pytest.raises(RuntimeError, match="shape"):
         flash_attn_combine(out_partial, bad_lse, out_dtype=torch.float16)
 
     big_partial = torch.randn(
@@ -2004,21 +2112,18 @@ def test_combine_error_contract():
     with pytest.raises(RuntimeError, match="256"):
         flash_attn_combine(big_partial, big_lse, out_dtype=torch.float16)
 
-    out = torch.empty(
-        batch,
-        seqlen,
-        heads,
-        head_dim,
+    oversized_partial = torch.randn(
+        1,
+        1,
+        1,
+        1,
+        1024,
         device="npu",
         dtype=torch.float32,
     )
-    with pytest.raises(RuntimeError, match="dtype"):
-        flash_attn_combine(
-            out_partial,
-            lse_partial,
-            out=out,
-            out_dtype=torch.float16,
-        )
+    oversized_lse = torch.randn(1, 1, 1, 1, device="npu", dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="UB budget"):
+        flash_attn_combine(oversized_partial, oversized_lse, out_dtype=torch.float16)
 
 
 # data_type, layout, num_splits, head_dim, seqlen

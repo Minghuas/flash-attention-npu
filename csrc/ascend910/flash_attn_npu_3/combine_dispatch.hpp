@@ -40,7 +40,7 @@ struct CombineLaunchArgs {
     int64_t oSeq{0};
     int64_t oHead{0};
 
-    // Element strides of lse_partial (seqlen dim must be contiguous).
+    // Element strides of lse_partial.
     int64_t lSplit{0};
     int64_t lBatch{0};
     int64_t lSeq{0};

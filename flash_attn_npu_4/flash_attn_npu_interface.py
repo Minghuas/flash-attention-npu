@@ -1295,6 +1295,58 @@ def flash_attn_varlen_func(
     )
 
 
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_4::_flash_attn_combine",
+    mutates_args=("out",),
+    device_types="npu",
+)
+def _flash_attn_combine_op(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    virtual_batch_idx: Optional[torch.Tensor],
+    return_lse: bool,
+) -> torch.Tensor:
+    result = flash_attn_npu_4.fwd_combine(
+        out_partial,
+        lse_partial,
+        out,
+        out_dtype,
+        cu_seqlens,
+        seqused,
+        virtual_batch_idx,
+        return_lse,
+    )
+    return result[1] if return_lse else torch.empty(
+        0, dtype=torch.float32, device=result[0].device
+    )
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4::_flash_attn_combine")
+def _flash_attn_combine_fake(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    virtual_batch_idx: Optional[torch.Tensor],
+    return_lse: bool,
+) -> torch.Tensor:
+    is_dense = out_partial.dim() == 5
+    if not return_lse:
+        return torch.empty(0, dtype=torch.float32, device=out.device)
+    lse_shape = (
+        (out_partial.shape[1], out_partial.shape[2], out_partial.shape[3])
+        if is_dense
+        else (out_partial.shape[1], out_partial.shape[2])
+    )
+    return torch.empty(lse_shape, dtype=torch.float32, device=out.device)
+
+
 def flash_attn_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -1310,26 +1362,42 @@ def flash_attn_combine(
     Mirrors ``flash_attn.cute.interface.flash_attn_combine``.
 
     Args:
-        out_partial: fp32 partial outputs. Batched (BSND):
+        out_partial: fp16/bf16/fp32 partial outputs. Batched (BSND):
             (num_splits, batch, seqlen, nheads, headdim); varlen (TND, detected
             by a 4-D input): (num_splits, total_q, nheads, headdim).
-        lse_partial: fp32 partial logsumexp, seqlen-contiguous. Batched:
+        lse_partial: fp32 partial logsumexp in logical (..., seqlen, heads) order. Batched:
             (num_splits, batch, seqlen, nheads); varlen:
             (num_splits, total_q, nheads).
-        out [optional]: preallocated output, written in place.
+        out [optional]: preallocated output, written in place. When supplied,
+            its dtype takes precedence over out_dtype.
         out_dtype [optional]: fp16 / bf16 / fp32; defaults to
             ``out_partial.dtype`` (fp32).
-        cu_seqlens [optional]: 1-D int32 cumulative sequence lengths.
-        seqused [optional]: 1-D int32 per-sequence used lengths.
-        virtual_batch_idx [optional]: not supported on NPU.
+        cu_seqlens [optional]: accepted and validated for API parity; currently
+            does not limit the processed rows.
+        seqused [optional]: accepted and validated for API parity; currently
+            does not limit the processed rows.
+        virtual_batch_idx [optional]: mapping from virtual batch slots to real batches.
         return_lse: whether to return the combined logsumexp.
 
     Returns:
         (out, lse); ``lse`` is None when ``return_lse=False``.
     """
-    if virtual_batch_idx is not None:
-        raise NotImplementedError("virtual_batch_idx is not supported on NPU")
-    result = flash_attn_npu_4.fwd_combine(
-        out_partial, lse_partial, out, out_dtype, cu_seqlens, seqused, return_lse
+    if out is None:
+        output_dtype = out_dtype or out_partial.dtype
+        out_shape = (
+            out_partial.shape[1:4] + (out_partial.shape[4],)
+            if out_partial.dim() == 5
+            else out_partial.shape[1:2] + out_partial.shape[2:4]
+        )
+        out = torch.empty(out_shape, dtype=output_dtype, device=out_partial.device)
+    lse = _flash_attn_combine_op(
+        out_partial,
+        lse_partial,
+        out,
+        out_dtype,
+        cu_seqlens,
+        seqused,
+        virtual_batch_idx,
+        return_lse,
     )
-    return result[0], result[1] if return_lse else None
+    return out, lse if return_lse else None

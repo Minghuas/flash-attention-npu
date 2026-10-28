@@ -132,7 +132,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
 // The FA2/FA3/FA4 forward kernels already merge FlashDecode partials inside
 // their own workspace; that path is gated to paged-KV/TND decode shapes and its
 // buffers are not caller-visible. This operator is the standalone, public
-// counterpart: it consumes caller-owned dense fp32 partials
+// counterpart: it consumes caller-owned dense fp16/bf16/fp32 partials
 // (num_splits, B, S, H, D) or (num_splits, T, H, D) and mirrors the NV
 // flash_attn_3::fwd_combine contract.
 // ---------------------------------------------------------------------------
@@ -140,18 +140,23 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
                                     std::optional<at::Tensor> out_ = std::nullopt,
                                     std::optional<at::ScalarType> out_dtype_ = std::nullopt,
                                     std::optional<at::Tensor> cu_seqlens = std::nullopt,
-                                    std::optional<at::Tensor> seqused = std::nullopt, bool return_lse = true)
+                                    std::optional<at::Tensor> seqused = std::nullopt,
+                                    std::optional<at::Tensor> virtual_batch_idx = std::nullopt,
+                                    bool return_lse = true)
 {
     TORCH_CHECK(out_partial.device().type() == at::kPrivateUse1, "out_partial must be on NPU");
     TORCH_CHECK(lse_partial.device().type() == at::kPrivateUse1, "lse_partial must be on NPU");
-    TORCH_CHECK(out_partial.scalar_type() == at::kFloat,
-                "Attention combine function only support fp32 data type");
+    const auto partial_dtype = out_partial.scalar_type();
+    TORCH_CHECK(partial_dtype == at::kFloat || partial_dtype == at::kHalf || partial_dtype == at::kBFloat16,
+                "out_partial must be fp16, bf16, or fp32");
+    if (partial_dtype != at::kFloat) {
+        out_partial = out_partial.to(at::kFloat);
+    }
     TORCH_CHECK(lse_partial.scalar_type() == at::kFloat,
                 "Attention combine function only support fp32 data type");
     TORCH_CHECK(out_partial.dim() == 4 || out_partial.dim() == 5,
                 "out_partial must have 4 or 5 dimensions");
     TORCH_CHECK(out_partial.stride(-1) == 1, "Input tensor must have contiguous last dimension");
-    TORCH_CHECK(lse_partial.stride(-2) == 1, "LSE tensor must be contiguous in the seqlen dimension");
 
     const bool is_dense = out_partial.dim() == 5;
     TORCH_CHECK(lse_partial.dim() == out_partial.dim() - 1,
@@ -184,7 +189,9 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
                     " out_partial=", out_partial.sizes());
     }
 
-    const auto out_type = out_dtype_.value_or(out_partial.scalar_type());
+    const auto out_type = out_.has_value()
+                              ? out_->scalar_type()
+                              : out_dtype_.value_or(partial_dtype);
     TORCH_CHECK(out_type == at::kFloat || out_type == at::kHalf || out_type == at::kBFloat16,
                 "Output type must be FP32, FP16 or BF16");
 
@@ -192,7 +199,6 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     if (out_.has_value()) {
         out = out_.value();
         TORCH_CHECK(out.device().type() == at::kPrivateUse1, "out must be on NPU");
-        TORCH_CHECK(out.scalar_type() == out_type, "out dtype must match out_dtype");
         TORCH_CHECK(out.stride(-1) == 1, "Output tensor must have contiguous last dimension");
         if (is_dense) {
             TORCH_CHECK(out.dim() == 4 && out.size(0) == batch_size && out.size(1) == seqlen &&
@@ -221,7 +227,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
         }
     }
 
-    // cu_seqlens/seqused are validated only; combine processes every row independently.
+    // Accepted for API parity; combine still processes every row independently.
     if (cu_seqlens.has_value()) {
         TORCH_CHECK(cu_seqlens->scalar_type() == at::kInt && cu_seqlens->dim() == 1 && cu_seqlens->numel() >= 2,
                     "cu_seqlens must be a 1-D int32 tensor with at least 2 elements");
@@ -229,6 +235,16 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     if (seqused.has_value()) {
         TORCH_CHECK(seqused->scalar_type() == at::kInt && seqused->dim() == 1 && seqused->numel() >= 1,
                     "seqused must be a 1-D int32 tensor");
+    }
+    if (virtual_batch_idx.has_value()) {
+        TORCH_CHECK(virtual_batch_idx->device().type() == at::kPrivateUse1 &&
+                        virtual_batch_idx->scalar_type() == at::kInt && virtual_batch_idx->dim() == 1 &&
+                        virtual_batch_idx->is_contiguous(),
+                    "virtual_batch_idx must be a contiguous 1-D int32 NPU tensor");
+        if (is_dense) {
+            TORCH_CHECK(virtual_batch_idx->numel() == batch_size,
+                        "virtual_batch_idx must have batch_size elements");
+        }
     }
 
     if (seqlen == 0 || num_heads == 0 || head_dim == 0) {
@@ -251,6 +267,8 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
             break;
         }
     }
+    TORCH_CHECK(static_cast<uint64_t>(tile_rows) * per_row <= 150U * 1024U,
+                "combine tile exceeds 150 KiB UB budget for head_dim=", head_dim);
 
     const uint64_t head_batch = is_dense ? static_cast<uint64_t>(batch_size) * num_heads
                                          : static_cast<uint64_t>(num_heads);
@@ -276,6 +294,8 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     args.lsePartial = static_cast<uint8_t*>(lse_partial.data_ptr());
     args.out = static_cast<uint8_t*>(out.data_ptr());
     args.lseOut = return_lse ? static_cast<uint8_t*>(lse_out.data_ptr()) : nullptr;
+    args.virtualBatchIdx =
+        virtual_batch_idx.has_value() ? static_cast<uint8_t*>(virtual_batch_idx->data_ptr()) : nullptr;
     if (is_dense) {
         args.oSplit = out_partial.stride(0);
         args.oBatch = out_partial.stride(1);
@@ -332,5 +352,6 @@ PYBIND11_MODULE(flash_attn_npu_4_950, m)
     m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs",
           py::arg("out_partial"), py::arg("lse_partial"), py::arg("out") = py::none(),
           py::arg("out_dtype") = py::none(), py::arg("cu_seqlens") = py::none(),
-          py::arg("seqused") = py::none(), py::arg("return_lse") = true);
+          py::arg("seqused") = py::none(), py::arg("virtual_batch_idx") = py::none(),
+          py::arg("return_lse") = true);
 }
