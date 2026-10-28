@@ -420,7 +420,11 @@ std::vector<at::Tensor> mha_fwd(
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
-        if (paged_KV && is_varlen_q && !is_local) {
+        // FlashDecode requires at least 1024 KV tokens. For paged KV, the
+        // page-table capacity bounds every valid used length, including append.
+        // Skip the device-to-host length reads when FD is impossible; those
+        // synchronous copies are also unsupported during graph capture.
+        if (paged_KV && is_varlen_q && !is_local && kvSeqlenBound >= 1024) {
             int64_t maxQ = 0;
             int64_t minQ = std::numeric_limits<int64_t>::max();
             if (seqused_q_.has_value()) {
@@ -448,11 +452,10 @@ std::vector<at::Tensor> mha_fwd(
             const uint32_t fdTaskCount = static_cast<uint32_t>(batch_size * num_heads_k);
             const bool fdLongSeq = (static_cast<double>(fdTaskCount) <= 0.8 * blockDim) &&
                                    (maxKvSeqlen >= static_cast<int64_t>(blockDim) * 512);
-            const bool fdShortSeq = (static_cast<double>(fdTaskCount) <= 0.4 * blockDim) &&
-                                    (maxKvSeqlen >= 1024);
+            const bool fdShortSeq = (static_cast<double>(fdTaskCount) <= 0.4 * blockDim) && (maxKvSeqlen >= 1024);
             const int64_t fdGroupSize = num_heads / num_heads_k;
-            flashDecodeFlag = (maxQ * fdGroupSize <= 128) && (maxQ <= 16) &&
-                              (maxKvSeqlen >= 1024) && (minQ > 0) && (fdLongSeq || fdShortSeq);
+            flashDecodeFlag = (maxQ * fdGroupSize <= 128) && (maxQ <= 16) && (maxKvSeqlen >= 1024) && (minQ > 0) &&
+                              (fdLongSeq || fdShortSeq);
         }
         TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
                     "scheduler_metadata buffer size must exactly match this call's "
@@ -572,8 +575,7 @@ std::vector<at::Tensor> mha_fwd(
         const uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
         const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
                                (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
-        const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) &&
-                                (maxKVSeqlenCalc >= 1024);
+        const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) && (maxKVSeqlenCalc >= 1024);
         TORCH_CHECK(num_splits <= 1 || (paged_KV && is_varlen_q),
                     "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
         flashDecodeFlag = paged_KV && is_varlen_q && !is_local && (maxQSeqlenCalc * groupSize <= 128) &&

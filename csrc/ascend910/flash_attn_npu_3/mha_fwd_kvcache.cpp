@@ -296,8 +296,8 @@ class FAInferKernel {
 
         const bool headDimSplit = embed > NUM_256;
         groupSize = qHeads / kvHeads;
-        const bool compactDecodeL1 = !FLASH_DECODE_FLAG && embed == 512U && embedV == 512U && kvNewSeqlen == 0U &&
-                                     maxQSeqlen * groupSize <= 64U;
+        const bool compactDecodeL1 =
+            !FLASH_DECODE_FLAG && embed == 512U && embedV == 512U && kvNewSeqlen == 0U && maxQSeqlen * groupSize <= 64U;
         kvStackLen = MAX_KV_STACK_LEN;
         uint32_t kDynNum = NUM_256;
         uint32_t nDynNum = L1_D512_KV_TILE;
@@ -373,8 +373,7 @@ class FAInferKernel {
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
 
         epilogueOnlineSoftmax.init(resource, scaleValue, softcapValue);
-        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL ||
-                      MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL || MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             epilogueOnlineSoftmax.InitArithMask(resource);
         }
         epilogueRescaleO.init(resource);
@@ -397,85 +396,86 @@ class FAInferKernel {
         uint32_t taskStateSequence = 0;
 
         if constexpr (FLASH_DECODE_FLAG) {
-            const bool idleCoreFD =
-                (fATilingData->needCoreNum != 0U) && (coreIdx >= fATilingData->needCoreNum);
+            const bool idleCoreFD = (fATilingData->needCoreNum != 0U) && (coreIdx >= fATilingData->needCoreNum);
             if (!idleCoreFD) {
-            uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;
-            uint32_t startN1Idx = fATilingData->coreInfo[coreIdx].startN1Idx;
-            uint32_t startS1Idx = fATilingData->coreInfo[coreIdx].startS1Idx;
-            uint32_t startS2Idx = fATilingData->coreInfo[coreIdx].startS2Idx;
-            uint32_t endBIdx = fATilingData->coreInfo[coreIdx].endBIdx;
-            uint32_t endN1Idx = fATilingData->coreInfo[coreIdx].endN1Idx;
-            uint32_t endS1Idx = fATilingData->coreInfo[coreIdx].endS1Idx;
-            uint32_t endS2Idx = fATilingData->coreInfo[coreIdx].endS2Idx;
-            uint64_t gmOffsetLseFD = fATilingData->coreInfo[coreIdx].firstSplitKVTaskLseOffset;
-            uint64_t gmOffsetOFD = fATilingData->coreInfo[coreIdx].firstSplitKVTaskOOffset;
+                uint32_t startBIdx = fATilingData->coreInfo[coreIdx].startBIdx;
+                uint32_t startN1Idx = fATilingData->coreInfo[coreIdx].startN1Idx;
+                uint32_t startS1Idx = fATilingData->coreInfo[coreIdx].startS1Idx;
+                uint32_t startS2Idx = fATilingData->coreInfo[coreIdx].startS2Idx;
+                uint32_t endBIdx = fATilingData->coreInfo[coreIdx].endBIdx;
+                uint32_t endN1Idx = fATilingData->coreInfo[coreIdx].endN1Idx;
+                uint32_t endS1Idx = fATilingData->coreInfo[coreIdx].endS1Idx;
+                uint32_t endS2Idx = fATilingData->coreInfo[coreIdx].endS2Idx;
+                uint64_t gmOffsetLseFD = fATilingData->coreInfo[coreIdx].firstSplitKVTaskLseOffset;
+                uint64_t gmOffsetOFD = fATilingData->coreInfo[coreIdx].firstSplitKVTaskOOffset;
 
-            for (uint32_t BIdx = startBIdx; BIdx <= endBIdx; BIdx++) {
-                uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
-                uint32_t kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
-                if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
-                    qSeqlenCur = QSeqLenOf(BIdx, gActualQseqlen, gSeqUsedQ);
-                    if constexpr (!PAGED_CACHE_FLAG) {
-                        kvSeqlenCur = KvSeqLenOf(BIdx, gActualKvseqlen, gSeqUsedKv);
-                    }
-                }
-                // Per batch KV length including the appended new KV, reused by every task
-                kvSeqlenCur += (kvNewSeqlen != 0U ? kvNewSeqlen : 0U);
-
-                uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
-                uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
-                uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
-                uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
-                uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
-                uint32_t curKSBlockNumTmp = CeilDiv(kvSeqlenCur, kvStackLen);
-                if (kvNewSeqlen != 0U) {
-                    curKSBlockNumTmp = CeilDiv(static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx)), kvStackLen) +
-                                       CeilDiv(kvNewSeqlen, kvStackLen);
-                }
-
-                int32_t stN1IdxNow = (BIdx == startBIdx) ? (int32_t)startN1Idx : 0;
-                int32_t enN1IdxNow = (BIdx == endBIdx) ? (int32_t)endN1Idx : (int32_t)curQNBlockNumTmp - 1;
-
-                for (int32_t n1Idx = stN1IdxNow; n1Idx <= enN1IdxNow; n1Idx++) {
-                    int32_t stS1IdxNow = (BIdx == startBIdx && n1Idx == stN1IdxNow) ? (int32_t)startS1Idx : 0;
-                    int32_t enS1IdxNow =
-                        (BIdx == endBIdx && n1Idx == enN1IdxNow) ? (int32_t)endS1Idx : (int32_t)curQSBlockNumTmp - 1;
-
-                    for (int32_t s1Idx = stS1IdxNow; s1Idx <= enS1IdxNow; s1Idx++) {
-                        int32_t stS2IdxNow =
-                            (BIdx == startBIdx && n1Idx == stN1IdxNow && s1Idx == stS1IdxNow) ? (int32_t)startS2Idx : 0;
-                        int32_t enS2IdxNow = (BIdx == endBIdx && n1Idx == enN1IdxNow && s1Idx == enS1IdxNow)
-                                                 ? (int32_t)endS2Idx
-                                                 : (int32_t)curKSBlockNumTmp;
-                        bool isSplitKV = (enS2IdxNow - stS2IdxNow) > 0 &&
-                                         (enS2IdxNow - stS2IdxNow) < static_cast<int32_t>(curKSBlockNumTmp);
-                        uint32_t pipelineDrain = 0;
-                        if (BIdx == endBIdx && n1Idx == enN1IdxNow && s1Idx == enS1IdxNow) {
-                            pipelineDrain = PRE_LAUNCH;
-                        }
-
-                        const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
-                        const bool hasTaskWork = runMainLoop(
-                            coreIdx, BIdx, qSeqlenCur, kvSeqlenCur, (uint32_t)n1Idx, (uint32_t)s1Idx, isSplitKV,
-                            stS2IdxNow, enS2IdxNow, gmOffsetLseFD, gmOffsetOFD, globalTensors, descriptors,
-                            taskContexts, currentTaskStateSlot, issuedStackCount, pipelineDrain, softmaxPingPongFlag);
-                        taskStateSequence += static_cast<uint32_t>(hasTaskWork);
-
-                        if (isSplitKV) {
-                            uint32_t qSBlockSizeTmp = (s1Idx == static_cast<int32_t>(curQSBlockNumTmp - 1U))
-                                                          ? (qSeqlenCur - s1Idx * curQSBlockTileTmp)
-                                                          : curQSBlockTileTmp;
-                            uint32_t qNBlockIdxCurGroupTmp = n1Idx % qNBlockNumPerGroupTmp;
-                            uint32_t qNBlockSizeTmp = (qNBlockIdxCurGroupTmp == (qNBlockNumPerGroupTmp - 1U))
-                                                          ? (groupSize - qNBlockIdxCurGroupTmp * curQNBlockTileTmp)
-                                                          : curQNBlockTileTmp;
-                            gmOffsetLseFD += qSBlockSizeTmp * qNBlockSizeTmp;
-                            gmOffsetOFD += qSBlockSizeTmp * qNBlockSizeTmp * embedV;
+                for (uint32_t BIdx = startBIdx; BIdx <= endBIdx; BIdx++) {
+                    uint32_t qSeqlenCur = fATilingData->maxQSeqlen;
+                    uint32_t kvSeqlenCur = static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx));
+                    if constexpr (INPUT_LAYOUT == FaiKenel::inputLayout::TND) {
+                        qSeqlenCur = QSeqLenOf(BIdx, gActualQseqlen, gSeqUsedQ);
+                        if constexpr (!PAGED_CACHE_FLAG) {
+                            kvSeqlenCur = KvSeqLenOf(BIdx, gActualKvseqlen, gSeqUsedKv);
                         }
                     }
+                    // Per batch KV length including the appended new KV, reused by every task
+                    kvSeqlenCur += (kvNewSeqlen != 0U ? kvNewSeqlen : 0U);
+
+                    uint32_t curQNBlockTileTmp = GetQNBlockTile(qSeqlenCur, groupSize);
+                    uint32_t qNBlockNumPerGroupTmp = CeilDiv(groupSize, curQNBlockTileTmp);
+                    uint32_t curQNBlockNumTmp = qNBlockNumPerGroupTmp * kvHeads;
+                    uint32_t curQSBlockTileTmp = GetQSBlockTile(kvSeqlenCur);
+                    uint32_t curQSBlockNumTmp = CeilDiv(qSeqlenCur, curQSBlockTileTmp);
+                    uint32_t curKSBlockNumTmp = CeilDiv(kvSeqlenCur, kvStackLen);
+                    if (kvNewSeqlen != 0U) {
+                        curKSBlockNumTmp = CeilDiv(static_cast<uint32_t>(gActualKvseqlen.GetValue(BIdx)), kvStackLen) +
+                                           CeilDiv(kvNewSeqlen, kvStackLen);
+                    }
+
+                    int32_t stN1IdxNow = (BIdx == startBIdx) ? (int32_t)startN1Idx : 0;
+                    int32_t enN1IdxNow = (BIdx == endBIdx) ? (int32_t)endN1Idx : (int32_t)curQNBlockNumTmp - 1;
+
+                    for (int32_t n1Idx = stN1IdxNow; n1Idx <= enN1IdxNow; n1Idx++) {
+                        int32_t stS1IdxNow = (BIdx == startBIdx && n1Idx == stN1IdxNow) ? (int32_t)startS1Idx : 0;
+                        int32_t enS1IdxNow = (BIdx == endBIdx && n1Idx == enN1IdxNow) ? (int32_t)endS1Idx
+                                                                                      : (int32_t)curQSBlockNumTmp - 1;
+
+                        for (int32_t s1Idx = stS1IdxNow; s1Idx <= enS1IdxNow; s1Idx++) {
+                            int32_t stS2IdxNow = (BIdx == startBIdx && n1Idx == stN1IdxNow && s1Idx == stS1IdxNow)
+                                                     ? (int32_t)startS2Idx
+                                                     : 0;
+                            int32_t enS2IdxNow = (BIdx == endBIdx && n1Idx == enN1IdxNow && s1Idx == enS1IdxNow)
+                                                     ? (int32_t)endS2Idx
+                                                     : (int32_t)curKSBlockNumTmp;
+                            bool isSplitKV = (enS2IdxNow - stS2IdxNow) > 0 &&
+                                             (enS2IdxNow - stS2IdxNow) < static_cast<int32_t>(curKSBlockNumTmp);
+                            uint32_t pipelineDrain = 0;
+                            if (BIdx == endBIdx && n1Idx == enN1IdxNow && s1Idx == enS1IdxNow) {
+                                pipelineDrain = PRE_LAUNCH;
+                            }
+
+                            const uint32_t currentTaskStateSlot = taskStateSequence % STACK_SLOTS;
+                            const bool hasTaskWork =
+                                runMainLoop(coreIdx, BIdx, qSeqlenCur, kvSeqlenCur, (uint32_t)n1Idx, (uint32_t)s1Idx,
+                                            isSplitKV, stS2IdxNow, enS2IdxNow, gmOffsetLseFD, gmOffsetOFD,
+                                            globalTensors, descriptors, taskContexts, currentTaskStateSlot,
+                                            issuedStackCount, pipelineDrain, softmaxPingPongFlag);
+                            taskStateSequence += static_cast<uint32_t>(hasTaskWork);
+
+                            if (isSplitKV) {
+                                uint32_t qSBlockSizeTmp = (s1Idx == static_cast<int32_t>(curQSBlockNumTmp - 1U))
+                                                              ? (qSeqlenCur - s1Idx * curQSBlockTileTmp)
+                                                              : curQSBlockTileTmp;
+                                uint32_t qNBlockIdxCurGroupTmp = n1Idx % qNBlockNumPerGroupTmp;
+                                uint32_t qNBlockSizeTmp = (qNBlockIdxCurGroupTmp == (qNBlockNumPerGroupTmp - 1U))
+                                                              ? (groupSize - qNBlockIdxCurGroupTmp * curQNBlockTileTmp)
+                                                              : curQNBlockTileTmp;
+                                gmOffsetLseFD += qSBlockSizeTmp * qNBlockSizeTmp;
+                                gmOffsetOFD += qSBlockSizeTmp * qNBlockSizeTmp * embedV;
+                            }
+                        }
+                    }
                 }
-            }
             }
         } else {
             // Reuse the batch cursor across monotonically increasing tasks.
@@ -542,8 +542,7 @@ class FAInferKernel {
                 const bool hasTaskWork =
                     runMainLoop(coreIdx, curBatchTmp, qSeqlenCur, kvSeqlenCur, qNBlockIdxCur, qSBlockIdxCur, false, 0,
                                 0, 0, 0, globalTensors, descriptors, taskContexts, currentTaskStateSlot,
-                                issuedStackCount,
-                                pipelineDrain, softmaxPingPongFlag);
+                                issuedStackCount, pipelineDrain, softmaxPingPongFlag);
                 taskStateSequence += static_cast<uint32_t>(hasTaskWork);
             }
         }
@@ -588,8 +587,7 @@ class FAInferKernel {
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID2);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID4);
-        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL ||
-                      MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
+        if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_CAUSAL || MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
             epilogueOnlineSoftmax.ReleaseArithMaskEvents();
         }
 #endif
@@ -608,11 +606,9 @@ class FAInferKernel {
     }
 
     __aicore__ inline bool runMainLoop(uint32_t coreIdx, uint32_t BIdx, uint32_t qSeqlen, uint32_t kvSeqlenCur,
-                                       uint32_t qNBlockIdx, uint32_t qSBlockIdx,
-                                       bool isSplitKV, int32_t stS2IdxNow,
+                                       uint32_t qNBlockIdx, uint32_t qSBlockIdx, bool isSplitKV, int32_t stS2IdxNow,
                                        int32_t enS2IdxNow, uint64_t gmOffsetLseFD, uint64_t gmOffsetOFD,
-                                       GlobalTensorBundle& globalTensors,
-                                       StackDescriptor (&descriptors)[STACK_SLOTS],
+                                       GlobalTensorBundle& globalTensors, StackDescriptor (&descriptors)[STACK_SLOTS],
                                        DelayedPVTaskContext (&taskContexts)[STACK_SLOTS],
                                        const uint32_t& currentTaskStateSlot, uint32_t& issuedStackCount,
                                        uint32_t pipelineDrain, uint32_t& softmaxPingPongFlag)
@@ -881,13 +877,27 @@ class FAInferKernel {
             softmaxTaskPlan = EpilogueOnlineSoftmax::MakeTaskPlan(rowNum, qSBlockSize, qNBlockSize);
             rescaleTaskPlan = EpilogueRescaleO::MakeTaskPlan(rowNum, qSBlockSize, qNBlockSize, embedRoundV);
 #endif
-            taskContexts[currentTaskStateSlot] = DelayedPVTaskContext{
-                gmOffsetV, gmOffsetVNew, gmOffsetO, gmOffsetLse, gmOffsetLseFD, gmOffsetOFD,
-                blockBOffset, rowNum, qSeqlen, qSBlockSize, qNBlockSize, kvSLoopNumTotal, noSkipKvS,
-                invalidSuffixStartRow, invalidPrefixEndRow, static_cast<int32_t>(qSBlockIdx),
-                static_cast<int32_t>(curQNBlockTile), isSplitKV
+            taskContexts[currentTaskStateSlot] = DelayedPVTaskContext{gmOffsetV,
+                                                                      gmOffsetVNew,
+                                                                      gmOffsetO,
+                                                                      gmOffsetLse,
+                                                                      gmOffsetLseFD,
+                                                                      gmOffsetOFD,
+                                                                      blockBOffset,
+                                                                      rowNum,
+                                                                      qSeqlen,
+                                                                      qSBlockSize,
+                                                                      qNBlockSize,
+                                                                      kvSLoopNumTotal,
+                                                                      noSkipKvS,
+                                                                      invalidSuffixStartRow,
+                                                                      invalidPrefixEndRow,
+                                                                      static_cast<int32_t>(qSBlockIdx),
+                                                                      static_cast<int32_t>(curQNBlockTile),
+                                                                      isSplitKV
 #ifdef __DAV_C220_VEC__
-                , rescaleTaskPlan
+                                                                      ,
+                                                                      rescaleTaskPlan
 #endif
             };
         }
@@ -949,9 +959,9 @@ class FAInferKernel {
                     bool doTriUMask = triUp < static_cast<int64_t>(kvSEndIdx - 1U);
                     int64_t diagS0 = triUp - static_cast<int64_t>(kvSStartIdx);
                     epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
-                                          softmaxTaskPlan, desc.firstStack, qSBlockSize,
-                                          curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                          diagS0, doTriUMask, isSplitKV);
+                                          softmaxTaskPlan, desc.firstStack, qSBlockSize, curStackTileMod,
+                                          desc.taskStateSlot, qkReady, softmaxPingPongFlag, diagS0, doTriUMask,
+                                          isSplitKV);
                 } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
                     // StartLen can be negative when Sq>>Sk; compare in int32 so
                     // it is not promoted against uint32 kvSStartIdx/kvSEndIdx.
@@ -973,20 +983,20 @@ class FAInferKernel {
                     int64_t leftS0 = static_cast<int64_t>(windowSizeLeftStartLen) - kvSStartIdx;
                     int64_t rightS0 = static_cast<int64_t>(windowSizeRightStartLen) - kvSStartIdx;
                     epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
-                                          softmaxTaskPlan, desc.firstStack, qSBlockSize,
-                                          curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                          rightS0, doTriUMask, isSplitKV,
-                                          leftS0, doTriUPreMask, doTriUNextMask);
+                                          softmaxTaskPlan, desc.firstStack, qSBlockSize, curStackTileMod,
+                                          desc.taskStateSlot, qkReady, softmaxPingPongFlag, rightS0, doTriUMask,
+                                          isSplitKV, leftS0, doTriUPreMask, doTriUNextMask);
                 } else {
                     if constexpr (FLASH_DECODE_FLAG) {
-                        epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK, softmaxTaskPlan,
-                                              desc.firstStack, 0, qSBlockSize, qNBlockSize, curStackTileMod,
-                                              desc.taskStateSlot, qkReady, softmaxPingPongFlag, isSplitKV, false,
-                                              false);
+                        epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
+                                              softmaxTaskPlan, desc.firstStack, 0, qSBlockSize, qNBlockSize,
+                                              curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
+                                              isSplitKV, false, false);
                     } else {
-                        epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK, softmaxTaskPlan,
-                                              desc.firstStack, 0, qSBlockSize, qNBlockSize, curStackTileMod,
-                                              desc.taskStateSlot, qkReady, softmaxPingPongFlag, false, false, false);
+                        epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
+                                              softmaxTaskPlan, desc.firstStack, 0, qSBlockSize, qNBlockSize,
+                                              curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag, false,
+                                              false, false);
                     }
                 }
                 Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(softmaxReady);
@@ -996,7 +1006,7 @@ class FAInferKernel {
                 StackDescriptor& pvDesc = descriptors[(issuedStackCount - PRE_LAUNCH) % STACK_SLOTS];
                 DelayedPVTaskContext& task = taskContexts[pvDesc.taskStateSlot];
                 uint64_t gmOffsetOTmp = static_cast<uint64_t>(coreIdx * WORKSPACE_BLOCK_SIZE_DB * STACK_SLOTS +
-                                                               pvDesc.slot * WORKSPACE_BLOCK_SIZE_DB);
+                                                              pvDesc.slot * WORKSPACE_BLOCK_SIZE_DB);
                 GemmCoord actualBlockShapePV{task.rowNum, embedV, pvDesc.stackSeqTile};
                 LayoutOTmp layoutOTmp(task.rowNum, embedV, embedRoundV);
 #ifdef __DAV_C220_CUBE__
@@ -1012,14 +1022,14 @@ class FAInferKernel {
                     blockMmadPV(gP[gmOffsetP], gPVSrc[gmOffsetVSrc], gOTmp[gmOffsetOTmp],
                                 pvDesc.isAppendBlock ? gBlockTable : gBlockTable[task.blockBOffset], layoutPTemp,
                                 layoutVTemp, layoutOTmp, actualBlockShapePV, pvDesc.kvSIdx, kvSLoopNumTotal,
-                                pagedBlockSize, task.noSkipKvS, strideV, blockStackNum, softmaxReady,
-                                pvDesc.doCopyback, gV[task.gmOffsetV], pvDesc.pvCacheOffset, gBlockTable,
+                                pagedBlockSize, task.noSkipKvS, strideV, blockStackNum, softmaxReady, pvDesc.doCopyback,
+                                gV[task.gmOffsetV], pvDesc.pvCacheOffset, gBlockTable,
                                 pvDesc.isAppendBlock ? pagedBlockSize : 0U, static_cast<uint32_t>(task.blockBOffset));
                 } else {
-                    blockMmadPV(gP[gmOffsetP], gPVSrc[gmOffsetVSrc], gOTmp[gmOffsetOTmp], gBlockTable,
-                                layoutPTemp, layoutVTemp, layoutOTmp, actualBlockShapePV, pvDesc.kvSIdx,
-                                kvSLoopNumTotal, pagedBlockSize, task.noSkipKvS, strideV, blockStackNum,
-                                softmaxReady, pvDesc.doCopyback, gV[task.gmOffsetV], pvDesc.pvCacheOffset);
+                    blockMmadPV(gP[gmOffsetP], gPVSrc[gmOffsetVSrc], gOTmp[gmOffsetOTmp], gBlockTable, layoutPTemp,
+                                layoutVTemp, layoutOTmp, actualBlockShapePV, pvDesc.kvSIdx, kvSLoopNumTotal,
+                                pagedBlockSize, task.noSkipKvS, strideV, blockStackNum, softmaxReady, pvDesc.doCopyback,
+                                gV[task.gmOffsetV], pvDesc.pvCacheOffset);
                 }
                 Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(pvReady);
 #endif
@@ -1042,18 +1052,18 @@ class FAInferKernel {
                     splitParams.layoutgmLse = &layoutgmLse;
                     splitParams.layoutgmLo = &layoutgmLo;
 
-                    epilogueRescaleO(
-                        gO[task.gmOffsetO], gOTmp[gmOffsetOTmp], gOUpdate[gmOffsetUpdate], gLse[task.gmOffsetLse],
-                        layoutO, layoutOTmp, layoutUpdate, layoutLse, actualBlockShapePV, task.rescaleTaskPlan, pvReady,
-                        task.qSBlockSize, task.qNBlockSize, pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot, pvDesc.taskStateSlot,
-                        splitParams, 0, 0, 0, 0, 1, static_cast<uint32_t>(strideO), static_cast<uint32_t>(oHeadStride));
+                    epilogueRescaleO(gO[task.gmOffsetO], gOTmp[gmOffsetOTmp], gOUpdate[gmOffsetUpdate],
+                                     gLse[task.gmOffsetLse], layoutO, layoutOTmp, layoutUpdate, layoutLse,
+                                     actualBlockShapePV, task.rescaleTaskPlan, pvReady, task.qSBlockSize,
+                                     task.qNBlockSize, pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot,
+                                     pvDesc.taskStateSlot, splitParams, 0, 0, 0, 0, 1, static_cast<uint32_t>(strideO),
+                                     static_cast<uint32_t>(oHeadStride));
                 } else {
                     epilogueRescaleO(
                         gO[task.gmOffsetO], gOTmp[gmOffsetOTmp], gOUpdate[gmOffsetUpdate], gLse[task.gmOffsetLse],
                         layoutO, layoutOTmp, layoutUpdate, layoutLse, actualBlockShapePV, task.rescaleTaskPlan, pvReady,
-                        task.qSBlockSize,
-                        task.qNBlockSize, pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot, pvDesc.taskStateSlot,
-                        typename EpilogueRescaleO::SplitKVParams(), task.invalidSuffixStartRow,
+                        task.qSBlockSize, task.qNBlockSize, pvDesc.firstStack, pvDesc.lastStack, pvDesc.slot,
+                        pvDesc.taskStateSlot, typename EpilogueRescaleO::SplitKVParams(), task.invalidSuffixStartRow,
                         task.invalidPrefixEndRow, task.qSeqlen, task.qSBlockIdx, task.curQNBlockTile,
                         static_cast<uint32_t>(strideO), static_cast<uint32_t>(oHeadStride));
                 }

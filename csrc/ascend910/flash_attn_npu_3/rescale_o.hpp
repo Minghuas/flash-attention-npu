@@ -84,8 +84,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
 
     __aicore__ inline ~BlockEpilogue() {}
 
-    __aicore__ inline static TaskPlan MakeTaskPlan(uint32_t rowNum, uint32_t qSBlockSize,
-                                                   uint32_t qNBlockSize, uint32_t embedRoundV)
+    __aicore__ inline static TaskPlan MakeTaskPlan(uint32_t rowNum, uint32_t qSBlockSize, uint32_t qNBlockSize,
+                                                   uint32_t embedRoundV)
     {
         TaskPlan plan{};
         const uint32_t maxRowNumPerLoop = MAX_UB_O_ELEM_NUM / embedRoundV;
@@ -93,17 +93,15 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
         plan.subBlockIdx = AscendC::GetSubBlockIdx();
         const uint32_t subBlockNum = AscendC::GetSubBlockNum();
         plan.qNSplitSubBlock = qNBlockSize / subBlockNum;
-        plan.qNThisSubBlock = (qNBlockSize == 1U) ? 0U
-            : (plan.subBlockIdx == 1U ? qNBlockSize - plan.qNSplitSubBlock : plan.qNSplitSubBlock);
-        const uint32_t inRowSplitSubBlock = (qNBlockSize == 1U)
-            ? qSBlockSize / subBlockNum : qSBlockSize * plan.qNSplitSubBlock;
-        plan.inRowActualThisSubBlock = (plan.subBlockIdx == 1U)
-            ? rowNum - inRowSplitSubBlock : inRowSplitSubBlock;
+        plan.qNThisSubBlock =
+            (qNBlockSize == 1U) ? 0U
+                                : (plan.subBlockIdx == 1U ? qNBlockSize - plan.qNSplitSubBlock : plan.qNSplitSubBlock);
+        const uint32_t inRowSplitSubBlock =
+            (qNBlockSize == 1U) ? qSBlockSize / subBlockNum : qSBlockSize * plan.qNSplitSubBlock;
+        plan.inRowActualThisSubBlock = (plan.subBlockIdx == 1U) ? rowNum - inRowSplitSubBlock : inRowSplitSubBlock;
         plan.inRowOffsetThisSubBlock = plan.subBlockIdx * inRowSplitSubBlock;
-        plan.qSThisSubBlock = (qNBlockSize == 1U)
-            ? plan.inRowActualThisSubBlock : qSBlockSize;
-        plan.rowLoop = plan.inRowActualThisSubBlock == 0U
-            ? 0U : CeilDiv(plan.inRowActualThisSubBlock, plan.rowNumTile);
+        plan.qSThisSubBlock = (qNBlockSize == 1U) ? plan.inRowActualThisSubBlock : qSBlockSize;
+        plan.rowLoop = plan.inRowActualThisSubBlock == 0U ? 0U : CeilDiv(plan.inRowActualThisSubBlock, plan.rowNumTile);
         plan.needRowLoop = plan.rowLoop > 1U ? 1U : 0U;
         return plan;
     }
@@ -209,10 +207,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
         }
         if (invalidBegin < invalidEnd) {
             AscendC::PipeBarrier<PIPE_V>();
-            AscendC::Duplicate<ElementOutput>(
-                goUbTensor16[(ubRowOffset + invalidBegin - tokenStart) * embedRound],
-                static_cast<ElementOutput>(0),
-                (invalidEnd - invalidBegin) * embedRound);
+            AscendC::Duplicate<ElementOutput>(goUbTensor16[(ubRowOffset + invalidBegin - tokenStart) * embedRound],
+                                              static_cast<ElementOutput>(0), (invalidEnd - invalidBegin) * embedRound);
         }
     }
 
@@ -238,11 +234,9 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                 copyRows = epiTokenNum;
                 gmOffset = ((proTokenNum != 0U ? 1U : 0U) + integralHeadNum) * oHeadStride;
             }
-            AscendC::DataCopyPad(
-                gOutput[gmOffset],
-                goUbTensor16[sourceRow * embedRound],
-                AscendC::DataCopyExtParams(
-                    copyRows, embed * SIZE_OF_16BIT, 0, (outputStride - embed) * SIZE_OF_16BIT, 0));
+            AscendC::DataCopyPad(gOutput[gmOffset], goUbTensor16[sourceRow * embedRound],
+                                 AscendC::DataCopyExtParams(copyRows, embed * SIZE_OF_16BIT, 0,
+                                                            (outputStride - embed) * SIZE_OF_16BIT, 0));
             sourceRow += copyRows;
             remaining -= copyRows;
         }
@@ -275,11 +269,9 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                 copyRows = epiTokenNum;
                 gmOffset = ((proTokenNum != 0U ? 1U : 0U) + integralHeadNum) * embed;
             }
-            AscendC::DataCopyPad(
-                gOutput[gmOffset],
-                goUbTensor32[sourceRow * embedRound],
-                AscendC::DataCopyExtParams(
-                    copyRows, blockLen, srcStride, (oHiddenSize_gmlo - embed) * sizeof(float), 0));
+            AscendC::DataCopyPad(gOutput[gmOffset], goUbTensor32[sourceRow * embedRound],
+                                 AscendC::DataCopyExtParams(copyRows, blockLen, srcStride,
+                                                            (oHiddenSize_gmlo - embed) * sizeof(float), 0));
             sourceRow += copyRows;
             remaining -= copyRows;
         }
@@ -321,13 +313,13 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
     SubCoreCompute(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<ElementInput> gInput,
                    AscendC::GlobalTensor<ElementUpdate> gUpdate, AscendC::GlobalTensor<ElementLse> gLse,
                    const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutUpdate& layoutUpdate,
-                   const LayoutLse& layoutLse, uint32_t qNThisSubBlock, uint32_t qSThisSubBlock,
-                   uint32_t totalRowNum, uint32_t isFirstStackTile, uint32_t isLastStackTile,
-                   uint32_t curStackTileMod, uint32_t taskStateSlot, uint32_t needRowLoop, uint32_t isLastRowLoop,
-                   uint32_t rowOffsetLoop, const SplitKVParams& splitParams, uint32_t rowOffsetCurLoop,
-                   int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx,
-                   uint32_t rowNum, uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile,
-                   uint32_t outputStride, uint32_t oHeadStride)
+                   const LayoutLse& layoutLse, uint32_t qNThisSubBlock, uint32_t qSThisSubBlock, uint32_t totalRowNum,
+                   uint32_t isFirstStackTile, uint32_t isLastStackTile, uint32_t curStackTileMod,
+                   uint32_t taskStateSlot, uint32_t needRowLoop, uint32_t isLastRowLoop, uint32_t rowOffsetLoop,
+                   const SplitKVParams& splitParams, uint32_t rowOffsetCurLoop, int32_t invalidSuffixStartRow,
+                   int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx, uint32_t rowNum,
+                   uint32_t inRowOffsetThisSubBlock, uint32_t curQNBlockTile, uint32_t outputStride,
+                   uint32_t oHeadStride)
     {
         uint32_t curRowNum = layoutInput.shape(0);
         uint32_t embed = layoutInput.shape(1);
@@ -341,8 +333,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
         if (isFirstStackTile) {
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
             // *** go = lo
-            AscendC::DataCopy(
-                goUbTensor32, gInput, AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+            AscendC::DataCopy(goUbTensor32, gInput,
+                              AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         } else {
@@ -394,9 +386,8 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
             if (needRowLoop) {
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
-                AscendC::DataCopy(
-                    gUpdate, goUbTensor32,
-                    AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
+                AscendC::DataCopy(gUpdate, goUbTensor32,
+                                  AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
             }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
         } else {
@@ -451,23 +442,27 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                         AscendC::UnaryRepeatParams(1, 1, 4, 8));
                 }
             }
-            const bool hasInvalidRows = invalidSuffixStartRow > 0 ||
+            const bool hasInvalidRows =
+                invalidSuffixStartRow > 0 ||
                 (invalidPrefixEndRow >= 0 && invalidPrefixEndRow != static_cast<int32_t>(qSeqlen));
             if (!splitParams.isSplitkv && hasInvalidRows) {
                 // Keep one inline clear body for the initial fragment, complete
                 // heads and final fragment. Reuse the existing segmentation.
                 const uint32_t qBlockStart = qSBlockIdx * VECTOR_SIZE;
                 const uint32_t rowStart = qBlockStart + rowOffsetCurLoop;
-                const uint32_t subBlockStart = qNThisSubBlock == 0U ? rowStart
-                    : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
-                uint32_t tokenStart = qNThisSubBlock == 0U ? rowStart
-                    : (proTokenNum != 0U ? subBlockStart : qBlockStart);
-                uint32_t clearRows = qNThisSubBlock == 0U ? curRowNum
-                    : (proTokenNum != 0U ? proTokenNum : AscendC::Std::min(curRowNum, qSThisSubBlock));
+                const uint32_t subBlockStart =
+                    qNThisSubBlock == 0U ? rowStart
+                                         : (rowStart >= qSeqlen ? rowStart - rowStart / qSeqlen * qSeqlen : rowStart);
+                uint32_t tokenStart =
+                    qNThisSubBlock == 0U ? rowStart : (proTokenNum != 0U ? subBlockStart : qBlockStart);
+                uint32_t clearRows =
+                    qNThisSubBlock == 0U
+                        ? curRowNum
+                        : (proTokenNum != 0U ? proTokenNum : AscendC::Std::min(curRowNum, qSThisSubBlock));
                 uint32_t sourceRow = 0U;
                 while (sourceRow < curRowNum) {
-                    ClearInvalidOutputRows(sourceRow, tokenStart, clearRows, invalidSuffixStartRow,
-                                           invalidPrefixEndRow, qSeqlen, embedRound);
+                    ClearInvalidOutputRows(sourceRow, tokenStart, clearRows, invalidSuffixStartRow, invalidPrefixEndRow,
+                                           qSeqlen, embedRound);
                     sourceRow += clearRows;
                     tokenStart = qBlockStart;
                     clearRows = AscendC::Std::min(curRowNum - sourceRow, qSThisSubBlock);
@@ -549,11 +544,11 @@ class BlockEpilogue<EpilogueAtlasA2RescaleOT<LSE_MODE_, float>, OutputType_, Inp
                AscendC::GlobalTensor<ElementUpdate> gUpdate, AscendC::GlobalTensor<ElementLse> gLse,
                const LayoutOutput& layoutOutput, const LayoutInput& layoutInput, const LayoutUpdate& layoutUpdate,
                const LayoutLse& layoutLse, GemmCoord actualBlockShape, const TaskPlan& taskPlan,
-               Arch::CrossCoreFlag pvReady,
-               uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t isFirstStackTile, uint32_t isLastStackTile,
-               uint32_t curStackTileMod, uint32_t taskStateSlot, const SplitKVParams& splitParams,
-               int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow, uint32_t qSeqlen, uint32_t qSBlockIdx,
-               uint32_t curQNBlockTile, uint32_t outputStride, uint32_t oHeadStride)
+               Arch::CrossCoreFlag pvReady, uint32_t qSBlockSize, uint32_t qNBlockSize, uint32_t isFirstStackTile,
+               uint32_t isLastStackTile, uint32_t curStackTileMod, uint32_t taskStateSlot,
+               const SplitKVParams& splitParams, int32_t invalidSuffixStartRow, int32_t invalidPrefixEndRow,
+               uint32_t qSeqlen, uint32_t qSBlockIdx, uint32_t curQNBlockTile, uint32_t outputStride,
+               uint32_t oHeadStride)
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t embed = actualBlockShape.n();
