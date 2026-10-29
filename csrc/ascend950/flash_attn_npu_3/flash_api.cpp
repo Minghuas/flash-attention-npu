@@ -143,12 +143,9 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
 {
     TORCH_CHECK(out_partial.device().type() == at::kPrivateUse1, "out_partial must be on NPU");
     TORCH_CHECK(lse_partial.device().type() == at::kPrivateUse1, "lse_partial must be on NPU");
-    TORCH_CHECK(out_partial.scalar_type() == at::kFloat,
-                "Attention combine function only support fp32 data type");
-    TORCH_CHECK(lse_partial.scalar_type() == at::kFloat,
-                "Attention combine function only support fp32 data type");
-    TORCH_CHECK(out_partial.dim() == 4 || out_partial.dim() == 5,
-                "out_partial must have 4 or 5 dimensions");
+    TORCH_CHECK(out_partial.scalar_type() == at::kFloat, "Attention combine function only support fp32 data type");
+    TORCH_CHECK(lse_partial.scalar_type() == at::kFloat, "Attention combine function only support fp32 data type");
+    TORCH_CHECK(out_partial.dim() == 4 || out_partial.dim() == 5, "out_partial must have 4 or 5 dimensions");
     TORCH_CHECK(out_partial.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
     const bool is_dense = out_partial.dim() == 5;
@@ -182,9 +179,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
                     " out_partial=", out_partial.sizes());
     }
 
-    const auto out_type = out_.has_value()
-                              ? out_->scalar_type()
-                              : out_dtype_.value_or(out_partial.scalar_type());
+    const auto out_type = out_.has_value() ? out_->scalar_type() : out_dtype_.value_or(out_partial.scalar_type());
     TORCH_CHECK(out_type == at::kFloat || out_type == at::kHalf || out_type == at::kBFloat16,
                 "Output type must be FP32, FP16 or BF16");
 
@@ -198,8 +193,7 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
                             out.size(2) == num_heads && out.size(3) == head_dim,
                         "out shape must be (batch, seqlen, num_heads, head_dim)");
         } else {
-            TORCH_CHECK(out.dim() == 3 && out.size(0) == seqlen && out.size(1) == num_heads &&
-                            out.size(2) == head_dim,
+            TORCH_CHECK(out.dim() == 3 && out.size(0) == seqlen && out.size(1) == num_heads && out.size(2) == head_dim,
                         "out shape must be (total_q, num_heads, head_dim)");
         }
     } else if (is_dense) {
@@ -238,11 +232,10 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     const uint32_t ns_align = (ns + 7U) / 8U * 8U;
     const uint32_t out_bytes = (out_type == at::kFloat) ? 4U : 2U;
     const uint32_t elem_align = (out_bytes == 4U) ? 8U : 16U;
-    const uint32_t d_align =
-        (static_cast<uint32_t>(head_dim) + elem_align - 1U) / elem_align * elem_align;
+    const uint32_t d_align = (static_cast<uint32_t>(head_dim) + elem_align - 1U) / elem_align * elem_align;
     // Choose tileRows up to 32 while per-tile UB usage stays below 150 KiB.
-    const uint64_t per_row = static_cast<uint64_t>(ns_align) * 16U +
-                             static_cast<uint64_t>(16U + out_bytes + 4U) * d_align;
+    const uint64_t per_row =
+        static_cast<uint64_t>(ns_align) * 16U + static_cast<uint64_t>(16U + out_bytes + 4U) * d_align;
     uint32_t tile_rows = 8U;
     for (uint32_t candidate : {32U, 24U, 16U, 8U}) {
         if (static_cast<uint64_t>(candidate) * per_row <= 150U * 1024U) {
@@ -253,14 +246,13 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     TORCH_CHECK(static_cast<uint64_t>(tile_rows) * per_row <= 150U * 1024U,
                 "combine tile exceeds 150 KiB UB budget for head_dim=", head_dim);
 
-    const uint64_t head_batch = is_dense ? static_cast<uint64_t>(batch_size) * num_heads
-                                         : static_cast<uint64_t>(num_heads);
+    const uint64_t head_batch =
+        is_dense ? static_cast<uint64_t>(batch_size) * num_heads : static_cast<uint64_t>(num_heads);
     const uint64_t row_blocks = (static_cast<uint64_t>(seqlen) + tile_rows - 1U) / tile_rows;
     const uint64_t total_tasks = head_batch * row_blocks;
     const uint32_t aiv = platform_ascendc::PlatformAscendCManager::GetInstance()->GetCoreNumAic();
     const uint32_t launch_block_dim =
-        static_cast<uint32_t>(std::min<uint64_t>(std::max<uint64_t>(aiv, 1U),
-                                                 std::max<uint64_t>(total_tasks, 1U)));
+        static_cast<uint32_t>(std::min<uint64_t>(std::max<uint64_t>(aiv, 1U), std::max<uint64_t>(total_tasks, 1U)));
 
     CombineLaunchArgs args{};
     args.aclStream = c10_npu::getCurrentNPUStream().stream(false);
@@ -323,15 +315,13 @@ std::vector<at::Tensor> mha_combine(at::Tensor out_partial, at::Tensor lse_parti
     return {out, lse_out};
 }
 
-
 PYBIND11_MODULE(flash_attn_npu_3_950, m)
 {
     m.doc() = "FlashAttention v3 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
-    m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs",
-          py::arg("out_partial"), py::arg("lse_partial"), py::arg("out") = py::none(),
-          py::arg("out_dtype") = py::none(), py::arg("cu_seqlens") = py::none(),
-          py::arg("seqused") = py::none(), py::arg("return_lse") = true);
+    m.def("fwd_combine", &mha_combine, "Combine split attention partial outputs", py::arg("out_partial"),
+          py::arg("lse_partial"), py::arg("out") = py::none(), py::arg("out_dtype") = py::none(),
+          py::arg("cu_seqlens") = py::none(), py::arg("seqused") = py::none(), py::arg("return_lse") = true);
 }

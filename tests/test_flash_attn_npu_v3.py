@@ -2205,9 +2205,7 @@ def test_combine_additional_coverage(
 
     out, lse = flash_attn_combine(out_partial, lse_partial, out_dtype=data_type)
     expected_shape = (
-        (batch, seqlen, heads, head_dim)
-        if layout == "BSND"
-        else (seqlen, heads, head_dim)
+        (batch, seqlen, heads, head_dim) if layout == "BSND" else (seqlen, heads, head_dim)
     )
     assert tuple(out.shape) == expected_shape
     assert out.dtype == data_type

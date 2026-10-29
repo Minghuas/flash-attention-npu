@@ -33,13 +33,12 @@ __aicore__ inline uint32_t AlignUp(uint32_t value, uint32_t align)
 }
 
 template <class OutDType>
-__global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_ADDR lsePartial, GM_ADDR outGm,
-                                     GM_ADDR lseOutGm, GM_ADDR virtualBatchIdx, uint32_t isDense,
-                                     uint32_t writeLse, uint32_t numSplits, uint32_t batch, uint32_t seqlen,
-                                     uint32_t numHeads, uint32_t headDim, uint32_t tileRows, int64_t oSplit,
-                                     int64_t oBatch, int64_t oSeq, int64_t oHead, int64_t lSplit, int64_t lBatch,
-                                     int64_t lSeq, int64_t lHead, int64_t outBatch, int64_t outSeq, int64_t outHead,
-                                     int64_t lseOutBatch, int64_t lseOutHead)
+__global__ __aicore__ void
+FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_ADDR lsePartial, GM_ADDR outGm, GM_ADDR lseOutGm,
+          GM_ADDR virtualBatchIdx, uint32_t isDense, uint32_t writeLse, uint32_t numSplits, uint32_t batch,
+          uint32_t seqlen, uint32_t numHeads, uint32_t headDim, uint32_t tileRows, int64_t oSplit, int64_t oBatch,
+          int64_t oSeq, int64_t oHead, int64_t lSplit, int64_t lBatch, int64_t lSeq, int64_t lHead, int64_t outBatch,
+          int64_t outSeq, int64_t outHead, int64_t lseOutBatch, int64_t lseOutHead)
 {
     AscendC::SetSyncBaseAddr(fftsAddr);
 #ifdef __DAV_C220_VEC__
@@ -115,10 +114,9 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
         const uint32_t hb = task / rowBlocks;
         const uint32_t rb = task - hb * rowBlocks;
         const uint32_t virtualBIdx = (isDense != 0U) ? (hb / numHeads) : 0U;
-        const uint32_t bIdx =
-            (isDense != 0U && virtualBatchIdx != nullptr)
-                ? static_cast<uint32_t>(gVirtualBatchIdx.GetValue(virtualBIdx))
-                : virtualBIdx;
+        const uint32_t bIdx = (isDense != 0U && virtualBatchIdx != nullptr)
+                                  ? static_cast<uint32_t>(gVirtualBatchIdx.GetValue(virtualBIdx))
+                                  : virtualBIdx;
         const uint32_t hIdx = (isDense != 0U) ? (hb % numHeads) : hb;
         const uint32_t s0 = rb * tileRows;
         const uint32_t remain = seqlen - s0;
@@ -130,8 +128,8 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
         AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID0);
 
-        const int64_t lseBase = static_cast<int64_t>(bIdx) * lBatch + static_cast<int64_t>(hIdx) * lHead +
-                                static_cast<int64_t>(s0) * lSeq;
+        const int64_t lseBase =
+            static_cast<int64_t>(bIdx) * lBatch + static_cast<int64_t>(hIdx) * lHead + static_cast<int64_t>(s0) * lSeq;
         // Align the 8-float transfer to 32B; use scalar loads if it crosses the row.
         const uint32_t loadElems = AlignUp(nrows, 8U);
         const bool vectorLoad = (lSeq == 1 && loadElems <= (seqlen - s0));
@@ -141,15 +139,13 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
                     lseUb[split * rA], gPartialLse[lseBase + static_cast<int64_t>(split) * lSplit],
                     AscendC::DataCopyExtParams(1U, static_cast<uint32_t>(loadElems * sizeof(float)), 0U, 0U, 0U),
                     AscendC::DataCopyPadExtParams<float>(false, 0U, static_cast<uint8_t>(loadElems - nrows),
-                                                        std::numeric_limits<float>::lowest()));
+                                                         std::numeric_limits<float>::lowest()));
             }
         } else {
             for (uint32_t split = 0U; split < numSplits; ++split) {
                 const int64_t base = lseBase + static_cast<int64_t>(split) * lSplit;
                 for (uint32_t row = 0U; row < nrows; ++row) {
-                    lseUb.SetValue(
-                        split * rA + row,
-                        gPartialLse.GetValue(base + static_cast<int64_t>(row) * lSeq));
+                    lseUb.SetValue(split * rA + row, gPartialLse.GetValue(base + static_cast<int64_t>(row) * lSeq));
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID0);
@@ -209,8 +205,8 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
         AscendC::Duplicate(oUb, 0.0f, static_cast<int32_t>(rA * dA));
         AscendC::PipeBarrier<PIPE_V>();
 
-        const int64_t oBase = static_cast<int64_t>(bIdx) * oBatch + static_cast<int64_t>(hIdx) * oHead +
-                              static_cast<int64_t>(s0) * oSeq;
+        const int64_t oBase =
+            static_cast<int64_t>(bIdx) * oBatch + static_cast<int64_t>(hIdx) * oHead + static_cast<int64_t>(s0) * oSeq;
         // DataCopyPad padding must stay within one 32B block (<= 7 floats).
         const uint32_t oPad = AlignUp(headDim, 8U) - headDim;
         // Use explicit dstStride to preserve row pitch dA for unaligned headDim.
@@ -221,13 +217,11 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
         for (uint32_t split = 0U; split < numSplits; ++split) {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID1);
-            AscendC::DataCopyPad(
-                oUb, gPartialO[oBase + static_cast<int64_t>(split) * oSplit],
-                AscendC::DataCopyExtParams(static_cast<uint16_t>(nrows),
-                                           static_cast<uint32_t>(headDim * sizeof(float)),
-                                           static_cast<uint32_t>((oSeq - static_cast<int64_t>(headDim)) * 4),
-                                           oDstStride, 0U),
-                AscendC::DataCopyPadExtParams<float>(true, 0U, static_cast<uint8_t>(oPad), 0.0f));
+            AscendC::DataCopyPad(oUb, gPartialO[oBase + static_cast<int64_t>(split) * oSplit],
+                                 AscendC::DataCopyExtParams(
+                                     static_cast<uint16_t>(nrows), static_cast<uint32_t>(headDim * sizeof(float)),
+                                     static_cast<uint32_t>((oSeq - static_cast<int64_t>(headDim)) * 4), oDstStride, 0U),
+                                 AscendC::DataCopyPadExtParams<float>(true, 0U, static_cast<uint8_t>(oPad), 0.0f));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
 
@@ -259,15 +253,14 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
         const int64_t outBase = static_cast<int64_t>(bIdx) * outBatch + static_cast<int64_t>(hIdx) * outHead +
                                 static_cast<int64_t>(s0) * outSeq;
         // UB-side gap between output rows, in 32B units.
-        const uint32_t outSrcStride =
-            (dA * kOutBytes - AlignUp(headDim * kOutBytes, 32U)) / 32U;
+        const uint32_t outSrcStride = (dA * kOutBytes - AlignUp(headDim * kOutBytes, 32U)) / 32U;
         if constexpr (std::is_same<OutDType, float>::value) {
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2);
             AscendC::DataCopyPad(
                 gOut[outBase], accUb,
-                AscendC::DataCopyExtParams(static_cast<uint16_t>(nrows),
-                                           static_cast<uint32_t>(headDim * sizeof(float)), outSrcStride,
+                AscendC::DataCopyExtParams(static_cast<uint16_t>(nrows), static_cast<uint32_t>(headDim * sizeof(float)),
+                                           outSrcStride,
                                            static_cast<uint32_t>((outSeq - static_cast<int64_t>(headDim)) * 4), 0U));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
@@ -280,12 +273,11 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID2);
-            AscendC::DataCopyPad(
-                gOut[outBase], outUb,
-                AscendC::DataCopyExtParams(static_cast<uint16_t>(nrows),
-                                           static_cast<uint32_t>(headDim * kOutBytes), outSrcStride,
-                                           static_cast<uint32_t>((outSeq - static_cast<int64_t>(headDim)) * kOutBytes),
-                                           0U));
+            AscendC::DataCopyPad(gOut[outBase], outUb,
+                                 AscendC::DataCopyExtParams(
+                                     static_cast<uint16_t>(nrows), static_cast<uint32_t>(headDim * kOutBytes),
+                                     outSrcStride,
+                                     static_cast<uint32_t>((outSeq - static_cast<int64_t>(headDim)) * kOutBytes), 0U));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID2);
         }
@@ -295,8 +287,9 @@ __global__ __aicore__ void FACombine(uint64_t fftsAddr, GM_ADDR outPartial, GM_A
                                        static_cast<int64_t>(hIdx) * lseOutHead + static_cast<int64_t>(s0);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID3);
-            AscendC::DataCopyPad(gLseOut[lseOutBase], lseOutUb,
-                                 AscendC::DataCopyExtParams(1U, static_cast<uint32_t>(nrows * sizeof(float)), 0U, 0U, 0U));
+            AscendC::DataCopyPad(
+                gLseOut[lseOutBase], lseOutUb,
+                AscendC::DataCopyExtParams(1U, static_cast<uint32_t>(nrows * sizeof(float)), 0U, 0U, 0U));
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID3);
         }
@@ -309,16 +302,24 @@ template <class OutDType>
 inline void LaunchCombine(const CombineLaunchArgs& a)
 {
     FACombine<OutDType><<<a.launchBlockDim, nullptr, a.aclStream>>>(
-        a.fftsAddr, a.outPartial, a.lsePartial, a.out, a.lseOut, a.virtualBatchIdx, a.isDense, a.writeLse,
-        a.numSplits, a.batch, a.seqlen, a.numHeads, a.headDim, a.tileRows, a.oSplit, a.oBatch, a.oSeq,
-        a.oHead, a.lSplit, a.lBatch, a.lSeq, a.lHead, a.outBatch, a.outSeq, a.outHead, a.lseOutBatch,
-        a.lseOutHead);
+        a.fftsAddr, a.outPartial, a.lsePartial, a.out, a.lseOut, a.virtualBatchIdx, a.isDense, a.writeLse, a.numSplits,
+        a.batch, a.seqlen, a.numHeads, a.headDim, a.tileRows, a.oSplit, a.oBatch, a.oSeq, a.oHead, a.lSplit, a.lBatch,
+        a.lSeq, a.lHead, a.outBatch, a.outSeq, a.outHead, a.lseOutBatch, a.lseOutHead);
 }
 
 } // namespace FaCombine
 
-void launch_combine_fp16(const CombineLaunchArgs& args) { FaCombine::LaunchCombine<half>(args); }
+void launch_combine_fp16(const CombineLaunchArgs& args)
+{
+    FaCombine::LaunchCombine<half>(args);
+}
 
-void launch_combine_bf16(const CombineLaunchArgs& args) { FaCombine::LaunchCombine<bfloat16_t>(args); }
+void launch_combine_bf16(const CombineLaunchArgs& args)
+{
+    FaCombine::LaunchCombine<bfloat16_t>(args);
+}
 
-void launch_combine_fp32(const CombineLaunchArgs& args) { FaCombine::LaunchCombine<float>(args); }
+void launch_combine_fp32(const CombineLaunchArgs& args)
+{
+    FaCombine::LaunchCombine<float>(args);
+}

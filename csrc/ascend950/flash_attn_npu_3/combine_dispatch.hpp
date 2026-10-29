@@ -13,7 +13,7 @@
 
 struct CombineLaunchArgs {
     aclrtStream aclStream{nullptr};
-    uint64_t fftsAddr{0};  // unused on 950, kept for ABI parity with 910
+    uint64_t fftsAddr{0}; // unused on 950, kept for ABI parity with 910
     uint32_t launchBlockDim{0};
 
     uint32_t isDense{0};

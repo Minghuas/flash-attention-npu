@@ -1160,9 +1160,7 @@ def _assert_combine_close(out, lse, out_ref, lse_ref, data_type):
     cast_ref = out_ref.to(data_type)
     cast_err = (cast_ref.float() - out_ref).abs().max().item()
     diff = (out.float() - out_ref).abs().max().item()
-    assert diff <= 2.0 * cast_err + 1e-3, (
-        f"out max diff {diff:.6f} vs cast err {cast_err:.6f}"
-    )
+    assert diff <= 2.0 * cast_err + 1e-3, f"out max diff {diff:.6f} vs cast err {cast_err:.6f}"
 
 
 # data_type, num_splits, head_dim

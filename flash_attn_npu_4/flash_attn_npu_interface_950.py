@@ -1013,9 +1013,7 @@ def _flash_attn_combine_op(
         virtual_batch_idx,
         return_lse,
     )
-    return result[1] if return_lse else torch.empty(
-        0, dtype=torch.float32, device=result[0].device
-    )
+    return result[1] if return_lse else torch.empty(0, dtype=torch.float32, device=result[0].device)
 
 
 @_torch_register_fake_wrapper("flash_attn_npu_4_950::_flash_attn_combine")

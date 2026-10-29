@@ -20,11 +20,11 @@ struct CombineLaunchArgs {
     uint64_t fftsAddr{0};
     uint32_t launchBlockDim{0};
 
-    uint32_t isDense{0};   // 1: (num_splits, B, S, H, D), 0: (num_splits, T, H, D)
-    uint32_t writeLse{0};  // 1: materialize the combined LSE
+    uint32_t isDense{0};  // 1: (num_splits, B, S, H, D), 0: (num_splits, T, H, D)
+    uint32_t writeLse{0}; // 1: materialize the combined LSE
     uint32_t numSplits{0};
     uint32_t batch{1};
-    uint32_t seqlen{0};    // S for dense, T for varlen
+    uint32_t seqlen{0}; // S for dense, T for varlen
     uint32_t numHeads{0};
     uint32_t headDim{0};
     uint32_t tileRows{0};
