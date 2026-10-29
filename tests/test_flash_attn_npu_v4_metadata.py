@@ -51,6 +51,7 @@ def test_950_scheduler_metadata_matches_signature():
         "leftpad_k",
         "seqlen_k_per_split",
         "_arch",
+        "qkv_dtype",
     ]
 
 
@@ -84,7 +85,7 @@ def test_950_metadata_reuse_with_forward_parameters(page_size, paged):
         seqused_k=used_k,
     )
     before = metadata.clone()
-    assert metadata.numel() == 5208
+    assert metadata.numel() == 5216
     for scale in (0.05, 0.2):
         kwargs = dict(
             cu_seqlens_q=cu_q,

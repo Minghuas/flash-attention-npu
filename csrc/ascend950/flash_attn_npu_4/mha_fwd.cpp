@@ -53,7 +53,9 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                 std::optional<float> softmax_scale_, bool is_causal, int64_t window_size_left,
                                 int64_t window_size_right, float softcap, int64_t num_splits,
                                 std::optional<bool> pack_gqa_, std::optional<at::Tensor> learnable_sink_,
-                                bool return_lse, std::optional<at::Tensor> scheduler_metadata_, int64_t layout)
+                                bool return_lse, std::optional<at::Tensor> scheduler_metadata_, int64_t layout,
+                                std::optional<at::Tensor> q_descale_, std::optional<at::Tensor> k_descale_,
+                                std::optional<at::Tensor> v_descale_)
 {
     // ============================================================
     // 0. Device guard + stream + AIC core count
@@ -68,7 +70,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto q_dtype = q.dtype();
     const bool is_bf16 = (q_dtype == torch::kBFloat16);
     const bool is_fp16 = (q_dtype == torch::kFloat16);
-    TORCH_CHECK(is_bf16 || is_fp16, "FlashAttention only supports FP16 and BF16 data types");
+    const uint32_t quantMode = q.scalar_type() == at::ScalarType::Float8_e4m3fn ? 1U : 0U;
+    TORCH_CHECK(is_bf16 || is_fp16 || quantMode == 1, "FlashAttention only supports FP16, BF16 and FP8_E4M3FN inputs");
+    TORCH_CHECK(quantMode == 1 || (!q_descale_ && !k_descale_ && !v_descale_),
+                "descales are only supported for FP8_E4M3FN inputs");
     TORCH_CHECK(q.device().type() == at::kPrivateUse1, "query must be on NPU");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
                 "query, key and value must be on the same NPU device");
@@ -228,6 +233,25 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         TORCH_CHECK(page_table.size(0) == batch_size, "page_table batch dimension must match query batch size");
     }
 
+    TORCH_CHECK(quantMode == 0 || (head_size_q == 128 && head_size_v == 128),
+                "950 V4 FP8 requires Q/K/V head dimensions of 128");
+    uint8_t* qDescale = nullptr;
+    uint8_t* kDescale = nullptr;
+    uint8_t* vDescale = nullptr;
+    auto set_descale = [&](const std::optional<at::Tensor>& scale, uint8_t*& ptr) {
+        if (!scale)
+            return;
+        TORCH_CHECK(scale->device() == q.device() && scale->scalar_type() == at::kFloat,
+                    "descale must be FP32 on the query device");
+        TORCH_CHECK(scale->dim() == 2 && scale->size(0) == batch_size && scale->size(1) == num_heads_k,
+                    "descale must have shape [batch, num_kv_heads]");
+        TORCH_CHECK(scale->is_contiguous(), "descale must be contiguous");
+        ptr = static_cast<uint8_t*>(scale->data_ptr());
+    };
+    set_descale(q_descale_, qDescale);
+    set_descale(k_descale_, kDescale);
+    set_descale(v_descale_, vDescale);
+    const auto output_dtype = quantMode == 1 ? at::kBFloat16 : q.scalar_type();
     std::vector<int64_t> output_sizes(q.sizes().begin(), q.sizes().end());
     output_sizes.back() = head_size_v;
     if (layout_enum == FwdLayout::BNSD) {
@@ -239,13 +263,13 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
-        TORCH_CHECK(out.dtype() == q_dtype, "output must have the same dtype as inputs");
+        TORCH_CHECK(out.scalar_type() == output_dtype, "output dtype must be BF16 for FP8, otherwise match inputs");
         TORCH_CHECK(out.device() == q.device(), "output must be on the same device as query");
         TORCH_CHECK(out.sizes().vec() == output_sizes,
                     "output shape must match query except for the last dimension, which must match value");
         CHECK_CONTIGUOUS(out);
     } else {
-        out = at::empty(output_sizes, q.options());
+        out = at::empty(output_sizes, q.options().dtype(output_dtype));
     }
 
     // Host tiling needs sequence lengths on CPU. Precomputed metadata keeps
@@ -322,7 +346,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                is_local ? window_size_left : 0, is_local ? window_size_right : 0, is_varlen_q, is_bf16,
                                batch_size, seqlen_q, num_heads, num_heads_k, head_size_q, head_size_v,
                                softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q))), softcap,
-                               return_lse, layout_enum);
+                               return_lse, layout_enum, quantMode);
         ctx.flashDecodeFlag = num_splits != 1 && fd_shape_supported;
         ctx.numSplits = static_cast<uint32_t>(num_splits);
         optiling::FAInferTiling tiler(ctx);
@@ -379,6 +403,20 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     // ============================================================
     at::Tensor tiling_dev;
     at::Tensor runtime_dev;
+    // FP8 follows V3's by-value per-call parameters; static metadata remains reusable.
+    FAInferRuntimeData fp8Runtime{};
+    if (quantMode == 1) {
+        fp8Runtime.numBlocks = num_blocks;
+        fp8Runtime.blockSize = page_block_size;
+        fp8Runtime.maxNumBlocksPerBatch = max_num_blocks_per_seq;
+        fp8Runtime.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
+        const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
+        fp8Runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
+        fp8Runtime.softcapValue = softcap;
+        fp8Runtime.windowSizeLeft = window_size_left;
+        fp8Runtime.windowSizeRight = window_size_right;
+        fp8Runtime.allowFlashDecode = flashDecodeEnabled;
+    }
     if (scheduler_metadata_.has_value()) {
         const auto& metadata = scheduler_metadata_.value();
         TORCH_CHECK(metadata.device() == q.device() && metadata.dtype() == at::kByte && metadata.is_contiguous(),
@@ -388,52 +426,55 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
         // Alias only the read-only scheduling buffer. Each forward owns a small
         // runtime buffer, so different streams never overwrite shared metadata.
         tiling_dev = metadata;
-        runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))}, q.options().dtype(at::kByte));
-        FARuntimeArgs runtimeArgs{};
-        runtimeArgs.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
-        auto& runtime = runtimeArgs.runtime;
-        runtime.numBlocks = num_blocks;
-        runtime.blockSize = page_block_size;
-        runtime.maxNumBlocksPerBatch = max_num_blocks_per_seq;
-        runtime.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
-        const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
-        runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
-        runtime.softcapValue = softcap;
-        runtime.windowSizeLeft = window_size_left;
-        runtime.windowSizeRight = window_size_right;
-        runtime.allowFlashDecode = flashDecodeEnabled;
-        auto aicpu = c10_npu::getNPUStreamFromPool();
-        if (aicpu.stream(false) == aclStream) {
-            aicpu = c10_npu::getNPUStreamFromPool();
+        if (quantMode == 0) {
+            runtime_dev = at::empty({static_cast<int64_t>(sizeof(FAInferRuntimeData))}, q.options().dtype(at::kByte));
+            FARuntimeArgs runtimeArgs{};
+            runtimeArgs.runtimeAddr = reinterpret_cast<uint64_t>(runtime_dev.data_ptr());
+            auto& runtime = runtimeArgs.runtime;
+            runtime.numBlocks = num_blocks;
+            runtime.blockSize = page_block_size;
+            runtime.maxNumBlocksPerBatch = max_num_blocks_per_seq;
+            runtime.maskType = is_local ? 2U : (is_causal ? 1U : 0U);
+            const float scale = softmax_scale_.value_or(1.0f / std::sqrt(static_cast<float>(head_size_q)));
+            runtime.scaleValue = softcap > 0.0f ? scale / softcap : scale;
+            runtime.softcapValue = softcap;
+            runtime.windowSizeLeft = window_size_left;
+            runtime.windowSizeRight = window_size_right;
+            runtime.allowFlashDecode = flashDecodeEnabled;
+            auto aicpu = c10_npu::getNPUStreamFromPool();
+            if (aicpu.stream(false) == aclStream) {
+                aicpu = c10_npu::getNPUStreamFromPool();
+            }
+            const auto aicpuStream = aicpu.stream(false);
+            TORCH_CHECK(aicpuStream != aclStream, "AICPU tiling merge requires a separate stream");
+            struct MergeEvents {
+                aclrtEvent input_ready = nullptr;
+                aclrtEvent done = nullptr;
+            };
+            // Separate event pairs prevent different caller streams from reusing
+            // one another's capture dependencies.
+            static thread_local std::unordered_map<aclrtStream, MergeEvents> events_by_stream;
+            auto& events = events_by_stream[aclStream];
+            if (events.input_ready == nullptr) {
+                constexpr uint32_t event_flags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
+                TORCH_CHECK(aclrtCreateEventExWithFlag(&events.input_ready, event_flags) == ACL_SUCCESS,
+                            "create merge input event failed");
+                TORCH_CHECK(aclrtCreateEventExWithFlag(&events.done, event_flags) == ACL_SUCCESS,
+                            "create merge completion event failed");
+            }
+            auto write_runtime = [runtimeArgs, aclStream, aicpuStream, input_ready = events.input_ready,
+                                  done = events.done]() mutable -> int {
+                TORCH_CHECK(aclrtRecordEvent(input_ready, aclStream) == ACL_SUCCESS, "record merge input event failed");
+                TORCH_CHECK(aclrtStreamWaitEvent(aicpuStream, input_ready) == ACL_SUCCESS,
+                            "wait for merge input failed");
+                WriteFARuntime<<<1, nullptr, aicpuStream>>>(&runtimeArgs, sizeof(runtimeArgs));
+                TORCH_CHECK(aclrtRecordEvent(done, aicpuStream) == ACL_SUCCESS, "record merge completion event failed");
+                TORCH_CHECK(aclrtStreamWaitEvent(aclStream, done) == ACL_SUCCESS, "wait for tiling merge failed");
+                return 0;
+            };
+            at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);
+            c10_npu::NPUCachingAllocator::recordStream(runtime_dev.storage().data_ptr(), aicpu);
         }
-        const auto aicpuStream = aicpu.stream(false);
-        TORCH_CHECK(aicpuStream != aclStream, "AICPU tiling merge requires a separate stream");
-        struct MergeEvents {
-            aclrtEvent input_ready = nullptr;
-            aclrtEvent done = nullptr;
-        };
-        // Separate event pairs prevent different caller streams from reusing
-        // one another's capture dependencies.
-        static thread_local std::unordered_map<aclrtStream, MergeEvents> events_by_stream;
-        auto& events = events_by_stream[aclStream];
-        if (events.input_ready == nullptr) {
-            constexpr uint32_t event_flags = ACL_EVENT_SYNC | ACL_EVENT_CAPTURE_STREAM_PROGRESS;
-            TORCH_CHECK(aclrtCreateEventExWithFlag(&events.input_ready, event_flags) == ACL_SUCCESS,
-                        "create merge input event failed");
-            TORCH_CHECK(aclrtCreateEventExWithFlag(&events.done, event_flags) == ACL_SUCCESS,
-                        "create merge completion event failed");
-        }
-        auto write_runtime = [runtimeArgs, aclStream, aicpuStream, input_ready = events.input_ready,
-                              done = events.done]() mutable -> int {
-            TORCH_CHECK(aclrtRecordEvent(input_ready, aclStream) == ACL_SUCCESS, "record merge input event failed");
-            TORCH_CHECK(aclrtStreamWaitEvent(aicpuStream, input_ready) == ACL_SUCCESS, "wait for merge input failed");
-            WriteFARuntime<<<1, nullptr, aicpuStream>>>(&runtimeArgs, sizeof(runtimeArgs));
-            TORCH_CHECK(aclrtRecordEvent(done, aicpuStream) == ACL_SUCCESS, "record merge completion event failed");
-            TORCH_CHECK(aclrtStreamWaitEvent(aclStream, done) == ACL_SUCCESS, "wait for tiling merge failed");
-            return 0;
-        };
-        at_npu::native::OpCommand::RunOpApiV2("ascendc_fa_write_runtime", write_runtime);
-        c10_npu::NPUCachingAllocator::recordStream(runtime_dev.storage().data_ptr(), aicpu);
         c10_npu::NPUCachingAllocator::recordStream(tiling_dev.storage().data_ptr(), c10_npu::getCurrentNPUStream());
     } else {
         tilingData.allowFlashDecode = flashDecodeEnabled;
@@ -443,9 +484,12 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
             at::empty({static_cast<int64_t>(sizeof(schedule))}, at::device(c10::kCPU).dtype(at::kByte));
         std::memcpy(tiling_cpu.data_ptr<uint8_t>(), &schedule, sizeof(schedule));
         tiling_dev = tiling_cpu.to(q.device());
-        auto runtime_cpu = at::empty({static_cast<int64_t>(sizeof(runtime))}, at::device(c10::kCPU).dtype(at::kByte));
-        std::memcpy(runtime_cpu.data_ptr<uint8_t>(), &runtime, sizeof(runtime));
-        runtime_dev = runtime_cpu.to(q.device());
+        if (quantMode == 0) {
+            auto runtime_cpu =
+                at::empty({static_cast<int64_t>(sizeof(runtime))}, at::device(c10::kCPU).dtype(at::kByte));
+            std::memcpy(runtime_cpu.data_ptr<uint8_t>(), &runtime, sizeof(runtime));
+            runtime_dev = runtime_cpu.to(q.device());
+        }
     }
 
     // ============================================================
@@ -463,7 +507,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto lseDev = return_lse ? static_cast<uint8_t*>(softmaxlse.data_ptr()) : oDev;
     auto wsDev = static_cast<uint8_t*>(workspace.data_ptr());
     auto tilDev = static_cast<uint8_t*>(tiling_dev.data_ptr());
-    auto runtimeDev = static_cast<uint8_t*>(runtime_dev.data_ptr());
+    auto runtimeDev = quantMode == 0 ? static_cast<uint8_t*>(runtime_dev.data_ptr()) : nullptr;
 
     const auto i64_npu = at::device(at::kPrivateUse1).dtype(at::kLong);
     at::Tensor q_seq_i64 = is_varlen_q ? cu_seqlens_q : at::empty({batch_size}, i64_npu);
@@ -493,7 +537,7 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
     auto blockTableDev = paged_KV ? static_cast<uint8_t*>(page_table.data_ptr()) : nullptr;
     uint8_t* maskDev = nullptr;
     at::Tensor mask_npu_tensor;
-    if (is_causal || is_local) {
+    if ((is_causal || is_local) && quantMode == 0) {
         mask_npu_tensor = MakeDeviceTriuMask();
         maskDev = static_cast<uint8_t*>(mask_npu_tensor.data_ptr());
     }
@@ -505,9 +549,10 @@ std::vector<at::Tensor> mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::o
                                         : (flashDecodeEnabled ? tilingData.fdActiveCoreNum : blockDim);
 
     const FwdLaunchArgs fwdArgs{
-        is_bf16,   fmt,      mask_category, paged_KV,     enableDN, return_lse,    is_softcap, launchBlockDim,
-        aclStream, qDev,     kDev,          vDev,         maskDev,  blockTableDev, oDev,       lseDev,
-        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,    tilDev,        runtimeDev, kv_seqlen_allocated};
+        is_bf16,   fmt,      mask_category, paged_KV,     enableDN,  return_lse,    is_softcap, launchBlockDim,
+        aclStream, qDev,     kDev,          vDev,         maskDev,   blockTableDev, oDev,       lseDev,
+        qSeqDev,   kvSeqDev, seqUsedQDev,   seqUsedKvDev, wsDev,     tilDev,        runtimeDev, kv_seqlen_allocated,
+        quantMode, qDescale, kDescale,      vDescale,     fp8Runtime};
     auto launch_fa_infer = [fwdArgs]() -> int {
         launch_fwd(fwdArgs);
         return 0;

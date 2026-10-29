@@ -12,6 +12,7 @@
 #define KERNEL_COMMON
 
 #include "kernel_operator.h"
+#include "tilingdata.h"
 
 constexpr int32_t NUM1 = 1;
 constexpr int32_t NUM4 = 4;
@@ -45,6 +46,10 @@ struct FAIKernelParams {
     GM_ADDR workSpace;
     GM_ADDR tiling;
     GM_ADDR runtimeTiling;
+    GM_ADDR qDescale = nullptr;
+    GM_ADDR kDescale = nullptr;
+    GM_ADDR vDescale = nullptr;
+    FAInferRuntimeData fp8Runtime{};
     // Allocated KV sequence length: the BNSD head-plane width. Unused (0) for
     // BSND / TND, whose layout is the compile-time Format template parameter.
     int64_t kvSeqlenAllocated;

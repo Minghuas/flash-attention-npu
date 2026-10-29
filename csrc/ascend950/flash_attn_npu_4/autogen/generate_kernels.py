@@ -18,6 +18,7 @@ from typing import List, Optional
 DTYPE_MAP = {
     "fp16": "half",
     "bf16": "bfloat16_t",
+    "fp8": "float8_e4m3_t",
 }
 
 # layout key -> (display name, Format token)

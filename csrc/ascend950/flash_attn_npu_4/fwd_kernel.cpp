@@ -643,8 +643,8 @@ class FAIKernel950 {
                         (flashDecodeFlag_ != 0U ? pipelineL0BStageBase : 0U);
                     if constexpr (IsDN) {
                         blockMmadQK(gmKTensorTlaDN, ubSTensorTlaDN, gBlockTable[blockBOffset], actualBlockShapeQK,
-                                    blockSize_, kvSTileIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0, 0, qSBlockSize,
-                                    qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
+                                    blockSize_, kvSTileIdx, kvSTileIdx, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0, 0, 0,
+                                    qSBlockSize, qNBlockSize, qkReadyFlag, prefixSumL0AStages, prefixSumL0BStages);
                     } else {
                         blockMmadQK(gmKTensorTla, ubSTensorTla, gBlockTable[blockBOffset], actualBlockShapeQK,
                                     blockSize_, kvSTileIdx, pipelineTileSeq, 0, kvHeads_, kvNumTokens, kvBaseTile_, 0,
@@ -1040,7 +1040,7 @@ CATLASS_GLOBAL void FAInfer(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_AD
     using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS,
-                                                            TileCopyRescaleO, Arch::PositionL0C>;
+                                                            ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, false, LseMode>;
@@ -1105,7 +1105,7 @@ CATLASS_GLOBAL void FAInferDn(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR mask, GM_
     using DispatchPolicyRescaleO = Epilogue::EpilogueFARescaleO;
     using TileCopyRescaleO = Epilogue::Tile::TileCopyRescaleO<ArchTag, ElementO, LayoutO, LayoutOTmp>;
     using EpilogueRescaleO = Epilogue::Block::BlockEpilogue<DispatchPolicyRescaleO, ElementO, ElementOTmp, ElementS,
-                                                            TileCopyRescaleO, Arch::PositionL0C>;
+                                                            ElementV, TileCopyRescaleO, Arch::PositionL0C>;
 
     using Kernel = FAIKernel950<BlockMmadQK, EpilogueOnlineSoftmax, BlockMmadPV, EpilogueRescaleO, qFormat, kvFormat,
                                 kvcacheType, kvcacheShape, maskCategory, cacheLayout, true, LseMode>;

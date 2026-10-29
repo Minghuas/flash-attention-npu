@@ -1,5 +1,5 @@
 # Copyright (c) 2026, Minghua Shen.
-"""96 fixed 950 V3 FP8 forward cases; all check O and LSE.
+"""950 V3 FP8: 123 cases; all check O and LSE.
 
 Run from the repository root:
     python -m pytest tests/test_flash_attn_npu_v3_fp8.py -v
@@ -24,21 +24,33 @@ from tests.common.attention_ref_fp8 import (
 )
 
 
-# dense: MHA/GQA/MQA, three masks, softcap and full tiles.
-# mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse
+# dense: MHA/GQA/MQA, three masks, softcap, full and tail tiles.
+# mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse, layout
 test_cases_func = [
-    ("none", (64, 64), (256, 256), 2, 1, 0.0, True),
-    ("none", (64, 64), (256, 256), 2, 3, 2.0, False),
-    ("none", (64, 64), (256, 256), 1, 4, 0.0, False),
-    ("causal", (64, 64), (256, 256), 2, 1, 0.0, True),
-    ("causal", (64, 64), (256, 256), 2, 3, 2.0, False),
-    ("causal", (64, 64), (256, 256), 1, 4, 0.0, False),
-    ("window", (64, 64), (256, 256), 2, 1, 0.0, True),
-    ("window", (64, 64), (256, 256), 2, 3, 2.0, False),
-    ("window", (64, 64), (256, 256), 1, 4, 0.0, False),
-    ("none", (128, 128), (512, 512), 2, 2, 10.0, False),
-    ("causal", (128, 128), (512, 512), 2, 2, 10.0, False),
-    ("window", (128, 128), (512, 512), 2, 2, 10.0, False),
+    ("none", (64, 64), (256, 256), 2, 1, 0.0, True, "BSND"),
+    ("none", (64, 64), (256, 256), 2, 3, 2.0, False, "BSND"),
+    ("none", (64, 64), (256, 256), 1, 4, 0.0, False, "BSND"),
+    ("causal", (64, 64), (256, 256), 2, 1, 0.0, True, "BSND"),
+    ("causal", (64, 64), (256, 256), 2, 3, 2.0, False, "BSND"),
+    ("causal", (64, 64), (256, 256), 1, 4, 0.0, False, "BSND"),
+    ("window", (64, 64), (256, 256), 2, 1, 0.0, True, "BSND"),
+    ("window", (64, 64), (256, 256), 2, 3, 2.0, False, "BSND"),
+    ("window", (64, 64), (256, 256), 1, 4, 0.0, False, "BSND"),
+    ("none", (128, 128), (512, 512), 2, 2, 10.0, False, "BSND"),
+    ("causal", (128, 128), (512, 512), 2, 2, 10.0, False, "BSND"),
+    ("window", (128, 128), (512, 512), 2, 2, 10.0, False, "BSND"),
+    ("none", (63,), (127,), 2, 1, 0.0, False, "BNSD"),
+    ("none", (65, 65), (129, 129), 2, 3, 2.0, False, "BNSD"),
+    ("none", (129, 129), (257, 257), 1, 4, 0.0, False, "BNSD"),
+    ("none", (33, 33), (257, 257), 3, 2, 10.0, False, "BNSD"),
+    ("causal", (63,), (127,), 2, 1, 0.0, False, "BNSD"),
+    ("causal", (65, 65), (129, 129), 2, 3, 2.0, False, "BNSD"),
+    ("causal", (129, 129), (257, 257), 1, 4, 0.0, False, "BNSD"),
+    ("causal", (33, 33), (257, 257), 3, 2, 10.0, False, "BNSD"),
+    ("window", (63,), (127,), 2, 1, 0.0, False, "BNSD"),
+    ("window", (65, 65), (129, 129), 2, 3, 2.0, False, "BNSD"),
+    ("window", (129, 129), (257, 257), 1, 4, 0.0, False, "BNSD"),
+    ("window", (33, 33), (257, 257), 3, 2, 10.0, False, "BNSD"),
 ]
 
 # varlen: MHA/GQA/MQA, three masks, softcap and full tiles.
@@ -59,20 +71,32 @@ test_cases_varlen = [
 ]
 
 # cache: MHA/GQA/MQA, three masks, softcap and full tiles.
-# mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse
+# mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse, layout
 test_cases_kvcache = [
-    ("none", (33, 65), (129, 257), 2, 1, 0.0, True),
-    ("none", (33, 65), (129, 257), 2, 3, 2.0, False),
-    ("none", (33, 65), (129, 257), 1, 4, 0.0, False),
-    ("causal", (33, 65), (129, 257), 2, 1, 0.0, True),
-    ("causal", (33, 65), (129, 257), 2, 3, 2.0, False),
-    ("causal", (33, 65), (129, 257), 1, 4, 0.0, False),
-    ("window", (33, 65), (129, 257), 2, 1, 0.0, True),
-    ("window", (33, 65), (129, 257), 2, 3, 2.0, False),
-    ("window", (33, 65), (129, 257), 1, 4, 0.0, False),
-    ("none", (128, 128), (512, 512), 2, 2, 10.0, False),
-    ("causal", (128, 128), (512, 512), 2, 2, 10.0, False),
-    ("window", (128, 128), (512, 512), 2, 2, 10.0, False),
+    ("none", (33, 65), (129, 257), 2, 1, 0.0, True, "BSND"),
+    ("none", (33, 65), (129, 257), 2, 3, 2.0, False, "BSND"),
+    ("none", (33, 65), (129, 257), 1, 4, 0.0, False, "BSND"),
+    ("causal", (33, 65), (129, 257), 2, 1, 0.0, True, "BSND"),
+    ("causal", (33, 65), (129, 257), 2, 3, 2.0, False, "BSND"),
+    ("causal", (33, 65), (129, 257), 1, 4, 0.0, False, "BSND"),
+    ("window", (33, 65), (129, 257), 2, 1, 0.0, True, "BSND"),
+    ("window", (33, 65), (129, 257), 2, 3, 2.0, False, "BSND"),
+    ("window", (33, 65), (129, 257), 1, 4, 0.0, False, "BSND"),
+    ("none", (128, 128), (512, 512), 2, 2, 10.0, False, "BSND"),
+    ("causal", (128, 128), (512, 512), 2, 2, 10.0, False, "BSND"),
+    ("window", (128, 128), (512, 512), 2, 2, 10.0, False, "BSND"),
+    ("none", (64, 64), (255, 255), 2, 1, 0.0, False, "BNSD"),
+    ("none", (127, 127), (256, 256), 2, 3, 2.0, False, "BNSD"),
+    ("none", (128, 128), (257, 257), 1, 4, 0.0, False, "BNSD"),
+    ("none", (129, 129), (385, 385), 2, 2, 10.0, False, "BNSD"),
+    ("causal", (64, 64), (255, 255), 2, 1, 0.0, False, "BNSD"),
+    ("causal", (127, 127), (256, 256), 2, 3, 2.0, False, "BNSD"),
+    ("causal", (128, 128), (257, 257), 1, 4, 0.0, False, "BNSD"),
+    ("causal", (129, 129), (385, 385), 2, 2, 10.0, False, "BNSD"),
+    ("window", (64, 64), (255, 255), 2, 1, 0.0, False, "BNSD"),
+    ("window", (127, 127), (256, 256), 2, 3, 2.0, False, "BNSD"),
+    ("window", (128, 128), (257, 257), 1, 4, 0.0, False, "BNSD"),
+    ("window", (129, 129), (385, 385), 2, 2, 10.0, False, "BNSD"),
 ]
 
 # Four page sizes, three masks, host and metadata scheduling.
@@ -300,6 +324,7 @@ def run_case(
     zero_descale="",
     zero_v=False,
     check_no_lse=False,
+    layout=None,
 ):
     kwargs = make_inputs(
         entry,
@@ -317,7 +342,33 @@ def run_case(
         zero_v,
     )
     case, inputs = read_inputs(kwargs, entry, metadata)
-    actual = run_forward(case, inputs, "npu:0")
+    if layout == "BNSD":
+        expected = run_forward(case, inputs, "npu:0")
+        for name in (
+            "q",
+            "k_cache" if entry == "cache" else "k",
+            "v_cache" if entry == "cache" else "v",
+        ):
+            tensor = inputs["native"][name]
+            inputs["native"][name] = tensor.transpose(1, 2).contiguous().transpose(1, 2)
+        from flash_attn_npu_3 import flash_attn_npu_interface_950 as interface
+
+        backend = interface.flash_attn_npu_3_950
+        forward = backend.fwd
+        layouts = []
+
+        def capture(*args, **kwargs):
+            layouts.append(args[-1])
+            return forward(*args, **kwargs)
+
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            monkeypatch.setattr(backend, "fwd", capture)
+            actual = run_forward(case, inputs, "npu:0")
+        assert layouts and all(value == interface._LAYOUT_BNSD for value in layouts)
+        for result, reference in zip(actual, expected):
+            assert torch.equal(result, reference)
+    else:
+        actual = run_forward(case, inputs, "npu:0")
     high = high_reference(case, inputs)
     low = low_reference(case, inputs)
     total_q = sum(q_lengths)
@@ -357,10 +408,10 @@ def run_case(
 
 
 @pytest.mark.parametrize(
-    "mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse",
+    "mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse, layout",
     test_cases_func,
 )
-def test_fp8_func(mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse):
+def test_fp8_func(mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse, layout):
     run_case(
         entry="dense",
         mask=mask,
@@ -370,6 +421,7 @@ def test_fp8_func(mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_n
         group=group,
         softcap=softcap,
         check_no_lse=check_no_lse,
+        layout=layout,
     )
 
 
@@ -391,10 +443,10 @@ def test_fp8_varlen(mask, q_lengths, kv_lengths, kv_heads, group, softcap, check
 
 
 @pytest.mark.parametrize(
-    "mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse",
+    "mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse, layout",
     test_cases_kvcache,
 )
-def test_fp8_kvcache(mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse):
+def test_fp8_kvcache(mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse, layout):
     run_case(
         entry="cache",
         mask=mask,
@@ -404,6 +456,7 @@ def test_fp8_kvcache(mask, q_lengths, kv_lengths, kv_heads, group, softcap, chec
         group=group,
         softcap=softcap,
         check_no_lse=check_no_lse,
+        layout=layout,
     )
 
 
@@ -480,3 +533,36 @@ def test_fp8_semantics(entry, mask, q_lengths, kv_lengths, window_size, zero_v):
         window_size=window_size,
         zero_v=zero_v,
     )
+
+
+@pytest.mark.parametrize("view_kind", ["strided_head", "strided_batch", "broadcast_batch"])
+def test_fp8_descale_views(view_kind):
+    from flash_attn_npu_3 import flash_attn_func
+
+    torch.manual_seed(0)
+    q = torch.randn(2, 65, 4, 128, device="npu:0").to(torch.float8_e4m3fn)
+    k = torch.randn(2, 129, 2, 128, device="npu:0").to(torch.float8_e4m3fn)
+    v = torch.randn_like(k.float()).to(torch.float8_e4m3fn)
+    scales = torch.rand(4, 4, device="npu:0")
+    views = {
+        "strided_head": scales[::2, ::2],
+        "strided_batch": scales[::2, :2],
+        "broadcast_batch": scales[:1, :2].expand(2, 2),
+    }
+    descale = views[view_kind]
+    assert not descale.is_contiguous()
+    actual = flash_attn_func(
+        q, k, v, q_descale=descale, k_descale=descale, v_descale=descale, return_attn_probs=True
+    )
+    contiguous = descale.contiguous()
+    expected = flash_attn_func(
+        q,
+        k,
+        v,
+        q_descale=contiguous,
+        k_descale=contiguous,
+        v_descale=contiguous,
+        return_attn_probs=True,
+    )
+    assert torch.equal(actual[0], expected[0])
+    assert torch.equal(actual[1], expected[1])

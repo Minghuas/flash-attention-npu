@@ -71,7 +71,7 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     const bool is_bf16 = (q_dtype == torch::kBFloat16);
     const bool is_fp16 = (q_dtype == torch::kFloat16);
     const uint32_t quantMode = q_dtype == at::ScalarType::Float8_e4m3fn ? 1U : 0U;
-    TORCH_CHECK(is_bf16 || is_fp16 || quantMode == 1, "FlashAttention supports FP16, BF16 and FP8_E4M3FN inputs");
+    TORCH_CHECK(is_bf16 || is_fp16 || quantMode == 1, "FlashAttention only supports FP16, BF16 and FP8_E4M3FN inputs");
     TORCH_CHECK(q.device().type() == at::kPrivateUse1, "query must be on NPU");
     TORCH_CHECK(k.device() == q.device() && v.device() == q.device(),
                 "query, key and value must be on the same NPU device");
@@ -87,7 +87,8 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(!leftpad_k_.has_value(), "950 backend (v3) does not support leftpad_k");
     TORCH_CHECK(!rotary_cos_.has_value() && !rotary_sin_.has_value() && !seqlens_rotary_.has_value(),
                 "950 backend (v3) does not support rotary embedding");
-    TORCH_CHECK(quantMode == 1 || (!q_descale_ && !k_descale_ && !v_descale_), "descales require FP8_E4M3FN inputs");
+    TORCH_CHECK(quantMode == 1 || (!q_descale_ && !k_descale_ && !v_descale_),
+                "descales are only supported for FP8_E4M3FN inputs");
     TORCH_CHECK(attention_chunk == 0, "950 backend (v3) does not support attention_chunk");
     TORCH_CHECK(num_splits >= 0 && num_splits <= static_cast<int64_t>(blockDim),
                 "950 backend (v3) requires num_splits in [0, ", blockDim, "]");
@@ -173,8 +174,6 @@ mha_fwd(at::Tensor q, at::Tensor k, at::Tensor v, std::optional<at::Tensor> k_ne
     TORCH_CHECK(layout >= static_cast<int64_t>(FwdLayout::TND) && layout <= static_cast<int64_t>(FwdLayout::BNSD),
                 "950 backend (v3) received an unsupported layout code (", layout, ")");
     const FwdLayout layout_enum = static_cast<FwdLayout>(layout);
-    TORCH_CHECK(quantMode == 0 || layout_enum != FwdLayout::BNSD,
-                "950 V3 FP8_E4M3FN supports BSND and TND layouts only");
     TORCH_CHECK((layout_enum == FwdLayout::TND) == is_varlen_q,
                 "950 backend (v3) layout code conflicts with cu_seqlens_q: TND requires it, "
                 "BSND and BNSD forbid it");

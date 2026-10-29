@@ -44,8 +44,8 @@ def _maybe_contiguous(x):
 
 
 def _full_contiguous(x):
-    """FAG (bwd) kernels use linear GM offsets and need fully contiguous
-    operands; ``_maybe_contiguous`` only guarantees stride(-1) == 1, which
+    """Linear GM operands (backward tensors and descales) need full contiguity;
+    ``_maybe_contiguous`` only guarantees stride(-1) == 1, which
     permuted last-dim-minor views also satisfy."""
     return x.contiguous() if x is not None and not x.is_contiguous() else x
 
@@ -83,6 +83,15 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     q_bnsd = _transposed_bnsd_view(q)
     k_bnsd = _transposed_bnsd_view(k)
     v_bnsd = _transposed_bnsd_view(v)
+    # A singleton sequence/head axis has identical BSND and BNSD storage.
+    # Let a non-degenerate FP8 operand anchor layout detection for MQA and Q=1.
+    if q.dtype == torch.float8_e4m3fn and any(x is not None for x in (q_bnsd, k_bnsd, v_bnsd)):
+        if q_bnsd is None and q.is_contiguous() and (q.shape[1] == 1 or q.shape[2] == 1):
+            q_bnsd = q.transpose(1, 2)
+        if k_bnsd is None and k.is_contiguous() and (k.shape[1] == 1 or k.shape[2] == 1):
+            k_bnsd = k.transpose(1, 2)
+        if v_bnsd is None and v.is_contiguous() and (v.shape[1] == 1 or v.shape[2] == 1):
+            v_bnsd = v.transpose(1, 2)
     if q_bnsd is not None and k_bnsd is not None and v_bnsd is not None:
         return _LAYOUT_BNSD, q_bnsd, k_bnsd, v_bnsd, True
 
@@ -93,7 +102,7 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
 # this in sync with fa_metadata::MetadataBytes(false) in
 # csrc/ascend950/flash_attn_npu_4/fa_metadata_args.h.  Unlike the FA3
 # metadata, its size does not depend on the input sequence lengths or mask.
-_SCHEDULER_METADATA_TILING_BYTES = 5208
+_SCHEDULER_METADATA_TILING_BYTES = 5216
 
 
 @_torch_custom_op_wrapper(
@@ -118,6 +127,7 @@ def _get_scheduler_metadata_op(
     pack_gqa: Optional[bool],
     sm_margin: int,
     seqused_q: Optional[torch.Tensor] = None,
+    quant_mode: int = 0,
 ) -> torch.Tensor:
     # Keep the raw pybind call behind a torch.library op.  Calling a pybind
     # function directly from a torch.compile graph is treated as an opaque
@@ -139,6 +149,7 @@ def _get_scheduler_metadata_op(
         pack_gqa,
         sm_margin,
         seqused_q,
+        quant_mode,
     )
 
 
@@ -160,6 +171,7 @@ def _get_scheduler_metadata_fake(
     pack_gqa: Optional[bool],
     sm_margin: int,
     seqused_q: Optional[torch.Tensor] = None,
+    quant_mode: int = 0,
 ) -> torch.Tensor:
     # The metadata is an opaque byte buffer during tracing.  Ascend950 FA4
     # serializes one fixed-size FAInferStaticTilingData object, so returning
@@ -192,6 +204,7 @@ def get_scheduler_metadata(
     leftpad_k: Optional[torch.Tensor] = None,
     seqlen_k_per_split: Optional[int] = None,
     _arch: Optional[int] = None,
+    qkv_dtype: Optional[torch.dtype] = None,
 ):
     """Precompute Ascend 950 FA4 metadata using the Tri Dao FA4 signature.
 
@@ -250,6 +263,7 @@ def get_scheduler_metadata(
         pack_gqa,
         0,
         seqused_q,
+        int(qkv_dtype == torch.float8_e4m3fn),
     )
 
 
@@ -282,12 +296,18 @@ def _flash_attn_forward(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     layout: int = _LAYOUT_BSND,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k = (_maybe_contiguous(x) for x in (q, k))
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
     cu_seqlens_q, cu_seqlens_k = (_maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k))
     seqused_q, seqused_k = (_maybe_contiguous(x) for x in (seqused_q, seqused_k))
     page_table = _maybe_contiguous(page_table)
+    q_descale, k_descale, v_descale = (
+        _full_contiguous(x) for x in (q_descale, k_descale, v_descale)
+    )
 
     out_t, softmax_lse, out_accum, softmax_lse_accum = flash_attn_npu_4_950.fwd(
         q,
@@ -315,6 +335,9 @@ def _flash_attn_forward(
         return_lse,
         scheduler_metadata,
         layout,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
     if out_accum is None:
@@ -543,6 +566,9 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse=False,
         scheduler_metadata=None,
         disable_scheduler_metadata=False,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -582,6 +608,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 window_size_left=window_size[0],
                 window_size_right=window_size[1],
                 seqused_k=seqused_k,
+                qkv_dtype=q.dtype,
             )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
@@ -610,6 +637,9 @@ class FlashAttnFunc(torch.autograd.Function):
             True,
             scheduler_metadata,
             layout,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -702,6 +732,9 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # scheduler_metadata
             None,  # disable_scheduler_metadata
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
         )
 
 
@@ -739,6 +772,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_lse=False,
         scheduler_metadata=None,
         disable_scheduler_metadata=False,
+        q_descale: Optional[torch.Tensor] = None,
+        k_descale: Optional[torch.Tensor] = None,
+        v_descale: Optional[torch.Tensor] = None,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -797,6 +833,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 seqused_k=kv_seqlens,
                 seqused_q=seqused_q,
                 cu_seqlens_q=cu_seqlens_q,
+                qkv_dtype=q.dtype,
             )
 
         out, softmax_lse, out_accum, softmax_lse_accum = _flash_attn_forward(
@@ -825,6 +862,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             True,
             scheduler_metadata,
             layout,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
         )
 
         ctx.save_for_backward(
@@ -939,6 +979,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # scheduler_metadata
             None,  # disable_scheduler_metadata
+            None,  # q_descale
+            None,  # k_descale
+            None,  # v_descale
         )
 
 
@@ -966,7 +1009,17 @@ def flash_attn_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
+    if q.dtype == torch.float8_e4m3fn:
+        if qv is not None:
+            raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")
+        if any(
+            t is not None and t.requires_grad for t in (q, k, v, q_descale, k_descale, v_descale)
+        ):
+            raise NotImplementedError("Ascend950 V4 FP8 supports inference forward only")
     return FlashAttnFunc.apply(
         q,
         k,
@@ -991,6 +1044,9 @@ def flash_attn_func(
         return_lse,
         scheduler_metadata,
         disable_scheduler_metadata,
+        q_descale,
+        k_descale,
+        v_descale,
     )
 
 
@@ -1107,11 +1163,14 @@ def _flash_attn_forward_fake(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     layout: int = _LAYOUT_BSND,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Metadata-only fake for V4 A3 forward. Returns 4-tuple."""
     is_varlen_q = cu_seqlens_q is not None
     head_size_v = v.shape[-1]
-    out_dtype = q.dtype
+    out_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
 
     if is_varlen_q:
         total_q = q.shape[0]
@@ -1191,7 +1250,17 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
 ):
+    if q.dtype == torch.float8_e4m3fn:
+        if qv is not None:
+            raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")
+        if any(
+            t is not None and t.requires_grad for t in (q, k, v, q_descale, k_descale, v_descale)
+        ):
+            raise NotImplementedError("Ascend950 V4 FP8 supports inference forward only")
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -1223,4 +1292,7 @@ def flash_attn_varlen_func(
         return_lse,
         scheduler_metadata,
         disable_scheduler_metadata,
+        q_descale,
+        k_descale,
+        v_descale,
     )

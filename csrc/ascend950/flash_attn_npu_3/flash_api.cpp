@@ -77,6 +77,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(num_heads_q % num_heads_kv == 0, "Number of heads in key/value must divide number of heads in query");
     TORCH_CHECK(num_splits == 0 || num_splits == 1, "950 backend (v3) only supports num_splits=0 or 1");
+    TORCH_CHECK(quant_mode == 0 || quant_mode == 1, "unsupported quantization mode");
     TORCH_CHECK(quant_mode != 1 || (headdim == 128 && headdim_v == 128),
                 "950 V3 FP8 requires Q/K/V head dimensions of 128");
 
