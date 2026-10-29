@@ -1225,8 +1225,73 @@ def flash_attn_varlen_func(
     )
 
 
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_3::_flash_attn_combine",
+    mutates_args=("out",),
+    device_types="npu",
+)
+def _flash_attn_combine_op(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    return flash_attn_npu_3.fwd_combine(out_partial, lse_partial, out, out_dtype)[1]
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_3::_flash_attn_combine")
+def _flash_attn_combine_fake(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    is_dense = out_partial.dim() == 5
+    lse_shape = (
+        (out_partial.shape[1], out_partial.shape[2], out_partial.shape[3])
+        if is_dense
+        else (out_partial.shape[1], out_partial.shape[2])
+    )
+    return torch.empty(lse_shape, dtype=torch.float32, device=out.device)
+
+
 def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
-    return flash_attn_npu_3.fwd_combine(out_partial, lse_partial, out, out_dtype)
+    """Merge split-KV partial attention outputs.
+
+    Mirrors ``flash_attn.flash_attn_combine`` from Dao-AILab/flash-attention:
+    ``lse = logsumexp_s(lse_partial)`` and ``out = sum_s exp(lse_s - lse) * O_s``.
+
+    Args:
+        out_partial: fp32 partial outputs. Dense (BSND):
+            (num_splits, batch, seqlen, nheads, headdim); varlen (TND):
+            (num_splits, total_q, nheads, headdim).
+        lse_partial: fp32 partial logsumexp in logical (..., seqlen, heads) order.
+            Dense: (num_splits, batch, seqlen, nheads); varlen:
+            (num_splits, total_q, nheads).
+        out [optional]: preallocated output, written in place. When supplied,
+            its dtype takes precedence over out_dtype.
+        out_dtype [optional]: output dtype (fp16 / bf16 / fp32). Defaults to
+            ``out_partial.dtype`` (fp32), matching the NV interface.
+
+    Returns:
+        (out, softmax_lse). ``out`` is (batch, seqlen, nheads, headdim) or
+        (total_q, nheads, headdim); ``softmax_lse`` is fp32 with shape
+        (batch, seqlen, nheads) or (total_q, nheads), i.e. seqlen-contiguous
+        (note this differs from ``flash_attn_func``'s (batch, nheads, seqlen)).
+
+    The in-tree v3 forward does not currently expose real split accumulators;
+    callers must provide partials from an external split-attention producer.
+    """
+    if out is None:
+        output_dtype = out_dtype or out_partial.dtype
+        out_shape = (
+            out_partial.shape[1:4] + (out_partial.shape[4],)
+            if out_partial.dim() == 5
+            else out_partial.shape[1:2] + out_partial.shape[2:4]
+        )
+        out = torch.empty(out_shape, dtype=output_dtype, device=out_partial.device)
+    lse = _flash_attn_combine_op(out_partial, lse_partial, out, out_dtype)
+    return out, lse
 
 
 def flash_attn_with_kvcache(

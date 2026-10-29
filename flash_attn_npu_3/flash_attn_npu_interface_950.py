@@ -1220,3 +1220,51 @@ def flash_attn_with_kvcache(
         layout=layout,
     )
     return (out, softmax_lse, *rest) if return_softmax_lse else out
+
+
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_3_950_C::_flash_attn_combine",
+    mutates_args=("out",),
+    device_types="npu",
+)
+def _flash_attn_combine_op(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    return flash_attn_npu_3_950.fwd_combine(out_partial, lse_partial, out, out_dtype)[1]
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_3_950_C::_flash_attn_combine")
+def _flash_attn_combine_fake(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+) -> torch.Tensor:
+    is_dense = out_partial.dim() == 5
+    lse_shape = (
+        (out_partial.shape[1], out_partial.shape[2], out_partial.shape[3])
+        if is_dense
+        else (out_partial.shape[1], out_partial.shape[2])
+    )
+    return torch.empty(lse_shape, dtype=torch.float32, device=out.device)
+
+
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """Merge split-KV partial attention outputs (Ascend 950 backend).
+
+    See ``flash_attn_npu_3.flash_attn_combine`` for the full contract; this
+    backend shares the same NV-aligned signature.
+    """
+    if out is None:
+        output_dtype = out_dtype or out_partial.dtype
+        out_shape = (
+            out_partial.shape[1:4] + (out_partial.shape[4],)
+            if out_partial.dim() == 5
+            else out_partial.shape[1:2] + out_partial.shape[2:4]
+        )
+        out = torch.empty(out_shape, dtype=output_dtype, device=out_partial.device)
+    lse = _flash_attn_combine_op(out_partial, lse_partial, out, out_dtype)
+    return out, lse

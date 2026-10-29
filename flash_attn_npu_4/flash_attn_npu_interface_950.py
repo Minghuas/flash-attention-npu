@@ -988,6 +988,92 @@ def flash_attn_func(
     )
 
 
+@_torch_custom_op_wrapper(
+    "flash_attn_npu_4_950::_flash_attn_combine",
+    mutates_args=("out",),
+    device_types="npu",
+)
+def _flash_attn_combine_op(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    virtual_batch_idx: Optional[torch.Tensor],
+    return_lse: bool,
+) -> torch.Tensor:
+    result = flash_attn_npu_4_950.fwd_combine(
+        out_partial,
+        lse_partial,
+        out,
+        out_dtype,
+        cu_seqlens,
+        seqused,
+        virtual_batch_idx,
+        return_lse,
+    )
+    return result[1] if return_lse else torch.empty(0, dtype=torch.float32, device=result[0].device)
+
+
+@_torch_register_fake_wrapper("flash_attn_npu_4_950::_flash_attn_combine")
+def _flash_attn_combine_fake(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: torch.Tensor,
+    out_dtype: Optional[torch.dtype],
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    virtual_batch_idx: Optional[torch.Tensor],
+    return_lse: bool,
+) -> torch.Tensor:
+    is_dense = out_partial.dim() == 5
+    if not return_lse:
+        return torch.empty(0, dtype=torch.float32, device=out.device)
+    lse_shape = (
+        (out_partial.shape[1], out_partial.shape[2], out_partial.shape[3])
+        if is_dense
+        else (out_partial.shape[1], out_partial.shape[2])
+    )
+    return torch.empty(lse_shape, dtype=torch.float32, device=out.device)
+
+
+def flash_attn_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+    virtual_batch_idx: Optional[torch.Tensor] = None,
+    return_lse: bool = True,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Merge split-KV partial attention outputs (FA4, Ascend 950 backend).
+
+    ``cu_seqlens``/``seqused`` are accepted and validated for API parity but do
+    not currently limit the processed rows.
+    """
+    if out is None:
+        output_dtype = out_dtype or out_partial.dtype
+        out_shape = (
+            out_partial.shape[1:4] + (out_partial.shape[4],)
+            if out_partial.dim() == 5
+            else out_partial.shape[1:2] + out_partial.shape[2:4]
+        )
+        out = torch.empty(out_shape, dtype=output_dtype, device=out_partial.device)
+    lse = _flash_attn_combine_op(
+        out_partial,
+        lse_partial,
+        out,
+        out_dtype,
+        cu_seqlens,
+        seqused,
+        virtual_batch_idx,
+        return_lse,
+    )
+    return out, lse if return_lse else None
+
+
 @_torch_register_fake_wrapper("flash_attn_npu_4_C::_flash_attn_forward")
 def _flash_attn_forward_fake(
     q: torch.Tensor,

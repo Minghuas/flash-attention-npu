@@ -647,6 +647,38 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
+    """
+    Merge the partial outputs of a split-KV attention computation:
+        lse = logsumexp_s(lse_partial)
+        out = sum_s exp(lse_s - lse) * O_s
+
+    Arguments:
+        out_partial: fp32 partial outputs.
+            BSND: (num_splits, batch, seqlen, nheads, headdim)
+            TND:  (num_splits, total_q, nheads, headdim)
+        lse_partial: fp32 partial logsumexp in logical (..., seqlen, heads) order.
+            BSND: (num_splits, batch, seqlen, nheads)
+            TND:  (num_splits, total_q, nheads)
+        out [optional]: preallocated output, written in place.
+            When provided, its dtype is authoritative.
+        out_dtype [optional]: fp16 / bf16 / fp32. Defaults to out_partial.dtype
+            (fp32), matching flash-attention.
+
+    Returns:
+        (out, softmax_lse). softmax_lse is fp32 shaped (batch, seqlen, nheads)
+        or (total_q, nheads) - it is contiguous along seqlen, unlike
+        flash_attn_func's (batch, nheads, seqlen).
+
+    The in-tree v3 forward does not currently expose real split accumulators;
+    callers must obtain out_partial/lse_partial from an external split-attention
+    producer.
+    """
+```
+
 ### FlashAttention v4
 
 #### flash_attn_varlen_func
@@ -772,6 +804,28 @@ def flash_attn_varlen_func(
     """
 ```
 
+#### flash_attn_combine
+
+```python
+def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None,
+                       cu_seqlens=None, seqused=None, virtual_batch_idx=None,
+                       return_lse=True):
+    """
+    FA4 entry point for merging split attention partial outputs (same math as
+    the v3 helper). A 4-D out_partial selects the varlen (TND) layout; a 5-D
+    out_partial selects the batched (BSND) layout.
+
+    out_partial supports fp16, bf16, or fp32; lower-precision partials are
+    converted to fp32 for accumulation. out.dtype is authoritative when out is
+    provided.
+    cu_seqlens / seqused: optional int32 metadata accepted for API parity; they
+    are validated but do not currently limit the processed rows.
+    virtual_batch_idx: optional dense-layout mapping from virtual batch slots
+    to real batch indices.
+    return_lse=False returns (out, None).
+    """
+```
+
 ## Features
 
 #### flash_attn_with_kvcache
@@ -818,6 +872,18 @@ def flash_attn_varlen_func(
 | Softcapping | ✅ | ✅ | ✅ |
 | FP8 Quantization | - | - | - |
 | Dropout | ✅ | - | - |
+
+#### flash_attn_combine
+| Feature | v3 | v4 |
+|---------|----|----|
+| FP16 / BF16 / FP32 partial input | - | ✅ |
+| FP32 LSE input | ✅ | ✅ |
+| FP16 / BF16 / FP32 output | ✅ | ✅ |
+| Batched (BSND) partials | ✅ | ✅ |
+| Variable-length (TND) partials | ✅ | ✅ |
+| cu_seqlens / seqused | - | ✅ accepted, currently ignored |
+| virtual_batch_idx | - | ✅ dense |
+| Combined LSE output | ✅ | ✅ (`return_lse`) |
 
 
 ## License
