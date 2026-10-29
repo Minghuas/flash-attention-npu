@@ -94,18 +94,29 @@ pytest -q -s tests/test_flash_attn_npu_v4.py
 
 ## Memory Checking with msSanitizer
 
-Set env `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` at compile time to enable Ascend msSanitizer memory exception detection:
+Set `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` at compile time and launch tests through `mssanitizer`:
 
 ```bash
 # Build with memory checking enabled
 FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
 
-# Ascend 910: static instrumentation is compiled into the kernels - run tests directly
-pytest -q -s tests/test_flash_attn_npu_v3.py
-
-# Ascend 950: memory checking via runtime injection (note the `--` separator)
+# Ascend 910 / 950: launch through msSanitizer (note the `--` separator)
 mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
+
+# Optional: skip golden/precision compares so memcheck only launches kernels
+FLASH_ATTN_MEMCHECK=TRUE mssanitizer --tool=memcheck -- \
+  python -m pytest -q -s tests/test_flash_attn_npu_v3.py
 ```
+Use a separate build without static instrumentation for graph execution:
+
+```bash
+# Repeat with v4 for FA4. Keep static eager-check artifacts in a separate location.
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_MSSANITIZER_MODE=runtime \
+  FLASH_ATTN_BUILD_NPU=910 FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
+python -m pytest -q -s tests/test_flash_attn_npu_v3_graph.py
+```
+
+`FLASH_ATTN_MSSANITIZER_MODE` accepts `auto` (default: static on 910, runtime on 950), `static` (910 only), and `runtime` (`-g -fno-jump-tables`, no static stubs). This option takes effect only with `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE`.
 
 ## Usage
 
@@ -722,6 +733,14 @@ def flash_attn_varlen_func(
 
     For paged KV cache, pass page_table and shape k/v as
     (num_pages, page_size, nheads_k, headdim).
+    For physical BNBD storage shaped (num_pages, nheads_k, page_size, headdim), pass `k.transpose(1, 2)`
+    and `v.transpose(1, 2)`. The transpose is a metadata-only view; FA3 and FA4 recognize its
+    token/head strides and read the original BNBD storage directly.
+    Appending new K/V into a physical BNBD cache is not supported yet.
+    The physical-page axis may be non-contiguous: `stride(0)` is honored independently
+    for K and V, while the selected layout's inner dimensions must be dense. TND batches
+    may contain zero-length Q or KV sequences; an all-zero-Q batch returns empty
+    output/LSE tensors without launching a kernel.
 
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
     than Q. The number of heads in Q must be divisible by the number of heads in KV.

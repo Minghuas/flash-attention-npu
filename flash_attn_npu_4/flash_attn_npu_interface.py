@@ -80,6 +80,45 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     return _LAYOUT_BSND, q, k, v, False
 
 
+def _paged_kv_inner_layout(x):
+    """Return the packed inner layout of a logical [page, token, head, dim] cache."""
+    if x is None or x.dim() != 4:
+        return None
+    page_size, num_heads, head_dim = x.shape[1:]
+    if (
+        x.stride(1) == num_heads * head_dim
+        and x.stride(2) == head_dim
+        and x.stride(3) == 1
+    ):
+        return "BBND"
+    if (
+        x.stride(1) == head_dim
+        and x.stride(2) == page_size * head_dim
+        and x.stride(3) == 1
+    ):
+        return "BNBD"
+    return None
+
+
+def _prepare_forward_qkv(q, k, v, page_table):
+    """Match FIA's stride policy before entering the packed FA4 kernel.
+
+    Q and dense K/V are materialized because the kernel uses fixed packed
+    strides. Paged K/V keep their zero-copy path when both caches have the
+    same packed BBND or BNBD inner layout; dimension 0 may still be strided.
+    Unsupported paged inner layouts fall back to contiguous logical BBND.
+    """
+    q = q.contiguous()
+    if page_table is None:
+        return q, k.contiguous(), v.contiguous()
+
+    key_layout = _paged_kv_inner_layout(k)
+    value_layout = _paged_kv_inner_layout(v)
+    if key_layout is not None and key_layout == value_layout:
+        return q, k, v
+    return q, k.contiguous(), v.contiguous()
+
+
 def round_multiple(x, m):
     return (x + m - 1) // m * m
 
@@ -124,6 +163,18 @@ def _pad_bwd_headdim(dout, q, k, v, out, head_size_og):
     return _pad(dout), _pad(q), _pad(k), _pad(v), _pad(out), head_size_og
 
 
+def _validate_varlen_query(q, cu_seqlens_q, *, max_seqlen_q=None):
+    if q.dim() != 3:
+        raise RuntimeError(f"q must be 3-dimensional; got {q.dim()} dimensions")
+    if cu_seqlens_q.numel() <= 1:
+        raise RuntimeError("batch size must be positive")
+    # max_seqlen_q == 0 is the paged TND fast path, where every sequence has
+    # qlen 0. A nonzero declared max length with an empty packed query is
+    # inconsistent.
+    if q.shape[0] == 0 and max_seqlen_q != 0:
+        raise RuntimeError("total_q must be positive (q must contain at least one query token)")
+
+
 def _window_to_npu(window_size: Optional[int]) -> int:
     """FA4 uses None; FAG kernel uses -1 for 'disabled'."""
     return -1 if window_size is None else int(window_size)
@@ -161,8 +212,9 @@ def _flash_attn_forward(
     sm_margin: int = 0,
     layout: int = _LAYOUT_BSND,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    q, k = [maybe_contiguous(x) for x in (q, k)]
-    v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
+    if cu_seqlens_q is not None:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
+    q, k, v = _prepare_forward_qkv(q, k, v, page_table)
     cu_seqlens_q, cu_seqlens_k = [maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k)]
     seqused_q, seqused_k = [maybe_contiguous(x) for x in (seqused_q, seqused_k)]
     page_table = maybe_contiguous(page_table)
@@ -409,6 +461,8 @@ def _flash_attn_forward_fake(
         )
 
     is_varlen_q = cu_seqlens_q is not None
+    if is_varlen_q:
+        _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
     if not is_varlen_q and layout == _LAYOUT_BNSD:
         out = torch.empty(
             (q.shape[0], q.shape[2], q.shape[1], q.shape[3]),
@@ -684,8 +738,6 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors_bwd=None,
         return_lse=False,
     ):
-        assert k.stride(-1) == 1, "k must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v must have contiguous last dimension"
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
 
@@ -873,8 +925,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         seqlen_k_per_split=None,
         disable_scheduler_metadata=False,
     ):
-        assert k.stride(-1) == 1, "k_cache must have contiguous last dimension"
-        assert v.stride(-1) == 1, "v_cache must have contiguous last dimension"
+        if cu_seqlens_q is not None:
+            _validate_varlen_query(q, cu_seqlens_q, max_seqlen_q=max_seqlen_q)
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # cu_seqlens_q packs the query (TND); otherwise the rank-4 data is BSND.
@@ -884,34 +936,37 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_k = maybe_contiguous(seqused_k)
 
         fwd_max_seqlen_k = max_seqlen_k
-        if (
-            scheduler_metadata is None
-            and not disable_scheduler_metadata
-            and cu_seqlens_q is not None
-        ):
-            num_heads = q.shape[1]
-            head_size = q.shape[2]
+        if scheduler_metadata is None and not disable_scheduler_metadata and q.shape[0] != 0:
+            is_varlen_q = cu_seqlens_q is not None
+            num_heads = q.shape[1] if is_varlen_q else q.shape[2]
+            head_size = q.shape[2] if is_varlen_q else q.shape[3]
             head_size_v = v.shape[-1]
             num_heads_k = k.shape[1] if k.dim() == 3 else k.shape[2]
             if seqused_k is not None:
                 cache_seqlens = seqused_k
+            elif not is_varlen_q:
+                cache_seqlens = torch.full(
+                    (q.shape[0],), k.shape[1], dtype=torch.int32, device=q.device
+                )
             else:
                 cache_seqlens = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
             if seqused_q is not None:
                 seqlens_q_arg = seqused_q
+            elif not is_varlen_q:
+                seqlens_q_arg = None
             else:
                 seqlens_q_arg = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
+            metadata_max_seqlen_q = max_seqlen_q if is_varlen_q else q.shape[1]
             metadata_max_seqlen_k = max_seqlen_k
+            if metadata_max_seqlen_k is None and not is_varlen_q and page_table is None:
+                metadata_max_seqlen_k = k.shape[1]
             if metadata_max_seqlen_k is None and page_table is not None and k.dim() == 4:
-                # Paged KV: normalize the SWA window against the actual max KV
-                # seqlen (not the page capacity), matching the host tiling /
-                # golden rule "both sides vs actual seqlen_k". Otherwise a
-                # finite window smaller than the page capacity but larger than
-                # the actual seqlen fails to collapse and yields a wrong mask.
+                # Preserve the paged-KV window rule: infer the bound from used
+                # lengths, so unused cache capacity cannot change the mask.
                 metadata_max_seqlen_k = int(cache_seqlens.max().item())
                 fwd_max_seqlen_k = metadata_max_seqlen_k
             scheduler_metadata = get_scheduler_metadata(
-                max_seqlen_q=max_seqlen_q,
+                max_seqlen_q=metadata_max_seqlen_q,
                 max_seqlen_k=metadata_max_seqlen_k,
                 nheads=num_heads,
                 nheads_kv=num_heads_k,
@@ -1118,7 +1173,8 @@ def flash_attn_func(
             Defaults to 1 / sqrt(headdim + (headdim_v if qv is not None else 0)).
         causal: bool. Whether to apply causal attention mask.
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        learnable_sink [optional]: (Not supported on NPU)
+        learnable_sink [optional]: (num_heads,), dtype bfloat16. One sink logit per query head.
+            Added to the softmax denominator. The sink has no value contribution.
         softcap: float. Anything > 0 activates softcapping attention.
         num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
         pack_gqa: bool. If True, pack GQA for better performance. (Not supported on NPU)
@@ -1199,6 +1255,13 @@ def flash_attn_varlen_func(
 
     For paged KV cache, pass page_table and shape k/v as
     (num_pages, page_size, nheads_k, headdim).
+    For physical BNBD storage shaped (num_pages, nheads_k, page_size, headdim), pass
+    ``k.transpose(1, 2)`` and ``v.transpose(1, 2)``. The transpose is a metadata-only
+    view; FA4 reads the original BNBD storage directly. The physical-page axis may
+    be non-contiguous and may use different strides for K and V, while the selected
+    layout's inner dimensions must be dense. TND batches may contain zero-length Q
+    or KV sequences; an all-zero-Q batch returns empty output/LSE tensors without
+    launching the attention kernel.
 
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
     than Q. The number of heads in Q must be divisible by the number of heads in KV.
@@ -1246,8 +1309,8 @@ def flash_attn_varlen_func(
             Default to 1 / sqrt(headdim + (headdim_v if qv is not None else 0)).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
-        learnable_sink [optional]: (num_heads,), dtype bfloat16. Learnable sink token.
-            (Not supported on NPU)
+        learnable_sink [optional]: (num_heads,), dtype bfloat16. One sink logit per query head.
+            Added to the softmax denominator. The sink has no value contribution.
         softcap: float. Anything > 0 activates softcapping attention.
         num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
             If num_splits == 0, use a heuristic to automatically determine the number of splits.
