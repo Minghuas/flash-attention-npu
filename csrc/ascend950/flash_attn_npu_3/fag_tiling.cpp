@@ -55,7 +55,21 @@ int64_t GetFAGTilingParam(const FAGInfo& info, FAGTilingData& tiling)
 
     tiling = FAGTilingData{};
     tiling.layout = static_cast<uint32_t>(info.layout);
+    tiling.s1Token = info.window_size_left;
+    tiling.s2Token = info.window_size_right;
     tiling.maskType = static_cast<uint32_t>(info.maskType);
+
+    if (info.maskType == MaskType::NO_MASK) {
+        tiling.s1Token = INT32_MAX;
+        tiling.s2Token = INT32_MAX;
+    } else if (info.maskType == MaskType::CAUSAL) {
+        tiling.s1Token = INT32_MAX;
+        tiling.s2Token = 0;
+    } else if (info.maskType == MaskType::BAND) {
+        tiling.s1Token = (info.window_size_left < 0) ? INT32_MAX : info.window_size_left;
+        tiling.s2Token = (info.window_size_right < 0) ? INT32_MAX : info.window_size_right;
+    }
+
     tiling.deterministic = info.deterministic;
     tiling.detSchedule = info.deterministic ? info.detSchedule : static_cast<uint32_t>(DetSchedule::LEGACY);
     tiling.aicNum = info.aicNum;

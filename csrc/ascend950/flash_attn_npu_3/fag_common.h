@@ -44,6 +44,7 @@ enum class Layout : uint32_t {
 enum class MaskType : uint32_t {
     NO_MASK = 0,
     CAUSAL = 1,
+    BAND = 2,
 };
 
 // Deterministic accumulation strategy:
@@ -75,6 +76,8 @@ struct FAGInfo {
     uint64_t kvHeadNum = 0;
     uint64_t qkHeadDim = 0;
     uint64_t vHeadDim = 0;
+    int64_t window_size_left;
+    int64_t window_size_right;
 
     uint32_t aicNum = 0;
     uint32_t aivNum = 0;
@@ -116,6 +119,9 @@ struct FAGTilingData {
     uint64_t groupSize = 0;
     uint64_t qkHeadDim = 0;
     uint64_t vHeadDim = 0;
+    int64_t s1Token;
+    int64_t s2Token;
+
     float scaleValue = 1.0f;
     float softcapValue = 0.0f;
 

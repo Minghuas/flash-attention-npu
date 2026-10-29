@@ -694,10 +694,6 @@ class FlashAttnFunc(torch.autograd.Function):
     def backward(ctx, dout, *unused_grads):
         if ctx.quant_mode == 1:
             raise NotImplementedError("Ascend950 V3 FP8 supports forward only")
-        if ctx.window_size != (-1, -1):
-            raise NotImplementedError(
-                "Ascend950 v3 backward does not support sliding-window attention"
-            )
         q, k, v, out, softmax_lse = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
@@ -718,8 +714,8 @@ class FlashAttnFunc(torch.autograd.Function):
             dv,
             ctx.softmax_scale,
             ctx.causal,
-            -1,
-            -1,
+            ctx.window_size[0],
+            ctx.window_size[1],
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
@@ -844,10 +840,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     def backward(ctx, dout, *unused_grads):
         if ctx.quant_mode == 1:
             raise NotImplementedError("Ascend950 V3 FP8 supports forward only")
-        if ctx.window_size != (-1, -1):
-            raise NotImplementedError(
-                "Ascend950 v3 backward does not support sliding-window attention"
-            )
         q, k, v, out, softmax_lse, cu_q, cu_k, seqused_q, seqused_k = ctx.saved_tensors
         dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
         _flash_attn_backward(
@@ -868,8 +860,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dv,
             ctx.softmax_scale,
             ctx.causal,
-            -1,
-            -1,
+            ctx.window_size[0],
+            ctx.window_size[1],
             ctx.softcap,
             ctx.deterministic,
             ctx.sm_margin,
