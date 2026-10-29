@@ -288,6 +288,22 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
     }
 
+    __aicore__ inline void Rowsum512(const AscendC::LocalTensor<float>& srcUb, const AscendC::LocalTensor<float>& outUb,
+                                     const AscendC::LocalTensor<float>& scratch, uint32_t numRowsRound,
+                                     uint32_t numElemsAligned)
+    {
+        const auto reduced = scratch[UB_UINT8_VECTOR_SIZE];
+        AscendC::BlockReduceSum<float, false>(scratch, srcUb, numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE, 0, 1,
+                                              1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::BlockReduceSum<float, false>(
+            reduced, scratch, numRowsRound * numElemsAligned / FLOAT_BLOCK_SIZE / FLOAT_VECTOR_SIZE, 0, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::BlockReduceSum<float, false>(
+            outUb, reduced, numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE / FLOAT_VECTOR_SIZE, 0, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
     __aicore__ inline void Rowmax(const AscendC::LocalTensor<float>& srcUb, const AscendC::LocalTensor<float>& outUb,
                                   const AscendC::LocalTensor<float>& partial, uint32_t numRowsRound, uint32_t numElems,
                                   uint32_t numElemsAligned)
@@ -312,6 +328,22 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
         AscendC::BlockReduceMax<float, false>(outUb, reduced, numRowsRound / FLOAT_BLOCK_SIZE, 0, 1, 1, 8);
         AscendC::PipeBarrier<PIPE_V>();
         AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+    }
+
+    __aicore__ inline void Rowmax512(const AscendC::LocalTensor<float>& srcUb, const AscendC::LocalTensor<float>& outUb,
+                                     const AscendC::LocalTensor<float>& scratch, uint32_t numRowsRound,
+                                     uint32_t numElemsAligned)
+    {
+        const auto reduced = scratch[UB_UINT8_VECTOR_SIZE];
+        AscendC::BlockReduceMax<float, false>(scratch, srcUb, numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE, 0, 1,
+                                              1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::BlockReduceMax<float, false>(
+            reduced, scratch, numRowsRound * numElemsAligned / FLOAT_BLOCK_SIZE / FLOAT_VECTOR_SIZE, 0, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::BlockReduceMax<float, false>(
+            outUb, reduced, numRowsRound * numElemsAligned / FLOAT_VECTOR_SIZE / FLOAT_VECTOR_SIZE, 0, 1, 1, 8);
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void CopySGmToUb(AscendC::GlobalTensor<ElementInput> gInput, uint32_t sUbOffset,
@@ -364,7 +396,12 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
     __aicore__ inline void CalcLocalRowMax(uint32_t sUbOffset, uint32_t rowNumCurLoopRound, uint32_t columnNum,
                                            uint32_t columnNumRound, uint32_t rowOffset)
     {
-        Rowmax(lsUbTensor[sUbOffset], lmUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNum, columnNumRound);
+        if (columnNum == 512U) {
+            Rowmax512(lsUbTensor[sUbOffset], lmUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNumRound);
+        } else {
+            Rowmax(lsUbTensor[sUbOffset], lmUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNum,
+                   columnNumRound);
+        }
     }
 
     __aicore__ inline void UpdateGlobalRowMax(uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound, uint32_t columnNum,
@@ -437,7 +474,12 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
     __aicore__ inline void CalcLocalRowSum(uint32_t sUbOffset, uint32_t rowNumCurLoopRound, uint32_t columnNum,
                                            uint32_t columnNumRound, uint32_t rowOffset)
     {
-        Rowsum(lsUbTensor[sUbOffset], llUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNum, columnNumRound);
+        if (columnNum == 512U) {
+            Rowsum512(lsUbTensor[sUbOffset], llUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNumRound);
+        } else {
+            Rowsum(lsUbTensor[sUbOffset], llUbTensor[rowOffset], tvUbTensor, rowNumCurLoopRound, columnNum,
+                   columnNumRound);
+        }
     }
 
     __aicore__ inline void UpdateGlobalRowSum(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound,
@@ -637,8 +679,7 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
-        // Preserve each mode's original S/P row alignment.
-        uint32_t columnNumRound = doTriUMask ? RoundUp(columnNum, BLOCK_SIZE_IN_BYTE) : RoundUp(columnNum, BLOCK_SIZE);
+        uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE);
         uint32_t columnNumPad = layoutInput.stride(0);
         const uint32_t subBlockIdx = taskPlan.subBlockIdx;
         const uint32_t rowActualThisSubBlock = taskPlan.rowActualThisSubBlock;
@@ -713,8 +754,7 @@ class BlockEpilogue<EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float, HAS_SOFTCAP_
     {
         uint32_t rowNum = actualBlockShape.m();
         uint32_t columnNum = actualBlockShape.n();
-        // Preserve each mode's original S/P row alignment.
-        uint32_t columnNumRound = doTriUMask ? RoundUp(columnNum, BLOCK_SIZE_IN_BYTE) : RoundUp(columnNum, BLOCK_SIZE);
+        uint32_t columnNumRound = RoundUp(columnNum, BLOCK_SIZE);
         uint32_t columnNumPad = layoutInput.stride(0);
         const uint32_t subBlockIdx = taskPlan.subBlockIdx;
         const uint32_t rowActualThisSubBlock = taskPlan.rowActualThisSubBlock;
