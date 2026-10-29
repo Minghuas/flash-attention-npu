@@ -24,6 +24,41 @@ from flash_attn_npu_4 import (  # noqa: E402
 )
 
 
+@pytest.mark.skipif("Ascend910" not in _device_name, reason="Ascend910 window normalization")
+@pytest.mark.parametrize("layout", ["BSND", "TND"])
+@pytest.mark.parametrize("num_pages", [1, 2])
+def test_paged_swa_inferred_kv_length_ignores_unused_capacity(layout, num_pages):
+    """Inferring max_seqlen_k must preserve the used-length window contract."""
+    query = torch.zeros((1, 512, 1, 16), dtype=torch.bfloat16, device="npu")
+    key = torch.zeros((num_pages, 128, 1, 16), dtype=query.dtype, device=query.device)
+    value = torch.ones_like(key)
+    kwargs = dict(
+        max_seqlen_q=512,
+        seqused_k=torch.tensor([32], dtype=torch.int32, device=query.device),
+        page_table=torch.arange(num_pages, dtype=torch.int32, device=query.device)[None],
+        window_size=(8, -1),
+        return_lse=True,
+    )
+    if layout == "TND":
+        query = query.squeeze(0)
+        kwargs["cu_seqlens_q"] = torch.tensor([0, 512], dtype=torch.int32, device=query.device)
+
+    expected_out, expected_lse, *_ = flash_attn_varlen_func(
+        query, key, value, max_seqlen_k=32, **kwargs
+    )
+    out, lse, *_ = flash_attn_varlen_func(query, key, value, **kwargs)
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
+
+    # With the existing used-KV normalization, the right window is 32.
+    # Right alignment is -480, so query rows 0..447 have no visible key.
+    rows = out.reshape(512, 16)
+    assert torch.equal(rows[:448], torch.zeros_like(rows[:448]))
+    torch.testing.assert_close(rows[448:], torch.ones_like(rows[448:]), rtol=0, atol=0)
+    assert torch.isposinf(lse.reshape(512)[:448]).all()
+    assert torch.isfinite(lse.reshape(512)[448:]).all()
+
+
 def test_950_scheduler_metadata_matches_signature():
     if "Ascend950" not in _device_name:
         pytest.skip("Ascend950-only API signature")
@@ -346,6 +381,7 @@ def _flash_attn_kvcache(
     *,
     cu_seqlens_q=None,
     max_seqlen_q,
+    max_seqlen_k=None,
     softmax_scale=None,
     causal=False,
     window_size=WINDOW_SIZE,
@@ -359,6 +395,7 @@ def _flash_attn_kvcache(
         seqused_k=cache_seqlens,
         page_table=page_table,
         max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=causal,
         window_size=window_size,
@@ -1342,7 +1379,7 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
     window_size,
     softcap,
 ):
-    """Window classification uses capacity; alignment uses actual cache lengths."""
+    """An explicit capacity bound controls the window on both metadata paths."""
     if "Ascend950" in _device_name and softcap != 0.0:
         pytest.skip("Ascend950 FA4 kernel does not support softcap")
     query = make_random_tensor(
@@ -1396,6 +1433,9 @@ def test_flash_attn_kvcache_metadata_paged_short_kv_window(
             page_table,
             metadata,
             max_seqlen_q=q_seqlen,
+            # This test explicitly exercises capacity-based normalization.
+            # Omission now infers the used length in the automatic path.
+            max_seqlen_k=capacity,
             softmax_scale=scale,
             causal=is_causal,
             window_size=window_size,

@@ -954,9 +954,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             if metadata_max_seqlen_k is None and not is_varlen_q and page_table is None:
                 metadata_max_seqlen_k = k.shape[1]
             if metadata_max_seqlen_k is None and page_table is not None and k.dim() == 4:
-                # Match FIA: classify the window against paged-cache capacity;
-                # seqused_k still supplies the actual lengths used for alignment.
-                metadata_max_seqlen_k = page_table.shape[1] * k.shape[1]
+                # Preserve the paged-KV window rule: infer the bound from used
+                # lengths, so unused cache capacity cannot change the mask.
+                metadata_max_seqlen_k = int(cache_seqlens.max().item())
                 fwd_max_seqlen_k = metadata_max_seqlen_k
             scheduler_metadata = get_scheduler_metadata(
                 max_seqlen_q=metadata_max_seqlen_q,
