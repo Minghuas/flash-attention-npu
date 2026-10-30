@@ -88,8 +88,8 @@ fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch, co
                        bool paged_KV, int page_block_size, int num_blocks, int max_num_blocks_per_seq, bool is_causal,
                        bool is_local, int64_t window_size_left, int64_t window_size_right, bool is_varlen_q,
                        bool is_bf16, int batch_size, int seqlen_q, int num_heads, int num_heads_k, int head_size_q,
-                       int head_size_v, float softmax_scale, float softcapValue, bool lse_flag,
-                       FwdLayout layout) // TND (varlen), BSND (B,S,H,D) or BNSD (B,H,S,D)
+                       int head_size_v, float softmax_scale, float softcapValue, bool lse_flag, FwdLayout layout,
+                       uint32_t quantMode = 0) // TND (varlen), BSND (B,S,H,D) or BNSD (B,H,S,D)
 {
     if (is_varlen_q) {
         TORCH_CHECK(cu_seqlens_q_cpu_int32 != nullptr, "fill_inference_context: varlen Q requires cu_seqlens_q");
@@ -205,7 +205,8 @@ fill_inference_context(optiling::FAInferContext& ctx, SeqlenScratch& scratch, co
         ctx.windowSizeLeft = 0;
         ctx.windowSizeRight = 0;
     }
-    ctx.dataType = is_bf16 ? optiling::DataType::BF16 : optiling::DataType::FP16;
+    ctx.dataType =
+        quantMode == 1 ? optiling::DataType::FP8 : (is_bf16 ? optiling::DataType::BF16 : optiling::DataType::FP16);
     ctx.pagedCacheFlag = paged_KV;
     ctx.lseFlag = lse_flag;
     ctx.layout = layout; // TND (varlen), BSND (B,S,H,D) or BNSD (B,H,S,D)

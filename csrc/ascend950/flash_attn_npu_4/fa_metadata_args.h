@@ -8,7 +8,7 @@
 
 static_assert(std::is_trivially_copyable<FAInferStaticTilingData>::value, "static tiling must be trivially copyable");
 static_assert(std::is_standard_layout<FAInferStaticTilingData>::value, "static tiling must have a stable layout");
-static_assert(sizeof(FAInferStaticTilingData) == 5208, "static metadata ABI changed; update Python fake size");
+static_assert(sizeof(FAInferStaticTilingData) == 5216, "static metadata ABI changed; update Python fake size");
 static_assert(std::is_trivially_copyable<FAInferRuntimeData>::value, "runtime tiling must be trivially copyable");
 static_assert(std::is_standard_layout<FAInferRuntimeData>::value, "runtime tiling must have a stable layout");
 static_assert(sizeof(FAInferRuntimeData) == 48, "runtime tiling ABI changed");
@@ -57,6 +57,7 @@ struct FAMetadataArgs {
     uint32_t maxQSeqlen;
     uint32_t maskType, blockDim, isVarlen, isVarlenKv, numSplits;
     uint32_t hasSequsedQ;
+    uint32_t quantMode;
     int64_t windowSizeLeft, windowSizeRight;
 };
 

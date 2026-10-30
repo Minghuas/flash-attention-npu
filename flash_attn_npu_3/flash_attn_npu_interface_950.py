@@ -73,6 +73,15 @@ def _detect_layout(q, k, v, page_table, cu_seqlens_k):
     q_bnsd = _transposed_bnsd_view(q)
     k_bnsd = _transposed_bnsd_view(k)
     v_bnsd = _transposed_bnsd_view(v)
+    # A singleton sequence/head axis has identical BSND and BNSD storage.
+    # Let a non-degenerate FP8 operand anchor layout detection for MQA and Q=1.
+    if q.dtype == torch.float8_e4m3fn and any(x is not None for x in (q_bnsd, k_bnsd, v_bnsd)):
+        if q_bnsd is None and q.is_contiguous() and (q.shape[1] == 1 or q.shape[2] == 1):
+            q_bnsd = q.transpose(1, 2)
+        if k_bnsd is None and k.is_contiguous() and (k.shape[1] == 1 or k.shape[2] == 1):
+            k_bnsd = k.transpose(1, 2)
+        if v_bnsd is None and v.is_contiguous() and (v.shape[1] == 1 or v.shape[2] == 1):
+            v_bnsd = v.transpose(1, 2)
     if q_bnsd is not None and k_bnsd is not None and v_bnsd is not None:
         return _LAYOUT_BNSD, q_bnsd, k_bnsd, v_bnsd, True
 

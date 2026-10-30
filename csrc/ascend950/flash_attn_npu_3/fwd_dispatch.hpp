@@ -58,6 +58,8 @@ inline void launch_fwd(const FwdLaunchArgs& a)
     if (a.quant_mode == 1) {
         if (a.layout == Format::TND) {
             launch_fwd_impl<float8_e4m3_t, Format::TND>(a);
+        } else if (a.layout == Format::BNSD) {
+            launch_fwd_impl<float8_e4m3_t, Format::BNSD>(a);
         } else {
             launch_fwd_impl<float8_e4m3_t, Format::BSND>(a);
         }

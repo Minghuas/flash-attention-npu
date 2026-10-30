@@ -72,7 +72,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                                   std::optional<at::Tensor> cu_seqlens_q = std::nullopt, bool causal = false,
                                   int64_t window_left = -1, int64_t window_right = -1, int64_t num_splits = 0,
                                   std::optional<bool> pack_gqa = std::nullopt, int64_t = 0,
-                                  std::optional<at::Tensor> seqused_q = std::nullopt)
+                                  std::optional<at::Tensor> seqused_q = std::nullopt, uint32_t quantMode = 0)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     TORCH_CHECK(cache_seqlens.device().type() == at::kPrivateUse1, "cache_seqlens must be on NPU");
@@ -97,7 +97,11 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                         sq.dim() == 1 && sq.numel() == batch_size,
                     "seqused_q must be a contiguous int32 tensor of shape [batch] on NPU");
     }
+    TORCH_CHECK(quantMode == 0 || quantMode == 1, "unsupported quantization mode");
+    TORCH_CHECK(quantMode != 1 || (headdim == 128 && headdim_v == 128),
+                "950 V4 FP8 requires Q/K/V head dimensions of 128");
     FAMetadataArgs args{};
+    args.quantMode = quantMode;
     args.cuSeqlensQAddr = is_varlen_q ? reinterpret_cast<uint64_t>(cu_seqlens_q->data_ptr()) : 0;
     args.seqlensQAddr = seqused_q.has_value() ? reinterpret_cast<uint64_t>(seqused_q->data_ptr()) : 0;
     args.hasSequsedQ = seqused_q.has_value() ? 1u : 0u;

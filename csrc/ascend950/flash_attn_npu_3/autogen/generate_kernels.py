@@ -65,12 +65,7 @@ def fwd_kernel(dtype_key: str, layout: tuple) -> Kernel:
 
 
 def get_all_kernels() -> List[Kernel]:
-    return [
-        fwd_kernel(dtype, layout)
-        for dtype in DTYPE_MAP
-        for layout in LAYOUTS
-        if dtype != "fp8" or layout[0] != "bnsd"
-    ]
+    return [fwd_kernel(dtype, layout) for dtype in DTYPE_MAP for layout in LAYOUTS]
 
 
 def main(output_dir: Optional[str]) -> None:
