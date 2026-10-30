@@ -6,9 +6,11 @@ The low reference models one unsplit KV stream, independently of host tiling,
 metadata layout and FD scheduling. ATK owns exact schedule-aware validation.
 """
 
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass
 
 import torch
+from tests.common.golden_cache import get_or_compute_golden, register_retry
 
 P_SCALE = 256.0
 
@@ -306,3 +308,26 @@ def low_reference(case, inputs):
         outputs.append(output)
         lses.append(lse)
     return torch.cat(outputs), torch.cat(lses, dim=1)
+
+
+def ref_flash_attention_pair(case, inputs):
+    """Return the two FP8 references, using the shared golden cache."""
+    names = ("high_o", "high_lse", "low_o", "low_lse")
+
+    def compute():
+        return dict(zip(names, (*high_reference(case, inputs), *low_reference(case, inputs))))
+
+    test_file = os.environ.get("GOLDEN_CACHE_TEST_FILE")
+    cache_args = dict(
+        nodeid=os.environ.get("GOLDEN_CACHE_NODEID", "standalone"),
+        metadata=asdict(case),
+        inputs={name: inputs[name] for name in ("q", "k", "v", "descales")},
+        compute_fn=compute,
+        expected_keys=names,
+        source_files=[__file__],
+        test_source_files=[test_file] if test_file else [],
+    )
+    values, status = get_or_compute_golden(**cache_args, return_status=True)
+    if status == "hit":
+        register_retry(values, lambda: get_or_compute_golden(**cache_args, force_refresh=True))
+    return (values["high_o"], values["high_lse"]), (values["low_o"], values["low_lse"])
