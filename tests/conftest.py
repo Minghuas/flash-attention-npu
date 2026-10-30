@@ -25,7 +25,9 @@ from tests.common.timing import add, begin, finish, set_current_state
 def _wrap_kernel_functions(module):
     """Time imported flash-attention entry points without editing every test."""
     names = {
-        "flash_attn_func", "flash_attn_varlen_func", "flash_attn_with_kvcache",
+        "flash_attn_func",
+        "flash_attn_varlen_func",
+        "flash_attn_with_kvcache",
         "_flash_attn_backward",
     }
     for name in names:
@@ -41,14 +43,14 @@ def _wrap_kernel_functions(module):
             if state is None:
                 return __function(*args, **kwargs)
             import torch
+
             sync = getattr(getattr(torch, "npu", None), "synchronize", None)
             # Synchronization changes the execution semantics of asynchronous
             # NPU launches and can break graph/compile tests.  Keep timing
             # observational by default; opt in only when exact kernel timing
             # is explicitly requested.
-            sync_enabled = (
-                os.environ.get("CI_TIMING_SYNC", "0") == "1"
-                and not getattr(timed, "_ci_sync_disabled", False)
+            sync_enabled = os.environ.get("CI_TIMING_SYNC", "0") == "1" and not getattr(
+                timed, "_ci_sync_disabled", False
             )
             if sync and sync_enabled:
                 sync()
@@ -66,8 +68,11 @@ def _wrap_kernel_functions(module):
 
 
 REFERENCE_HELPERS = (
-    "torch_ref_fwd_bsnd", "golden_bsnd_bwd_from_fwd", "golden_tnd_bwd_from_fwd",
-    "ref_flash_attention", "_ref_flash_attention_pair",
+    "torch_ref_fwd_bsnd",
+    "golden_bsnd_bwd_from_fwd",
+    "golden_tnd_bwd_from_fwd",
+    "ref_flash_attention",
+    "_ref_flash_attention_pair",
 )
 
 
@@ -87,8 +92,10 @@ def _wrap_reference_functions(module):
     _wrap_reference_names(
         module,
         {
-            "torch_ref_fwd_bsnd", "golden_bsnd_bwd_from_fwd",
-            "golden_tnd_bwd_from_fwd", "ref_flash_attention",
+            "torch_ref_fwd_bsnd",
+            "golden_bsnd_bwd_from_fwd",
+            "golden_tnd_bwd_from_fwd",
+            "ref_flash_attention",
         },
     )
     # The uncached forward reference is called through the reference module's
@@ -229,6 +236,26 @@ def pytest_collection_modifyitems(config, items):
     items[:] = [it for it in items if it.nodeid in keep]
 
 
+@pytest.fixture(scope="module")
+def fp8_cpu_threads():
+    """Keep the FP8 bit-level CPU reference from oversubscribing the runner.
+
+    Cube rounding uses many small elementwise operations and reductions.
+    A large intra-op pool spends far more time scheduling these operations
+    than computing them, even when the golden cache is enabled. Limit the
+    whole FP8 module so input preparation and comparisons benefit as well.
+    Each xdist worker has its own pool; restore it before other modules run.
+    """
+    import torch
+
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
 @pytest.fixture(autouse=True)
 def _seed_per_case(request):
     """Seed torch's default RNG (CPU + NPU) per test case for reproducibility.
@@ -241,9 +268,9 @@ def _seed_per_case(request):
     """
     import torch
     import zlib
+
     env_seed = os.environ.get("CI_TORCH_SEED")
-    seed = int(env_seed) if env_seed else zlib.crc32(
-        request.node.nodeid.encode("utf-8"))
+    seed = int(env_seed) if env_seed else zlib.crc32(request.node.nodeid.encode("utf-8"))
     torch.manual_seed(seed)
     if hasattr(torch, "npu") and hasattr(torch.npu, "manual_seed"):
         torch.npu.manual_seed(seed)
@@ -253,6 +280,7 @@ def _seed_per_case(request):
     set_current_state(state)
     import tests.common.golden_cache as golden_cache
     import tests.common.compare as compare
+
     golden_cache.get_or_compute_golden._ci_timing_state = state
     compare.assert_fa_close._ci_timing_state = state
     for name in ("flash_attn_func", "flash_attn_varlen_func", "flash_attn_with_kvcache"):
@@ -265,10 +293,18 @@ def _seed_per_case(request):
             function._ci_state = state
     for function in _reference_wrapped_functions(request.module):
         function._ci_state = state
-    for name in ("make_random_tensor", "make_packed_random_tensor", "make_paged_kv_cache",
-                 "make_block_table", "gather_paged_kv_batch", "pad_packed_tensor",
-                 "make_padded_varlen_mask", "make_local_attention_mask",
-                 "make_attention_inputs", "check_kvcache_inplace"):
+    for name in (
+        "make_random_tensor",
+        "make_packed_random_tensor",
+        "make_paged_kv_cache",
+        "make_block_table",
+        "gather_paged_kv_batch",
+        "pad_packed_tensor",
+        "make_padded_varlen_mask",
+        "make_local_attention_mask",
+        "make_attention_inputs",
+        "check_kvcache_inplace",
+    ):
         function = getattr(request.module, name, None)
         if callable(function) and getattr(function, "_ci_prepare_timed", False):
             function._ci_state = state
@@ -285,10 +321,18 @@ def _seed_per_case(request):
             function._ci_state = None
     for function in _reference_wrapped_functions(request.module):
         function._ci_state = None
-    for name in ("make_random_tensor", "make_packed_random_tensor", "make_paged_kv_cache",
-                 "make_block_table", "gather_paged_kv_batch", "pad_packed_tensor",
-                 "make_padded_varlen_mask", "make_local_attention_mask",
-                 "make_attention_inputs", "check_kvcache_inplace"):
+    for name in (
+        "make_random_tensor",
+        "make_packed_random_tensor",
+        "make_paged_kv_cache",
+        "make_block_table",
+        "gather_paged_kv_batch",
+        "pad_packed_tensor",
+        "make_padded_varlen_mask",
+        "make_local_attention_mask",
+        "make_attention_inputs",
+        "check_kvcache_inplace",
+    ):
         function = getattr(request.module, name, None)
         if callable(function) and getattr(function, "_ci_prepare_timed", False):
             function._ci_state = None

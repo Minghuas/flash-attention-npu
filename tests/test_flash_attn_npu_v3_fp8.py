@@ -17,11 +17,12 @@ if not torch_npu.npu.is_available() or "Ascend950" not in torch_npu.npu.get_devi
 
 from tests.common.compare import assert_fa_close
 from tests.common.attention_ref_fp8 import (
-    high_reference,
-    low_reference,
     read_inputs,
+    ref_flash_attention_pair,
     visible,
 )
+
+pytestmark = pytest.mark.usefixtures("fp8_cpu_threads")
 
 
 # dense: MHA/GQA/MQA, three masks, softcap, full and tail tiles.
@@ -369,8 +370,7 @@ def run_case(
             assert torch.equal(result, reference)
     else:
         actual = run_forward(case, inputs, "npu:0")
-    high = high_reference(case, inputs)
-    low = low_reference(case, inputs)
+    high, low = ref_flash_attention_pair(case, inputs)
     total_q = sum(q_lengths)
     assert actual[0].shape == (total_q, kv_heads * group, 128)
     assert actual[0].dtype == torch.bfloat16
