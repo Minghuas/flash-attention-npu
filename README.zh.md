@@ -14,15 +14,22 @@ FlashAttention 通过分块计算和内存感知算法提升训练和推理效�
 
 ### 环境要求
 
-- 硬件: 昇腾 910B / 910C / 950 NPU
-- 系统: Linux
-- 软件:
-  - CANN >= 8.5.0
-  - PyTorch >= 2.1.0
-  - torch_npu >= 2.1.0 (与Pytorch版本相同)
-- Python 依赖包
+- 硬件：昇腾 910B / 910C / 950 NPU
+- 系统：Linux
+- Python：>= 3.9
+- CANN：安装支持目标 NPU 的 Toolkit、驱动和固件。
+
+### Python 依赖包
+
+- `torch`（>= 2.4）
+- `torch_npu`（与 PyTorch 发布版本匹配）
+- `setuptools`（>= 70.1，构建）
+- `packaging`（构建）
+- `pytest`、`numpy`（测试）
+- `pytest-xdist`（可选，并行测试）
+
 ```bash
-pip install packaging psutil
+python -m pip install "setuptools>=70.1" packaging
 ```
 - 设置 CANN 环境变量
 ```bash
@@ -51,39 +58,50 @@ git submodule update --init --recursive
 2. 编译安装：
 
 ```bash
-python setup.py install
+pip install -e . --no-build-isolation --no-deps --config-settings editable_mode=compat
+
+# 或仅在源码目录原地编译
+python setup.py build_ext --inplace
 ```
 
   编译特定版本：
 
 ```bash
 # 仅编译 v2
-FLASH_ATTN_BUILD_VERSION=v2 python setup.py install
+FLASH_ATTN_BUILD_VERSION=v2 python setup.py build_ext --inplace
 
 # 仅编译 v3
-FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
+FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
 
 # 仅编译 v4
-FLASH_ATTN_BUILD_VERSION=v4 python setup.py install
+FLASH_ATTN_BUILD_VERSION=v4 python setup.py build_ext --inplace
 ```
 
   编译面向特定NPU的版本：
 
 ```bash
 # 仅编译 910 版本
-FLASH_ATTN_BUILD_NPU=910 python setup.py install
+FLASH_ATTN_BUILD_NPU=910 python setup.py build_ext --inplace
 
 # 仅编译 950 版本
-FLASH_ATTN_BUILD_NPU=950 python setup.py install
+FLASH_ATTN_BUILD_NPU=950 python setup.py build_ext --inplace
 ```
 
 ## 测试
 
-运行测试脚本：
+在已准备好的 NPU 环境中安装测试依赖：
+
+```bash
+python -m pip install pytest numpy
+# 可选：与 CI 一样启用并行测试
+python -m pip install pytest-xdist
+```
+
+编译安装对应 API 版本后运行测试脚本。FlashAttention v2 仅支持昇腾 910B/C：
 
 ```bash
 # 测试 FlashAttention v2
-pytest -q -s tests/test_flash_attn_npu_2.py
+pytest -q -s tests/test_flash_attn_npu_v2.py
 
 # 测试 FlashAttention v3
 pytest -q -s tests/test_flash_attn_npu_v3.py
@@ -98,7 +116,7 @@ pytest -q -s tests/test_flash_attn_npu_v4.py
 
 ```bash
 # 使能内存检测编译
-FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
 
 # Ascend 910 / 950 均须通过 msSanitizer 启动（注意 `--` 分隔符）
 mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
