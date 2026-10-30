@@ -16,14 +16,22 @@ FlashAttention significantly improves training and inference efficiency for mode
 
 - Hardware: Ascend 910B / 910C / 950 NPU
 - OS: Linux
-- Software:
-  - CANN >= 8.5.0
-  - PyTorch >= 2.1.0
-  - torch_npu >= 2.1.0 (same version with PyTorch)
-- Python Dependencies
+- Python: >= 3.9
+- CANN: Install the Toolkit, driver, and firmware supporting the target NPU.
+
+### Python Dependencies
+
+- `torch` (>= 2.4)
+- `torch_npu` (matching the PyTorch release version)
+- `setuptools` (>= 70.1, build)
+- `packaging` (build)
+- `pytest`, `numpy` (tests)
+- `pytest-xdist` (optional, parallel tests)
+
 ```bash
-pip install packaging psutil
+python -m pip install "setuptools>=70.1" packaging
 ```
+
 - CANN environment variables
 ```bash
 source [PATH_TO_ASCEND_HOME]/cann/set_env.sh
@@ -51,39 +59,51 @@ git submodule update --init --recursive
 2. Build and install:
 
 ```bash
-python setup.py install
+pip install -e . --no-build-isolation --no-deps --config-settings editable_mode=compat
+
+# Or build in place in the source directory
+python setup.py build_ext --inplace
 ```
 
   Build specific version:
 
 ```bash
 # Build v2 only
-FLASH_ATTN_BUILD_VERSION=v2 python setup.py install
+FLASH_ATTN_BUILD_VERSION=v2 python setup.py build_ext --inplace
 
 # Build v3 only
-FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
+FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
 
 # Build v4 only
-FLASH_ATTN_BUILD_VERSION=v4 python setup.py install
+FLASH_ATTN_BUILD_VERSION=v4 python setup.py build_ext --inplace
 ```
 
   Build for specific NPU:
 
 ```bash
 # Build 910 only
-FLASH_ATTN_BUILD_NPU=910 python setup.py install
+FLASH_ATTN_BUILD_NPU=910 python setup.py build_ext --inplace
 
 # Build 950 only
-FLASH_ATTN_BUILD_NPU=950 python setup.py install
+FLASH_ATTN_BUILD_NPU=950 python setup.py build_ext --inplace
 ```
 
 ## Testing
 
-Run test scripts:
+Install test dependencies in the prepared NPU environment:
+
+```bash
+python -m pip install pytest numpy
+# Optional: parallel tests, as used by CI
+python -m pip install pytest-xdist
+```
+
+Run test scripts after building and installing the corresponding API version.
+FlashAttention v2 is supported only on Ascend 910B/C:
 
 ```bash
 # Test FlashAttention v2
-pytest -q -s tests/test_flash_attn_npu_2.py
+pytest -q -s tests/test_flash_attn_npu_v2.py
 
 # Test FlashAttention v3
 pytest -q -s tests/test_flash_attn_npu_v3.py
@@ -98,7 +118,7 @@ Set `FLASH_ATTN_ENABLE_MSSANITIZER=TRUE` at compile time and launch tests throug
 
 ```bash
 # Build with memory checking enabled
-FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py install
+FLASH_ATTN_ENABLE_MSSANITIZER=TRUE FLASH_ATTN_BUILD_VERSION=v3 python setup.py build_ext --inplace
 
 # Ascend 910 / 950: launch through msSanitizer (note the `--` separator)
 mssanitizer --tool=memcheck -- python -m pytest -q -s tests/test_flash_attn_npu_v3.py
