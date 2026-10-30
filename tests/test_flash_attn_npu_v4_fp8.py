@@ -21,6 +21,8 @@ from tests.common.attention_ref_fp8 import (
     visible,
 )
 
+pytestmark = pytest.mark.usefixtures("fp8_cpu_threads")
+
 
 # dense: MHA/GQA/MQA, three masks, softcap, full and tail tiles.
 # mask, q_lengths, kv_lengths, kv_heads, group, softcap, check_no_lse, layout
