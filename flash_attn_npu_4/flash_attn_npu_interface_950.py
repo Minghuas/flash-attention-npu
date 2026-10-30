@@ -566,9 +566,6 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse=False,
         scheduler_metadata=None,
         disable_scheduler_metadata=False,
-        q_descale: Optional[torch.Tensor] = None,
-        k_descale: Optional[torch.Tensor] = None,
-        v_descale: Optional[torch.Tensor] = None,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -637,9 +634,6 @@ class FlashAttnFunc(torch.autograd.Function):
             True,
             scheduler_metadata,
             layout,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
         )
 
         ctx.save_for_backward(q, k, v, out, softmax_lse)
@@ -732,9 +726,6 @@ class FlashAttnFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # scheduler_metadata
             None,  # disable_scheduler_metadata
-            None,  # q_descale
-            None,  # k_descale
-            None,  # v_descale
         )
 
 
@@ -772,9 +763,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_lse=False,
         scheduler_metadata=None,
         disable_scheduler_metadata=False,
-        q_descale: Optional[torch.Tensor] = None,
-        k_descale: Optional[torch.Tensor] = None,
-        v_descale: Optional[torch.Tensor] = None,
     ):
         assert k.stride(-1) == 1, "k must have contiguous last dimension"
         assert v.stride(-1) == 1, "v must have contiguous last dimension"
@@ -862,9 +850,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             True,
             scheduler_metadata,
             layout,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
         )
 
         ctx.save_for_backward(
@@ -979,9 +964,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             None,  # return_lse
             None,  # scheduler_metadata
             None,  # disable_scheduler_metadata
-            None,  # q_descale
-            None,  # k_descale
-            None,  # v_descale
         )
 
 
@@ -1009,16 +991,11 @@ def flash_attn_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
 ):
     if q.dtype == torch.float8_e4m3fn:
         if qv is not None:
             raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")
-        if any(
-            t is not None and t.requires_grad for t in (q, k, v, q_descale, k_descale, v_descale)
-        ):
+        if any(t is not None and t.requires_grad for t in (q, k, v)):
             raise NotImplementedError("Ascend950 V4 FP8 supports inference forward only")
     return FlashAttnFunc.apply(
         q,
@@ -1044,9 +1021,6 @@ def flash_attn_func(
         return_lse,
         scheduler_metadata,
         disable_scheduler_metadata,
-        q_descale,
-        k_descale,
-        v_descale,
     )
 
 
@@ -1250,16 +1224,11 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
     scheduler_metadata: Optional[torch.Tensor] = None,
     disable_scheduler_metadata: bool = False,
-    q_descale: Optional[torch.Tensor] = None,
-    k_descale: Optional[torch.Tensor] = None,
-    v_descale: Optional[torch.Tensor] = None,
 ):
     if q.dtype == torch.float8_e4m3fn:
         if qv is not None:
             raise NotImplementedError("Ascend950 V4 FP8 supports q/k/v inputs only")
-        if any(
-            t is not None and t.requires_grad for t in (q, k, v, q_descale, k_descale, v_descale)
-        ):
+        if any(t is not None and t.requires_grad for t in (q, k, v)):
             raise NotImplementedError("Ascend950 V4 FP8 supports inference forward only")
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1292,7 +1261,4 @@ def flash_attn_varlen_func(
         return_lse,
         scheduler_metadata,
         disable_scheduler_metadata,
-        q_descale,
-        k_descale,
-        v_descale,
     )

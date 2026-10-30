@@ -208,37 +208,68 @@ def prepare_v4_forward(kwargs, entry, metadata=False):
         if entry == "cache"
         else kwargs.get("return_attn_probs", False)
     )
+    window_left, window_right = kwargs.get("window_size", (-1, -1))
+    used_q = None
+    if cuq is None:
+        q_max, k_max = q.shape[1], k.shape[1]
+        q_heads, kv_heads = q.shape[2], k.shape[2]
+        layout, q, k, v, _ = fa._detect_layout(q, k, v, table, cuk)
+        used_k = torch.full((q.shape[0],), k_max, dtype=torch.int32, device=q.device)
+    else:
+        layout = fa._LAYOUT_TND
+        used_q = cuq[1:] - cuq[:-1]
+        q_max = kwargs.get("max_seqlen_q") or int(used_q.max().item())
+        k_max = kwargs.get("max_seqlen_k")
+        if used_k is None and cuk is not None:
+            used_k = cuk[1:] - cuk[:-1]
+        if k_max is None and metadata and used_k is not None:
+            k_max = int(used_k.max().item())
+        q_heads, kv_heads = q.shape[-2], k.shape[-2]
+
     common = dict(
         q=q,
         k=k,
         v=v,
+        layout=layout,
+        cu_seqlens_q=cuq,
+        cu_seqlens_k=cuk,
+        max_seqlen_q=q_max if cuq is not None else None,
+        max_seqlen_k=k_max if cuq is not None else None,
+        seqused_q=used_q,
+        seqused_k=used_k,
+        page_table=table,
         softmax_scale=kwargs.get("softmax_scale"),
         causal=kwargs.get("causal", False),
-        window_size=tuple(kwargs.get("window_size", (-1, -1))),
+        window_size_left=fa._window_to_npu(window_left),
+        window_size_right=fa._window_to_npu(window_right),
         softcap=kwargs.get("softcap", 0.0),
         num_splits=kwargs.get("num_splits", 1),
         q_descale=kwargs.get("q_descale"),
         k_descale=kwargs.get("k_descale"),
         v_descale=kwargs.get("v_descale"),
         return_lse=return_lse,
-        disable_scheduler_metadata=not metadata,
     )
-    if cuq is None:
-        function = fa.flash_attn_func
-    else:
-        function = fa.flash_attn_varlen_func
-        common.update(
+    if metadata:
+        common["scheduler_metadata"] = fa.get_scheduler_metadata(
+            max_seqlen_q=q_max,
+            max_seqlen_k=k_max,
+            nheads=q_heads,
+            nheads_kv=kv_heads,
+            headdim=q.shape[-1],
+            headdim_v=v.shape[-1],
+            num_splits=common["num_splits"],
+            causal=common["causal"],
+            window_size_left=window_left,
+            window_size_right=window_right,
             cu_seqlens_q=cuq,
-            cu_seqlens_k=cuk,
-            max_seqlen_q=kwargs.get("max_seqlen_q") or int((cuq[1:] - cuq[:-1]).max().item()),
-            max_seqlen_k=kwargs.get("max_seqlen_k"),
+            seqused_q=used_q,
             seqused_k=used_k,
-            page_table=table,
+            qkv_dtype=q.dtype,
         )
 
-    # Keep cache's legacy output convention while using V4's existing varlen API.
+    # Restore the caller's layout and legacy output convention.
     def normalize(result):
-        out, lse = (result[0], result[1]) if return_lse else (result, None)
+        out, lse = result[0], result[1] if return_lse else None
         if original_shape is not None:
             batch, q_len, heads, dim = original_shape
             out = out.reshape(batch, q_len, heads, dim)
@@ -248,7 +279,7 @@ def prepare_v4_forward(kwargs, entry, metadata=False):
             lse = lse.transpose(-1, -2)
         return (out, lse) if return_lse else out
 
-    return function, common, normalize
+    return fa._flash_attn_forward, common, normalize
 
 
 def run_forward(case, inputs, device):
@@ -576,7 +607,7 @@ def test_fp8_semantics(entry, mask, q_lengths, kv_lengths, window_size, zero_v):
 
 @pytest.mark.parametrize("view_kind", ["strided_head", "strided_batch", "broadcast_batch"])
 def test_fp8_descale_views(view_kind):
-    from flash_attn_npu_4 import flash_attn_func
+    from flash_attn_npu_4.flash_attn_npu_interface_950 import _flash_attn_forward
 
     torch.manual_seed(0)
     q = torch.randn(2, 65, 4, 128, device="npu:0").to(torch.float8_e4m3fn)
@@ -590,12 +621,27 @@ def test_fp8_descale_views(view_kind):
     }
     descale = views[view_kind]
     assert not descale.is_contiguous()
-    actual = flash_attn_func(
-        q, k, v, q_descale=descale, k_descale=descale, v_descale=descale, return_lse=True
+    seqused_k = torch.full((2,), 129, dtype=torch.int32, device=q.device)
+    actual = _flash_attn_forward(
+        q,
+        k,
+        v,
+        seqused_k=seqused_k,
+        q_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
+        return_lse=True,
     )
     contiguous = descale.contiguous()
-    expected = flash_attn_func(
-        q, k, v, q_descale=contiguous, k_descale=contiguous, v_descale=contiguous, return_lse=True
+    expected = _flash_attn_forward(
+        q,
+        k,
+        v,
+        seqused_k=seqused_k,
+        q_descale=contiguous,
+        k_descale=contiguous,
+        v_descale=contiguous,
+        return_lse=True,
     )
     assert torch.equal(actual[0], expected[0])
     assert torch.equal(actual[1], expected[1])
