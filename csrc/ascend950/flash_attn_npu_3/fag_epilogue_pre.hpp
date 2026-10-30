@@ -55,11 +55,15 @@ public:
             ClearRegion(dkWorkspace_, dkCount, vectorCoreId, vectorCoreNum);
             ClearRegion(dvWorkspace_, dvCount, vectorCoreId, vectorCoreNum);
         }
-        if (vectorCoreId == 0) {
-            // GM_ADDR is __gm__ uint8_t*: cast to int64_t to zero the FULL
-            // counters, and use atomics so the zeroing is visible at L2 —
-            // a scalar store could sit in this core's DCache and never reach
-            // the L2 where the v2 AtomicAdd/poll operate.
+        // readyCounter/doneCounter live at workspace_[0..15]. The non-det
+        // tiler sets dqOffset=0 so ClearRegion already zeros that range;
+        // Only reset when a dedicated sync region was reserved (deterministic
+        // layouts use MULTI_CORE_SYNC_BYTES before dq).
+        if (vectorCoreId == 0 &&
+            tiling_->dqOffset >= FAGTiling950::MULTI_CORE_SYNC_BYTES) {
+            // Use atomics so the zeroing is visible at L2 — a scalar store
+            // could sit in this core's DCache and never reach the L2 where
+            // AtomicAdd/poll operate.
             AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t *>(workspace_), (uint64_t)0);                   // readyCounter
             AscendC::AtomicExch(reinterpret_cast<__gm__ uint64_t *>(workspace_ + sizeof(uint64_t)), (uint64_t)0); // doneCounter
         }
