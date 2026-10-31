@@ -20,10 +20,10 @@
 
 #include "mha_fwd_kvcache.cpp"
 
-// 7-param FAInfer (no IS_FD template arg — main moved flash-decode to tiling).
-#define FWD_LAUNCH(DTYPE, PAGED, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                                      \
-    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, MASK_TYPE, LAYOUT_TYPE, Catlass::Epilogue::LseModeT::OUT_ONLY,      \
-                       SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(                                               \
+// 9-parameter FAInfer: Q/KV/accumulator types, paged/FD, mask/layout, LSE mode, softcap.
+#define FWD_LAUNCH(DTYPE, PAGED, FLASH_DECODE, MASK_TYPE, LAYOUT_TYPE, SOFTCAP)                                        \
+    SplitFuse::FAInfer<DTYPE, DTYPE, float, PAGED, FLASH_DECODE, MASK_TYPE, LAYOUT_TYPE,                               \
+                       Catlass::Epilogue::LseModeT::OUT_ONLY, SOFTCAP><<<launchBlockDim, nullptr, aclStream>>>(        \
         fftsAddr, qDevice, kDevice, vDevice, maskDevice, blockTableDevice, oDevice, softmaxLseDevice, qSeqDevice,      \
         kvSeqDevice, workspaceDevice, tiling, kNewDevice, vNewDevice, sequsedQDevice, sequsedKVDevice,                 \
         kvSeqlenAllocated)
@@ -91,11 +91,12 @@ void launch_fwd_dtype(const FwdLaunchArgs& a)
     uint8_t* sequsedQDevice = a.sequsedQDevice;
     uint8_t* sequsedKVDevice = a.sequsedKVDevice;
     const int64_t kvSeqlenAllocated = a.kv_seqlen_allocated;
-    (void)flashDecodeFlag;
-
     FWD_BOOL_SWITCH(paged_KV, IsPaged, {
-        FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
-            FWD_BOOL_SWITCH(has_softcap, HasSoftcap, { FWD_LAUNCH(DType, IsPaged, MaskType, LAYOUT, HasSoftcap); });
+        FWD_BOOL_SWITCH(flashDecodeFlag, IsFlashDecode, {
+            FWD_MASK_SWITCH(is_local, is_causal, MaskType, {
+                FWD_BOOL_SWITCH(has_softcap, HasSoftcap,
+                                { FWD_LAUNCH(DType, IsPaged, IsFlashDecode, MaskType, LAYOUT, HasSoftcap); });
+            });
         });
     });
 }

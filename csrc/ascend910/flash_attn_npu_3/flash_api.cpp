@@ -500,6 +500,43 @@ std::vector<at::Tensor> mha_fwd(
         is_causal = maskDer.is_causal;
         is_local = maskDer.is_local;
         const bool hasMask = maskDer.maskType != static_cast<uint32_t>(FaiKenel::MaskType::NO_MASK);
+        // FlashDecode requires at least 1024 KV tokens. For paged KV, the
+        // page-table capacity bounds every valid used length, including append.
+        // Skip the device-to-host length reads when FD is impossible; those
+        // synchronous copies are also unsupported during graph capture.
+        if (paged_KV && is_varlen_q && !is_local && kvSeqlenBound >= 1024) {
+            int64_t maxQ = 0;
+            int64_t minQ = std::numeric_limits<int64_t>::max();
+            if (seqused_q_.has_value()) {
+                at::Tensor q_used_cpu = seqused_q_->to(at::Device(at::kCPU)).contiguous();
+                const int32_t* q_used = static_cast<const int32_t*>(q_used_cpu.data_ptr());
+                for (int64_t i = 0; i < batch_size; ++i) {
+                    maxQ = std::max<int64_t>(maxQ, q_used[i]);
+                    minQ = std::min<int64_t>(minQ, q_used[i]);
+                }
+            } else {
+                at::Tensor cu_q_cpu = cu_seqlens_q.to(at::Device(at::kCPU)).contiguous();
+                const int32_t* cu_q = static_cast<const int32_t*>(cu_q_cpu.data_ptr());
+                for (int64_t i = 0; i < batch_size; ++i) {
+                    const int64_t qLen = static_cast<int64_t>(cu_q[i + 1]) - cu_q[i];
+                    maxQ = std::max(maxQ, qLen);
+                    minQ = std::min(minQ, qLen);
+                }
+            }
+            at::Tensor kv_used_cpu = seqlens_k.to(at::Device(at::kCPU)).contiguous();
+            const int32_t* kv_used = static_cast<const int32_t*>(kv_used_cpu.data_ptr());
+            int64_t maxKvSeqlen = 0;
+            for (int64_t i = 0; i < batch_size; ++i) {
+                maxKvSeqlen = std::max<int64_t>(maxKvSeqlen, static_cast<int64_t>(kv_used[i]) + kvNewSeqlen);
+            }
+            const uint32_t fdTaskCount = static_cast<uint32_t>(batch_size * num_heads_k);
+            const bool fdLongSeq = (static_cast<double>(fdTaskCount) <= 0.8 * blockDim) &&
+                                   (maxKvSeqlen >= static_cast<int64_t>(blockDim) * 512);
+            const bool fdShortSeq = (static_cast<double>(fdTaskCount) <= 0.4 * blockDim) && (maxKvSeqlen >= 1024);
+            const int64_t fdGroupSize = num_heads / num_heads_k;
+            flashDecodeFlag = (maxQ * fdGroupSize <= 128) && (maxQ <= 16) && (maxKvSeqlen >= 1024) && (minQ > 0) &&
+                              (fdLongSeq || fdShortSeq);
+        }
         TORCH_CHECK(static_cast<uint64_t>(schedMd.nbytes()) == fa_metadata::MetadataBytes(hasMask),
                     "scheduler_metadata buffer size must exactly match this call's "
                     "causal/window-derived layout");
@@ -611,17 +648,14 @@ std::vector<at::Tensor> mha_fwd(
             if (seqlens_q_cpu != nullptr) {
                 qSeqlenVal = *(seqlens_q_cpu + batchIdx);
             }
-            if (is_varlen_kv) {
-                kvSeqlenVal = *(seqlens_k_cpu + batchIdx + 1) - *(seqlens_k_cpu + batchIdx);
-            }
             maxQSeqlenCalc = std::max(maxQSeqlenCalc, qSeqlenVal);
             minQSeqlenCalc = std::min(minQSeqlenCalc, qSeqlenVal);
             maxKVSeqlenCalc = std::max(maxKVSeqlenCalc, kvSeqlenVal);
         }
-        uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
-        bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
-                         (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
-        bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) && (maxKVSeqlenCalc >= 1024);
+        const uint32_t numTasks = static_cast<uint32_t>(batch_size * num_heads_k);
+        const bool isLongSeq = (static_cast<double>(numTasks) <= 0.8 * blockDim) &&
+                               (maxKVSeqlenCalc >= static_cast<int64_t>(blockDim) * 512);
+        const bool isShortSeq = (static_cast<double>(numTasks) <= 0.4 * blockDim) && (maxKVSeqlenCalc >= 1024);
         TORCH_CHECK(num_splits <= 1 || (paged_KV && is_varlen_q),
                     "NPU FlashAttention num_splits>1 currently requires paged KV cache and varlen-q (TND) layout");
         flashDecodeFlag = paged_KV && is_varlen_q && !is_local && (maxQSeqlenCalc * groupSize <= 128) &&
@@ -735,8 +769,7 @@ std::vector<at::Tensor> mha_fwd(
     auto softmaxLseDevice = static_cast<uint8_t*>(softmaxlse.data_ptr());
     // Forward kernel launches live in fwd_dispatch_<dtype>_<layout>.cpp. The layout
     // template argument is selected from the host `layout` code; dtype and
-    // paged/causal are resolved inside the dispatch. flashDecodeFlag only affects
-    // tiling (fa_split), not a FAInfer template arg.
+    // paged/causal and the FlashDecode specialization are resolved in dispatch.
     auto aclStream = c10_npu::getCurrentNPUStream().stream(false);
     FwdLaunchArgs fwd_args;
     fwd_args.launchBlockDim = launchBlockDim;
