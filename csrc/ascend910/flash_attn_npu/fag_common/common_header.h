@@ -7,12 +7,10 @@
 #ifndef INCLUDE_COMMON_HEADER_H
 #define INCLUDE_COMMON_HEADER_H
 
-
 #include <limits>
 #include <type_traits>
 #include <cstdint>
 #include "kernel_operator.h"
-
 
 #define SET_FLAG(trigger, waiter, e) AscendC::SetFlag<AscendC::HardEvent::trigger##_##waiter>((e))
 #define WAIT_FLAG(trigger, waiter, e) AscendC::WaitFlag<AscendC::HardEvent::trigger##_##waiter>((e))
@@ -60,6 +58,11 @@ struct AddrInfo {
     int32_t lineStride = 0;
     bool lowerLeft;
     bool upperRight;
+    // Absolute S1/S2 block indices for causal in-rectangle skips (Cube3 ROW_4 packing).
+    int32_t S1Idx = 0;
+    int32_t S2Idx = 0;
+    // 1 = MASK_CAUSAL (enable S1Idx/S2Idx skips in Cube3); 0 = NO_MASK.
+    int32_t isCausal = 0;
 };
 
 struct CubeAddrInfo {
