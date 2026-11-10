@@ -1,12 +1,12 @@
 name: NPU Benchmark
 
 # 触发方式:
-#   - PR 评论触发: 例如 run-npu-benchmark arch=910 fa_version=fa3 commit_id=<sha>
+#   - PR 评论触发: 例如 /run-npu-benchmark arch=910 faversion=fa3 commit_id=<sha>
 #                   未指定时默认全部 arch / FA version / layout / mode / causal
 #
 # 兼容参数:
 #   arch=both|910|950
-#   fa_version=all|fa2|fa3|fa4
+#   faversion=all|fa2|fa3|fa4 (fa_version is also accepted)
 #   layout=all|bsnd|tnd
 #   mode=all|fwd|fwd_bwd
 #   causal=both|true|false
@@ -101,7 +101,7 @@ jobs:
             arch="$(printf '%s\n' "$body" | grep -oE 'arch=(910|950|both)' | head -n1 | cut -d= -f2- || true)"
             fa_version="$(
               printf '%s\n' "$body" |
-                grep -oE 'fa_version=(all|fa2|fa3|fa4)' |
+                grep -oE '(faversion|fa_version)=(all|fa2|fa3|fa4)' |
                 head -n1 |
                 cut -d= -f2- || true
             )"

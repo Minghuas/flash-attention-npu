@@ -92,6 +92,17 @@ CI_BENCHMARK_MODE="${CI_BENCHMARK_MODE:-all}"
 CI_BENCHMARK_CAUSAL="${CI_BENCHMARK_CAUSAL:-both}"
 CI_BENCHMARK_COMMIT_SHA="${CI_BENCHMARK_COMMIT_SHA:-unknown}"
 
+# A benchmark limited to one FA version does not need to compile the other
+# versions. Keep an explicitly supplied build selection authoritative.
+if [ "$CI_TASK" = "benchmark" ] && [ -z "${FLASH_ATTN_BUILD_VERSION+x}" ]; then
+  case "$CI_BENCHMARK_FA_VERSION" in
+    all) FLASH_ATTN_BUILD_VERSION=all ;;
+    fa2) FLASH_ATTN_BUILD_VERSION=v2 ;;
+    fa3) FLASH_ATTN_BUILD_VERSION=v3 ;;
+    fa4) FLASH_ATTN_BUILD_VERSION=v4 ;;
+  esac
+fi
+
 CI_RUN_EXAMPLE_ST="${CI_RUN_EXAMPLE_ST:-true}"
 CI_CONTAINER_DEVICE="${CI_CONTAINER_DEVICE:-0}"
 # ASCEND_RT_VISIBLE_DEVICES masks host physical devices; with one visible card,

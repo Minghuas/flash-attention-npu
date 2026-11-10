@@ -77,7 +77,8 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
       github.event.issue.pull_request != null &&
-      startsWith(github.event.comment.body, '/run-npu-ci'))
+      startsWith(github.event.comment.body, '/run-npu-ci') &&
+      !contains(github.event.comment.body, 'run-npu-benchmark'))
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       base_ref: ${{ steps.resolve.outputs.base_ref }}
