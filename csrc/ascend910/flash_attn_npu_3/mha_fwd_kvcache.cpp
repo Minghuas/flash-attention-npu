@@ -1123,7 +1123,8 @@ class FAInferKernel {
                             epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
                                                   actualBlockShapeQK, softmaxTaskPlan, desc.firstStack, qSBlockSize,
                                                   qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
-                                                  softmaxPingPongFlag, triUp, triDown, kvSStartIdx, kvSEndIdx, isSplitKV);
+                                                  softmaxPingPongFlag, triUp, triDown, kvSStartIdx, kvSEndIdx,
+                                                  isSplitKV);
                         } else {
                             epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], gMask, layOutP, layOutS, layOutMask,
                                                   actualBlockShapeQK, softmaxTaskPlan, desc.firstStack, qSBlockSize,
@@ -1142,10 +1143,9 @@ class FAInferKernel {
                                                   isSplitKV, false, false);
                         } else {
                             epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
-                                                  softmaxTaskPlan, desc.firstStack,
-                                                  (stackSeqCount == lastNoMaskTile), qSBlockSize, qNBlockSize,
-                                                  curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
-                                                  false, false, false);
+                                                  softmaxTaskPlan, desc.firstStack, (stackSeqCount == lastNoMaskTile),
+                                                  qSBlockSize, qNBlockSize, curStackTileMod, desc.taskStateSlot,
+                                                  qkReady, softmaxPingPongFlag, false, false, false);
                         }
                     }
                 } else if constexpr (MASK_TYPE == FaiKenel::MaskType::MASK_SWA) {
@@ -1173,9 +1173,8 @@ class FAInferKernel {
                                               actualBlockShapeQK, softmaxTaskPlan, desc.firstStack, qSBlockSize,
                                               qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
                                               softmaxPingPongFlag, kvSStartIdx, doTriUPreMask, doTriUNextMask,
-                                              windowSizeLeftStartLen, windowSizeLeftEndLen,
-                                              windowSizeRightStartLen, windowSizeRightEndLen,
-                                              FLASH_DECODE_FLAG ? isSplitKV : false);
+                                              windowSizeLeftStartLen, windowSizeLeftEndLen, windowSizeRightStartLen,
+                                              windowSizeRightEndLen, FLASH_DECODE_FLAG ? isSplitKV : false);
                     } else {
                         bool isLastNoMaskStackTile =
                             (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
@@ -1183,11 +1182,11 @@ class FAInferKernel {
                         uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile ? RoundUp(kvSeqlenLimit, kvStackLen)
                                                                               : RoundDown(kvSeqlenLimit, kvStackLen);
                         uint32_t noMaskStackSeqNum = (alignedKvSeqlenLimit - kvStart * kvStackLen) / kvStackLen;
-                        epilogueOnlineSoftmax(gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK,
-                                              softmaxTaskPlan, desc.firstStack, (stackSeqCount == noMaskStackSeqNum - 1),
-                                              qSBlockSize, qNBlockSize, curStackTileMod, desc.taskStateSlot, qkReady,
-                                              softmaxPingPongFlag, FLASH_DECODE_FLAG ? isSplitKV : false,
-                                              startsWithMaskTile, startsWithMaskThenNomaskFlag);
+                        epilogueOnlineSoftmax(
+                            gP[gmOffsetP], gS[gmOffsetS], layOutP, layOutS, actualBlockShapeQK, softmaxTaskPlan,
+                            desc.firstStack, (stackSeqCount == noMaskStackSeqNum - 1), qSBlockSize, qNBlockSize,
+                            curStackTileMod, desc.taskStateSlot, qkReady, softmaxPingPongFlag,
+                            FLASH_DECODE_FLAG ? isSplitKV : false, startsWithMaskTile, startsWithMaskThenNomaskFlag);
                         startsWithMaskTile = false;
                     }
                 } else {
