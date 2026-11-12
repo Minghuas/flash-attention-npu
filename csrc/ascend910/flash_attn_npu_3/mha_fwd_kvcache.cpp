@@ -1176,8 +1176,8 @@ class FAInferKernel {
                                               windowSizeLeftStartLen, windowSizeLeftEndLen, windowSizeRightStartLen,
                                               windowSizeRightEndLen, FLASH_DECODE_FLAG ? isSplitKV : false);
                     } else {
-                        bool isLastNoMaskStackTile =
-                            (windowSizeRightStartLen >= kvSeqlen) || (windowSizeRightStartLen < 0);
+                        bool isLastNoMaskStackTile = notNextMask || (windowSizeRightStartLen >= kvSeqlen) ||
+                                                    (windowSizeRightStartLen < 0);
                         uint32_t kvSeqlenLimit = isLastNoMaskStackTile ? kvSeqlen : windowSizeRightStartLen;
                         uint32_t alignedKvSeqlenLimit = isLastNoMaskStackTile ? RoundUp(kvSeqlenLimit, kvStackLen)
                                                                               : RoundDown(kvSeqlenLimit, kvStackLen);
