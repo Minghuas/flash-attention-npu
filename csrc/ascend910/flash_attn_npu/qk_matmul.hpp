@@ -236,6 +236,32 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             blockStart = blockSize - blockStartOffset;
             setBlockParam(stackSeqTile, blockStart, blockEnd, curBlockTotalNum, blockSize);
         }
+        // ---- L0C fixpipe fusion over the n-tiles of one (segment, KV stack) ----
+        // The n-tiles of one call are disjoint 16-column blocks of a single L0C
+        // tile (block j sits at nL1Idx * l1NDynamic * RoundUp16(m)), so one
+        // fixpipe whose srcStride is one 16-row block flushes them all. A
+        // fixpipe costs ~150ns of FIX pipe time on decode shapes regardless of
+        // its payload -- a stacked task issues nL1Loop of them per segment -- so
+        // this trades nL1Loop sync pairs for one.
+        // Preconditions: a single M tile (mL0Loop == 1, else the K tile would
+        // have to be re-read per M tile) and the whole row x stack tile fits one
+        // L0C ping-pong buffer.
+        uint32_t l0CFuseCols = 0;
+        {
+            const uint32_t mRowsAlign = RoundUp(rowNum, BLOCK_SIZE);
+            const bool oneMTile = CeilDiv(rowNum, L0TileShape::M) == 1U;
+            const bool fitsL0C = static_cast<uint64_t>(mRowsAlign) * stackSeqTile * sizeof(ElementAccumulator) <=
+                                 L0C_PINGPONG_BUF_SIZE;
+            if ((nL1Loop > 1U) && oneMTile && fitsL0C) {
+                l0CFuseCols = stackSeqTile;
+            }
+        }
+        uint32_t l0CFusedFlag = 0;
+        if (l0CFuseCols != 0U) {
+            l0CFusedFlag = pingPongState->l0CPingPongFlag;
+            pingPongState->l0CPingPongFlag = 1U - l0CFusedFlag;
+            AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CFusedFlag);
+        }
         for (uint32_t nL1Idx = 0; nL1Idx < nL1Loop; ++nL1Idx) {
             uint32_t mActual = actualShape.m();
             uint32_t kActual = actualShape.k();
@@ -299,9 +325,14 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
             uint32_t kL0Loop = CeilDiv(kActual, L0TileShape::K);
             for (uint32_t mL0Idx = 0; mL0Idx < mL0Loop; mL0Idx++) {
                 uint32_t mL0Actual = (mL0Idx < mL0Loop - 1U) ? L0TileShape::M : (mActual - mL0Idx * L0TileShape::M);
-                l0CPingPongFlag = pingPongState->l0CPingPongFlag;
-                pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
-                AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
+                uint32_t mL0Align = (mL0Actual + BLOCK_SIZE - 1U) / BLOCK_SIZE * BLOCK_SIZE;
+                uint32_t l0COutFlag = l0CFusedFlag;
+                if (l0CFuseCols == 0U) {
+                    l0CPingPongFlag = pingPongState->l0CPingPongFlag;
+                    pingPongState->l0CPingPongFlag = 1U - pingPongState->l0CPingPongFlag;
+                    l0COutFlag = l0CPingPongFlag;
+                    AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0COutFlag);
+                }
                 for (uint32_t kL0Idx = 0; kL0Idx < kL0Loop; kL0Idx++) {
                     l0ABPingPongFlag = pingPongState->l0ABPingPongFlag;
                     pingPongState->l0ABPingPongFlag = 1U - pingPongState->l0ABPingPongFlag;
@@ -329,20 +360,34 @@ struct BlockMmad<MmadAtlasA2FAIQKT<PAGED_CACHE_FLAG_, ENABLE_UNIT_FLAG_>, L1Tile
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
                     bool initMmad = (kL0Idx == 0U);
-                    uint32_t mL0Align = (mL0Actual + BLOCK_SIZE - 1U) / BLOCK_SIZE * BLOCK_SIZE;
-                    tileMmad(l0CTensor[l0CPingPongFlag], l0ATensor[l0ABPingPongFlag], l0BTensor[l0ABPingPongFlag],
-                             mL0Align, nActual, kL0Actual, initMmad);
+                    // Fused flush: n-tile `nL1Idx` owns the 16-column block range
+                    // [nL1Idx*l1NDynamic, ...) of the shared L0C tile.
+                    uint32_t l0CColOffset = (l0CFuseCols != 0U) ? (nL1Idx * l1NDynamic * mL0Align) : 0U;
+                    tileMmad(l0CTensor[l0COutFlag][l0CColOffset], l0ATensor[l0ABPingPongFlag],
+                             l0BTensor[l0ABPingPongFlag], mL0Align, nActual, kL0Actual, initMmad);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
                 }
-                AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
-                AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
-                MatrixCoord gmCTileCoord{mL0Idx * L0TileShape::M, nL1Idx * l1NDynamic};
-                LayoutC layoutCTile = layoutC.GetTileLayout(MakeCoord(mL0Actual, nActual));
-                auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0Actual, nActual));
-                copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
-                AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
+                if (l0CFuseCols == 0U) {
+                    AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+                    AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+                    MatrixCoord gmCTileCoord{mL0Idx * L0TileShape::M, nL1Idx * l1NDynamic};
+                    LayoutC layoutCTile = layoutC.GetTileLayout(MakeCoord(mL0Actual, nActual));
+                    auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0Actual, nActual));
+                    copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0COutFlag], layoutCTile, layoutInL0C);
+                    AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0COutFlag);
+                }
             }
+        }
+        if (l0CFuseCols != 0U) {
+            // One fixpipe for the whole row x stack tile: srcStride is a single
+            // 16-row block, i.e. the n-blocks of the per-tile mmads are adjacent.
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+            LayoutC layoutCFused = layoutC.GetTileLayout(MakeCoord(rowNum, l0CFuseCols));
+            auto layoutInL0CFused = LayoutCInL0::MakeLayoutInL0C(MakeCoord(rowNum, l0CFuseCols));
+            copyL0CToGm(gC, l0CTensor[l0CFusedFlag], layoutCFused, layoutInL0CFused);
+            AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CFusedFlag);
         }
     }
 
