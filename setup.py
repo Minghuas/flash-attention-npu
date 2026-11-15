@@ -842,11 +842,16 @@ if BUILD_EXTENSIONS:
 
 
 def get_package_version():
+    # The version string must be identical across every phase of a pip
+    # install from an index: sdist filename, prepared metadata
+    # (prepare_metadata_for_build_wheel), wheel filename, and wheel METADATA.
+    # pip compares them at candidate selection ("has inconsistent version")
+    # and at wheel verification ("Wheel has unexpected file name"), and any
+    # environment-dependent variation breaks one of them.  The tagged local
+    # version is therefore reserved for release CI (FLASH_ATTN_WHEEL_VARIANT),
+    # whose GitHub-release wheels never flow through pip's index resolution.
     config = wheel_metadata.get_build_config()
-    wheel_commands = {"bdist_wheel", "dist_info", "egg_info"}
-    if os.getenv("FLASH_ATTN_WHEEL_VARIANT") or (
-        not FORCE_BUILD and not SKIP_NPU_BUILD and wheel_commands.intersection(sys.argv[1:])
-    ):
+    if os.getenv("FLASH_ATTN_WHEEL_VARIANT"):
         return config.wheel_version
     return config.version
 
@@ -882,10 +887,12 @@ class CachedWheelsCommand(_bdist_wheel):
             if not os.path.exists(self.dist_dir):
                 os.makedirs(self.dist_dir)
 
-            impl_tag, abi_tag, plat_tag = self.get_tag()
-            archive_basename = f"{self.wheel_dist_name}-{impl_tag}-{abi_tag}-{plat_tag}"
-
-            wheel_path = os.path.join(self.dist_dir, archive_basename + ".whl")
+            # Keep the downloaded asset's own name: its internal METADATA
+            # carries the tagged release version, and pip >= 25.1 rejects a
+            # wheel whose filename version differs from its METADATA version.
+            # Renaming it to this run's (plain) distribution name would break
+            # that check for every user relying on the prebuilt-wheel path.
+            wheel_path = os.path.join(self.dist_dir, wheel_filename)
             os.rename(wheel_filename, wheel_path)
         except (OSError, urllib.error.HTTPError, urllib.error.URLError) as error:
             print(
@@ -911,6 +918,8 @@ setup(
     packages=find_packages(
         exclude=(
             "build",
+            "ci",
+            "ci.*",
             "csrc/ascend910",
             "csrc/ascend950",
             "include",
